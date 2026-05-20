@@ -437,6 +437,7 @@ class PredictionSnapshot:
     p_up_3m: float
     p_down_3m: float
     signal: str
+    rsi9_value: float
     reason_1: str
     reason_2: str
     reason_3: str
@@ -649,6 +650,7 @@ class Storage:
               signal_reason TEXT,
               price REAL,
               qty REAL,
+              fill_price REAL,
               raw_payload_json TEXT
             )""")
             cur.execute("""
@@ -687,7 +689,7 @@ class Storage:
               ts TEXT PRIMARY KEY,
               regime TEXT,
               p_up_1m REAL, p_down_1m REAL, p_up_3m REAL, p_down_3m REAL,
-              signal TEXT, reason_1 TEXT, reason_2 TEXT, reason_3 TEXT
+              signal TEXT, rsi9_value REAL, reason_1 TEXT, reason_2 TEXT, reason_3 TEXT
             )""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS paper_trades(
@@ -713,12 +715,24 @@ class Storage:
               raw_features_json TEXT
             )""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_facts_order_id_ts ON execution_facts(order_id, ts)")
+            self._ensure_prediction_rsi9_column(cur)
+            self._ensure_execution_fill_price_column(cur)
             con.commit()
 
     def _ensure_bar_ma13_column(self, cur: sqlite3.Cursor, table: str) -> None:
         cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
         if "ma13" not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN ma13 REAL")
+
+    def _ensure_prediction_rsi9_column(self, cur: sqlite3.Cursor) -> None:
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(prediction_snapshot)").fetchall()]
+        if "rsi9_value" not in cols:
+            cur.execute("ALTER TABLE prediction_snapshot ADD COLUMN rsi9_value REAL")
+
+    def _ensure_execution_fill_price_column(self, cur: sqlite3.Cursor) -> None:
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(execution_facts)").fetchall()]
+        if "fill_price" not in cols:
+            cur.execute("ALTER TABLE execution_facts ADD COLUMN fill_price REAL")
 
     def log(self, level: str, event_type: str, message: str) -> None:
         with self._connect() as con:
@@ -748,8 +762,8 @@ class Storage:
                 con.execute(
                     """
                     INSERT INTO execution_facts(
-                      ts,event_type,order_id,strategy,side,signal_reason,price,qty,raw_payload_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                      ts,event_type,order_id,strategy,side,signal_reason,price,qty,fill_price,raw_payload_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         ts,
@@ -760,6 +774,7 @@ class Storage:
                         str(normalized.get("signal_reason", "")),
                         _safe_float(normalized.get("price")),
                         _safe_float(normalized.get("qty")),
+                        _safe_float(normalized.get("fill_price")),
                         json.dumps(safe_payload, ensure_ascii=False, default=str),
                     ),
                 )
@@ -849,7 +864,7 @@ class Storage:
     def insert_prediction(self, p: PredictionSnapshot) -> None:
         with self._connect() as con:
             con.execute(
-                "INSERT OR REPLACE INTO prediction_snapshot VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO prediction_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     p.ts.isoformat(),
                     p.regime,
@@ -858,6 +873,7 @@ class Storage:
                     p.p_up_3m,
                     p.p_down_3m,
                     p.signal,
+                    p.rsi9_value,
                     p.reason_1,
                     p.reason_2,
                     p.reason_3,
@@ -900,6 +916,31 @@ class Storage:
                     pred.p_up_3m,
                     pred.p_down_3m,
                     decision_features_json(gf),
+                ),
+            )
+            con.commit()
+
+    def insert_execution_fill_price(self, event_type: str, order_id: str, side: str, strategy: str, signal_reason: str, fill_price: Optional[float]) -> None:
+        if not order_id:
+            return
+        with self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO execution_facts(
+                  ts,event_type,order_id,strategy,side,signal_reason,price,qty,fill_price,raw_payload_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    now_jst().isoformat(),
+                    event_type,
+                    order_id,
+                    strategy,
+                    side,
+                    signal_reason,
+                    None,
+                    None,
+                    fill_price,
+                    json.dumps({"event_type": event_type, "fill_price": fill_price}, ensure_ascii=False, default=str),
                 ),
             )
             con.commit()
@@ -1290,6 +1331,7 @@ def _scalp_prediction(
             p_up_3m=p_up_3m,
             p_down_3m=p_down_3m,
             signal="LONG_CANDIDATE",
+            rsi9_value=0.0,
             reason_1="SCALP_REBOUND_LONG",
             reason_2=common_detail,
             reason_3=f"ret1={f.ret_1m:.5f} ret3={f.ret_3m:.5f}",
@@ -1311,6 +1353,7 @@ def _scalp_prediction(
             p_up_3m=p_up_3m,
             p_down_3m=p_down_3m,
             signal="LONG_CANDIDATE",
+            rsi9_value=0.0,
             reason_1="SCALP_SQUEEZE_LONG",
             reason_2=common_detail,
             reason_3=f"vwap_gap={f.vwap_gap_bps:.1f}bps intensity={f.trade_intensity_30s:.1f}",
@@ -1333,6 +1376,7 @@ def _scalp_prediction(
             p_up_3m=p_up_3m,
             p_down_3m=p_down_3m,
             signal="LONG_CANDIDATE",
+            rsi9_value=0.0,
             reason_1="SCALP_VWAP_PULLBACK_LONG",
             reason_2=common_detail,
             reason_3=f"vwap_gap={f.vwap_gap_bps:.1f}bps",
@@ -1354,6 +1398,7 @@ def _scalp_prediction(
             p_up_3m=p_up_3m,
             p_down_3m=p_down_3m,
             signal="LONG_CANDIDATE",
+            rsi9_value=0.0,
             reason_1="SCALP_BREAKOUT_LONG",
             reason_2=common_detail,
             reason_3=f"close_pos={f.close_pos_in_bar_1m:.2f}",
@@ -1376,6 +1421,7 @@ def _scalp_prediction(
             p_up_3m=p_up_3m,
             p_down_3m=p_down_3m,
             signal="SHORT_CANDIDATE",
+            rsi9_value=0.0,
             reason_1="SCALP_STRICT_SHORT",
             reason_2=common_detail,
             reason_3=f"vwap_gap={f.vwap_gap_bps:.1f}bps",
@@ -1425,6 +1471,7 @@ def build_prediction(f: FeatureSnapshot) -> PredictionSnapshot:
         p_up_3m=p_up_3m,
         p_down_3m=p_down_3m,
         signal=signal,
+        rsi9_value=0.0,
         reason_1=reasons[0],
         reason_2=reasons[1],
         reason_3=reasons[2],
@@ -1478,6 +1525,7 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
         p_up_3m=0.5,
         p_down_3m=0.5,
         signal=signal,
+        rsi9_value=rsi,
         reason_1="RSI9_ONLY",
         reason_2=f"rsi9={rsi:.2f}",
         reason_3="rule_based",
@@ -3018,6 +3066,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             )
                                         except Exception:
                                             candidate_pos.entry_fill_price = None
+                                        storage.insert_execution_fill_price(
+                                            "ENTRY_FILL_PRICE",
+                                            result.order_id,
+                                            side,
+                                            candidate_pos.strategy,
+                                            p.reason_1,
+                                            candidate_pos.entry_fill_price,
+                                        )
                                         status.open_position = candidate_pos
                                         status.live_state = "OPEN"
                                         take_profit_cfg = config.get("take_profit_execution", {})
@@ -3122,6 +3178,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     status.exit_fail_count = 0
                                     status.live_state = "FLAT"
                                     storage.log("INFO", "LIVE_TAKE_PROFIT_FILLED", f"{pos.side} order_id={pos.take_profit_order_id or pos.exit_order_id}")
+                                    storage.insert_execution_fill_price(
+                                        "EXIT_FILL_PRICE",
+                                        pos.take_profit_order_id or pos.exit_order_id or "",
+                                        pos.side,
+                                        pos.strategy,
+                                        ex_reason,
+                                        pos.exit_fill_price,
+                                    )
                                 elif exit_confirmed:
                                     status.live_state = "EXIT_SENT"
                                     result = execute_live_exit(client, config, pos.side, storage, pos, p, status)
@@ -3159,6 +3223,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         status.exit_fail_count = 0
                                         status.live_state = "FLAT"
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
+                                        storage.insert_execution_fill_price(
+                                            "EXIT_FILL_PRICE",
+                                            result.order_id,
+                                            pos.side,
+                                            pos.strategy,
+                                            ex_reason,
+                                            pos.exit_fill_price,
+                                        )
 
                             if exit_confirmed:
                                 holding_sec = (f.ts - pos.entry_ts).total_seconds()
