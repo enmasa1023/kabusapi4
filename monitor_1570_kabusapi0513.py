@@ -464,6 +464,7 @@ class PositionState:
     take_profit_trigger_ts: Optional[datetime] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
+    rsi_added: bool = False
 
 
 @dataclass
@@ -525,6 +526,10 @@ class MonitorStatus:
     exit_fail_count: int = 0
     last_entry_reject_key: str = ""
     midday_written: bool = False
+    pending_entry_side: Optional[str] = None
+    pending_entry_ts: Optional[datetime] = None
+    pending_add: bool = False
+    pending_exit: bool = False
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -1479,6 +1484,18 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
     )
 
 
+
+
+def extract_rsi_from_pred(pred: Optional[PredictionSnapshot]) -> Optional[float]:
+    if pred is None:
+        return None
+    if not pred.reason_2.startswith("rsi9="):
+        return None
+    try:
+        return float(pred.reason_2.split("=", 1)[1])
+    except Exception:
+        return None
+
 def can_enter(side: str, now_: datetime, state: MonitorStatus) -> tuple[bool, str]:
     if state.open_position is not None:
         return False, "ALREADY_OPEN"
@@ -1556,10 +1573,12 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
                 rsi = None
         if rsi is not None:
             if pos.side == "LONG":
-                if rsi >= RSI9_LONG_TP:
+                tp = 60.0 if pos.rsi_added else RSI9_LONG_TP
+                if rsi >= tp:
                     return True, "TAKE_PROFIT", 0.0
             else:
-                if rsi <= RSI9_SHORT_TP:
+                tp = 40.0 if pos.rsi_added else RSI9_SHORT_TP
+                if rsi <= tp:
                     return True, "TAKE_PROFIT", 0.0
 
     pnl_ticks = price_to_ticks(f.price - pos.entry_price, pos.entry_price)
@@ -2936,14 +2955,23 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 last_pred = p
                 last_gate = gate_decision
                 effective_signal = p.signal
+                current_rsi = extract_rsi_from_pred(p)
 
-                if status.open_position is None and effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
-                    side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
+                # RSI threshold hit on closed 1m bar -> execute on next 1m bar open (first tick)
+                if bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
+                    if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
+                        status.pending_entry_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
+                        status.pending_entry_ts = f.ts
+                        storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
+
+                if status.pending_entry_side and status.open_position is None:
+                    side = status.pending_entry_side
                     enter_ok, _ = can_enter(side, f.ts, status)
                     if enter_ok:
                         candidate_pos = create_position(p, f, config)
                         if not adaptive.allow_strat(candidate_pos.strategy, f.ts):
                             storage.log("INFO", "ADAPTIVE_SKIP_ENTRY", f"side={candidate_pos.side} strategy={candidate_pos.strategy} reason=STRAT_1M_FROZEN until={adaptive.freeze_strat_1m_until}")
+                            status.pending_entry_side = None
                         elif config["live_mode"]:
                             rec = reconcile_live_position(client, config, status, storage, expected_side=side, reason="PRE_ENTRY", ts=f.ts, expected_margin_trade_type=margin_trade_type_for_side(config, side))
                             if not rec.ok_for_entry or status.open_position is not None:
@@ -2963,6 +2991,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 reject_key = entry_reject_key(config, side, candidate_pos.strategy, p, status.last_error_code)
                                 if status.last_entry_reject_key and status.last_entry_reject_key == reject_key:
                                     storage.log("INFO", "ENTRY_SKIP_DUPLICATE_REJECT", reject_key)
+                                    status.pending_entry_side = None
                                 else:
                                     status.live_state = "ENTRY_SENT"
                                     result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
@@ -3001,12 +3030,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
                                         status.last_entry_reject_key = ""
                                         status.last_entry_ts_by_side[side] = f.ts
+                                        status.pending_entry_side = None
                                         mfe_ticks = 0.0
                                         mae_ticks = 0.0
                         else:
                             status.open_position = candidate_pos
                             status.live_state = "OPEN"
                             status.last_entry_ts_by_side[side] = f.ts
+                            status.pending_entry_side = None
                             mfe_ticks = 0.0
                             mae_ticks = 0.0
                 elif status.open_position is not None:
@@ -3032,6 +3063,19 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         mfe_ticks = max(mfe_ticks, cur_pnl_ticks)
                         mae_ticks = min(mae_ticks, cur_pnl_ticks)
                         live_tp_already_filled = False
+                        # RSI9 add-on: +1 lot on extreme RSI, executed on next 1m open tick
+                        if pos.strategy == "RSI9" and current_rsi is not None and not pos.rsi_added:
+                            if (pos.side == "LONG" and current_rsi <= 10.0) or (pos.side == "SHORT" and current_rsi >= 90.0):
+                                if config["live_mode"]:
+                                    add_result = execute_live_entry(client, config, pos.side, storage, pos, p, status, latest_snapshot=snap)
+                                    if add_result.ok:
+                                        pos.rsi_added = True
+                                        pos.entry_price = (pos.entry_price + f.price) / 2.0
+                                        storage.log("INFO", "RSI_ADD_OK", f"side={pos.side} order_id={add_result.order_id} rsi={current_rsi:.2f}")
+                                else:
+                                    pos.rsi_added = True
+                                    pos.entry_price = (pos.entry_price + f.price) / 2.0
+
                         if config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
                             pos.exit_fill_price = take_profit_limit_price(pos)
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
