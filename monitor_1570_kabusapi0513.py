@@ -116,12 +116,12 @@ SCALP_EXIT_PARAMS: dict[str, tuple[int, int, int, int]] = {
 }
 
 RSI9_PERIOD = 9
-RSI9_LONG_ENTRY = 30.0
+RSI9_LONG_ENTRY = 20.0
 RSI9_LONG_TP = 70.0
-RSI9_LONG_SL = 20.0
+RSI9_LONG_SL = 0.0
 RSI9_SHORT_ENTRY = 80.0
-RSI9_SHORT_TP = 40.0
-RSI9_SHORT_SL = 90.0
+RSI9_SHORT_TP = 30.0
+RSI9_SHORT_SL = 0.0
 
 
 def now_jst() -> datetime:
@@ -1558,13 +1558,9 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
             if pos.side == "LONG":
                 if rsi >= RSI9_LONG_TP:
                     return True, "TAKE_PROFIT", 0.0
-                if rsi <= RSI9_LONG_SL:
-                    return True, "STOP_LOSS", 0.0
             else:
                 if rsi <= RSI9_SHORT_TP:
                     return True, "TAKE_PROFIT", 0.0
-                if rsi >= RSI9_SHORT_SL:
-                    return True, "STOP_LOSS", 0.0
 
     pnl_ticks = price_to_ticks(f.price - pos.entry_price, pos.entry_price)
     if pos.side == "SHORT":
