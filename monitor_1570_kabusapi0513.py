@@ -115,6 +115,14 @@ SCALP_EXIT_PARAMS: dict[str, tuple[int, int, int, int]] = {
     "SCALP_STRICT_SHORT": (10, 10, 8, 60),
 }
 
+RSI9_PERIOD = 9
+RSI9_LONG_ENTRY = 30.0
+RSI9_LONG_TP = 70.0
+RSI9_LONG_SL = 20.0
+RSI9_SHORT_ENTRY = 80.0
+RSI9_SHORT_TP = 40.0
+RSI9_SHORT_SL = 90.0
+
 
 def now_jst() -> datetime:
     return datetime.now(JST)
@@ -1418,6 +1426,59 @@ def build_prediction(f: FeatureSnapshot) -> PredictionSnapshot:
     )
 
 
+def rsi9_wilder(closes: list[float], period: int = RSI9_PERIOD) -> Optional[float]:
+    if len(closes) <= period:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gain = max(d, 0.0)
+        loss = max(-d, 0.0)
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Optional[PositionState]) -> Optional[PredictionSnapshot]:
+    if bar1 is None:
+        return None
+    closes = [b.close for b in history]
+    rsi = rsi9_wilder(closes, RSI9_PERIOD)
+    if rsi is None:
+        return None
+    signal = "NO_ACTION"
+    side = "NEUTRAL"
+    if open_pos is None:
+        if rsi <= RSI9_LONG_ENTRY:
+            signal, side = "LONG_CANDIDATE", "LONG"
+        elif rsi >= RSI9_SHORT_ENTRY:
+            signal, side = "SHORT_CANDIDATE", "SHORT"
+    else:
+        side = open_pos.side
+    return PredictionSnapshot(
+        ts=bar1.ts,
+        regime="RSI9",
+        p_up_1m=0.5,
+        p_down_1m=0.5,
+        p_up_3m=0.5,
+        p_down_3m=0.5,
+        signal=signal,
+        reason_1="RSI9_ONLY",
+        reason_2=f"rsi9={rsi:.2f}",
+        reason_3="rule_based",
+    )
+
+
 def can_enter(side: str, now_: datetime, state: MonitorStatus) -> tuple[bool, str]:
     if state.open_position is not None:
         return False, "ALREADY_OPEN"
@@ -1444,7 +1505,10 @@ def create_position(
 ) -> PositionState:
     is_long = pred.signal == "LONG_CANDIDATE"
     side = "LONG" if is_long else "SHORT"
-    if pred.reason_1 in SCALP_EXIT_PARAMS:
+    if pred.reason_1 == "RSI9_ONLY":
+        strategy = "RSI9"
+        stop_ticks, take_ticks, min_hold, max_hold = 9999, 9999, 0, 3600
+    elif pred.reason_1 in SCALP_EXIT_PARAMS:
         strategy = pred.reason_1
         stop_ticks, take_ticks, min_hold, max_hold = SCALP_EXIT_PARAMS[strategy]
     elif (pred.p_up_3m if is_long else pred.p_down_3m) >= (
@@ -1483,6 +1547,25 @@ def create_position(
 
 def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot) -> tuple[bool, str, float]:
     elapsed = (f.ts - pos.entry_ts).total_seconds()
+    if pos.strategy == "RSI9":
+        rsi = None
+        if pred.reason_2.startswith("rsi9="):
+            try:
+                rsi = float(pred.reason_2.split("=", 1)[1])
+            except Exception:
+                rsi = None
+        if rsi is not None:
+            if pos.side == "LONG":
+                if rsi >= RSI9_LONG_TP:
+                    return True, "TAKE_PROFIT", 0.0
+                if rsi <= RSI9_LONG_SL:
+                    return True, "STOP_LOSS", 0.0
+            else:
+                if rsi <= RSI9_SHORT_TP:
+                    return True, "TAKE_PROFIT", 0.0
+                if rsi >= RSI9_SHORT_SL:
+                    return True, "STOP_LOSS", 0.0
+
     pnl_ticks = price_to_ticks(f.price - pos.entry_price, pos.entry_price)
     if pos.side == "SHORT":
         pnl_ticks = -pnl_ticks
@@ -2845,7 +2928,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
             if f is not None:
                 storage.insert_feature(f)
-                p = build_prediction(f)
+                p = build_rsi9_prediction(rb1.latest(), list(rb1.history), status.open_position)
+                if p is None:
+                    continue
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
@@ -2854,25 +2939,10 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 last_feature = f
                 last_pred = p
                 last_gate = gate_decision
-                effective_signal = gate_decision.final_signal
+                effective_signal = p.signal
 
                 if status.open_position is None and effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                     side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
-                    if side == "SHORT" and not short_ma_guard_pass(rb1.latest(), f.price):
-                        b1 = rb1.latest()
-                        storage.log_structured(
-                            "INFO",
-                            "SHORT_MA_GUARD_SKIP",
-                            {
-                                "side": side,
-                                "price": f.price,
-                                "ma5": b1.ma5 if b1 else None,
-                                "ma13": b1.ma13 if b1 else None,
-                                "ma25": b1.ma25 if b1 else None,
-                            },
-                            mirror_message="short skipped: price must be <= ma5/ma13/ma25",
-                        )
-                        continue
                     enter_ok, _ = can_enter(side, f.ts, status)
                     if enter_ok:
                         candidate_pos = create_position(p, f, config)
