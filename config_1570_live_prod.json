@@ -1,0 +1,89 @@
+{
+  "api_password": "enmasa1023",
+  "order_password": "47095095",
+  "live_mode": true,
+  "symbol": "1570",
+  "exchange": 1,
+  "order_exchange": 9,
+  "exit_order_exchange": 1,
+  "margin_entry_exchange": 9,
+  "order_qty": 1,
+  "entry_min_fill_qty": 1,
+  "account_type": 4,
+  "margin_trade_type": 3,
+  "margin_trade_type_long": 3,
+  "margin_trade_type_short": 1,
+  "entry_cash_margin": 2,
+  "exit_cash_margin": 3,
+  "entry_deliv_type": 0,
+  "exit_deliv_type": 2,
+  "entry_front_order_type": 10,
+  "exit_front_order_type": 10,
+  "entry_price": 0,
+  "exit_price": 0,
+  "expire_day": 0,
+  "live_entry_timeout_sec": 8,
+  "live_exit_timeout_sec": 10,
+  "live_retry_max": 1,
+  "entry_error_block_sec": 300,
+  "prob_upper_1m": 0.56,
+  "prob_upper_3m": 0.52,
+  "book_neutral_obi_l1_min": 0.015,
+  "book_neutral_obi_l3_min": 0.008,
+  "poll_interval_sec": 2.0,
+  "console_status_interval_sec": 5.0,
+  "outdir": "monitor_output_live",
+  "runtime_minutes": null,
+  "live_entry_overrides_long": {},
+  "live_entry_overrides_short": {},
+  "live_exit_overrides": {},
+  "volatility_regime_gate": {
+    "enabled": true,
+    "mode": "warn_only",
+    "thresholds": {
+      "low_vol_5m": 0.0004,
+      "panic_vol_1m": 0.003,
+      "min_volume_ratio": 0.8,
+      "max_spread_ticks": 2.0,
+      "max_spread_ratio": 0.001,
+      "board_imbalance_long": 0.55,
+      "board_imbalance_short": 0.45,
+      "min_price_vs_vwap_long": 0.0,
+      "max_price_vs_vwap_short": 0.0
+    },
+    "actions": {
+      "block_dead_market": true,
+      "block_panic_market": true,
+      "block_wide_spread": true,
+      "block_low_volume": true,
+      "warn_when_board_conflicts": true,
+      "warn_when_vwap_conflicts": true,
+      "block_when_board_conflicts": false,
+      "block_when_vwap_conflicts": true
+    },
+    "logging": {
+      "save_features": true,
+      "save_gate_decision": true,
+      "print_gate_reason": true
+    }
+  },
+  "entry_execution": {
+    "enabled": true,
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 0,
+    "fallback_to_market": false,
+    "verify_position_after_cancel": true,
+    "skip_signal_after_timeout": true,
+    "log_execution_detail": true
+  },
+  "scalping": {
+    "enabled": true
+  },
+  "take_profit_execution": {
+    "enabled": true,
+    "fallback_market_after_signal_sec": 180.0
+  }
+}
