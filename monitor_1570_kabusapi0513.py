@@ -53,6 +53,7 @@ TRADE_WINDOWS = [
     ("12:35:00", "15:20:00"),
 ]
 STOP_AFTER = "15:30:00"
+FORCE_CLOSE_AFTER = "15:20:00"
 
 # v1.6 exit-tuned parameters
 SPREAD_TICKS_MAX = 2.0
@@ -530,6 +531,7 @@ class MonitorStatus:
     pending_entry_ts: Optional[datetime] = None
     pending_add: bool = False
     pending_exit: bool = False
+    force_market_close_sent: bool = False
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -2322,6 +2324,14 @@ def entry_limit_price(side: str, snap: Optional[TickSnapshot], limit_mode: str) 
     return best_ask if limit_mode == "passive_best" else best_bid
 
 
+def marketable_exit_limit_price(pos: PositionState, snap: Optional[TickSnapshot]) -> Optional[float]:
+    if snap is None:
+        return None
+    if pos.side == "LONG":
+        return snap.buy1_price
+    return snap.sell1_price
+
+
 def take_profit_limit_price(pos: PositionState) -> float:
     tick_size = tick_size_for_1570(pos.entry_price)
     delta = pos.take_ticks * tick_size
@@ -2674,6 +2684,9 @@ def execute_live_exit(
     pos: PositionState,
     pred: Optional[PredictionSnapshot],
     status: MonitorStatus,
+    latest_snapshot: Optional[TickSnapshot] = None,
+    force_marketable_limit: bool = False,
+    force_market_order: bool = False,
 ) -> LiveOrderResult:
     retries = max(int(config.get("live_retry_max", LIVE_RETRY_MAX)), 0)
     timeout_sec = int(config.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC))
@@ -2708,11 +2721,27 @@ def execute_live_exit(
 
         order_ids: list[str] = []
         for position_exchange, close_positions, group_total_qty in close_position_groups:
+            if force_market_order:
+                front_order_type = 10
+                limit_price = 0.0
+                exit_order_mode = "market_1520_force_close"
+            elif force_marketable_limit or pos.strategy == "RSI9":
+                front_order_type = 20
+                limit_price = marketable_exit_limit_price(pos, latest_snapshot)
+                exit_order_mode = "marketable_limit"
+                if limit_price is None or limit_price <= 0:
+                    return LiveOrderResult(False, "MARKETABLE_EXIT_LIMIT_PRICE_UNAVAILABLE", recoverable=True)
+            else:
+                front_order_type = None
+                limit_price = None
+                exit_order_mode = "config_default"
             payload = build_exit_order_payload(
                 config,
                 side,
                 close_positions=close_positions,
                 qty=group_total_qty,
+                front_order_type=front_order_type,
+                price=limit_price,
                 margin_trade_type=pos.margin_trade_type,
                 exchange=position_exchange,
             )
@@ -2723,6 +2752,10 @@ def execute_live_exit(
                     **context,
                     "attempt": attempt + 1,
                     "position_exchange": position_exchange,
+                    "exit_order_mode": exit_order_mode,
+                    "limit_price": limit_price,
+                    "force_market_order": force_market_order,
+                    "force_marketable_limit": force_marketable_limit,
                     "request_json": payload,
                     "positions_json": positions,
                 },
@@ -2788,12 +2821,11 @@ def force_close_open_position(
     reason: str,
     ts: datetime,
     last_pred: Optional[PredictionSnapshot],
+    latest_snapshot: Optional[TickSnapshot] = None,
+    use_market_order: bool = False,
 ) -> None:
     pos = status.open_position
     if pos is None:
-        return
-    if pos.strategy == "RSI9":
-        storage.log("WARN", "FORCE_EXIT_SKIPPED_RSI9", f"reason={reason} side={pos.side}")
         return
     if not config.get("live_mode"):
         storage.log("WARN", "FORCE_EXIT_PAPER_CLEAR", f"reason={reason} side={pos.side}")
@@ -2817,7 +2849,18 @@ def force_close_open_position(
             return
 
     status.live_state = "EXIT_SENT"
-    result = execute_live_exit(client, config, pos.side, storage, pos, last_pred, status)
+    result = execute_live_exit(
+        client,
+        config,
+        pos.side,
+        storage,
+        pos,
+        last_pred,
+        status,
+        latest_snapshot=latest_snapshot,
+        force_marketable_limit=(not use_market_order),
+        force_market_order=use_market_order,
+    )
     if result.ok:
         pos.exit_order_id = result.order_id
         status.exit_fail_count = 0
@@ -2983,11 +3026,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
         tstr = now_.strftime("%H:%M:%S")
         if end_ts and now_ >= end_ts:
             storage.log("INFO", "STOP_RUNTIME", "runtime end reached")
-            force_close_open_position(client, config, storage, status, "STOP_RUNTIME", now_, last_pred)
+            force_close_open_position(client, config, storage, status, "STOP_RUNTIME", now_, last_pred, latest_snapshot=None, use_market_order=False)
             break
         if tstr >= STOP_AFTER:
             storage.log("INFO", "STOP_AFTER_SESSION", "session end reached")
-            force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred)
+            force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred, latest_snapshot=None, use_market_order=False)
             break
         try:
             raw = client.get_board(config["symbol"], config["exchange"])
@@ -3021,98 +3064,130 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 last_gate = gate_decision
                 effective_signal = p.signal
                 current_rsi = extract_rsi_from_pred(p)
+                force_close_time_reached = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
+
+                if force_close_time_reached:
+                    effective_signal = "NO_ACTION"
+                    if status.pending_entry_side is not None:
+                        storage.log("WARN", "PENDING_ENTRY_CLEARED_FORCE_CLOSE_TIME", f"side={status.pending_entry_side}")
+                        status.pending_entry_side = None
+                        status.pending_entry_ts = None
+                    if (
+                        status.open_position is not None
+                        and not status.force_market_close_sent
+                        and status.live_state not in {"EXIT_SENT", "EXIT_VERIFYING", "RECOVERING"}
+                    ):
+                        storage.log("WARN", "FORCE_MARKET_CLOSE_1520", f"time={tstr} side={status.open_position.side} strategy={status.open_position.strategy}")
+                        status.force_market_close_sent = True
+                        force_close_open_position(
+                            client,
+                            config,
+                            storage,
+                            status,
+                            reason="FORCE_MARKET_CLOSE_1520",
+                            ts=now_,
+                            last_pred=last_pred,
+                            latest_snapshot=snap,
+                            use_market_order=True,
+                        )
 
                 # RSI threshold hit on closed 1m bar -> execute on next 1m bar open (first tick)
-                if bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
+                if (not force_close_time_reached) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
                     if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                         status.pending_entry_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
                         status.pending_entry_ts = f.ts
                         storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
 
                 if status.pending_entry_side and status.open_position is None:
-                    side = status.pending_entry_side
-                    enter_ok, _ = can_enter(side, f.ts, status)
-                    if enter_ok:
-                        candidate_pos = create_position(p, f, config)
-                        if not adaptive.allow_strat(candidate_pos.strategy, f.ts):
-                            storage.log("INFO", "ADAPTIVE_SKIP_ENTRY", f"side={candidate_pos.side} strategy={candidate_pos.strategy} reason=STRAT_1M_FROZEN until={adaptive.freeze_strat_1m_until}")
-                            status.pending_entry_side = None
-                        elif config["live_mode"]:
-                            rec = reconcile_live_position(client, config, status, storage, expected_side=side, reason="PRE_ENTRY", ts=f.ts, expected_margin_trade_type=margin_trade_type_for_side(config, side))
-                            if not rec.ok_for_entry or status.open_position is not None:
-                                storage.log_structured(
-                                    "WARN",
-                                    "ENTRY_SKIP_RECOVERY",
-                                    {
-                                        "side": side,
-                                        "strategy_name": candidate_pos.strategy,
-                                        "signal_reason": p.reason_1,
-                                        "reconcile_result": asdict(rec),
-                                        "internal_state": position_state_payload(status.open_position),
-                                    },
-                                    mirror_message=f"side={side} reason={rec.message}",
-                                )
-                            else:
-                                reject_key = entry_reject_key(config, side, candidate_pos.strategy, p, status.last_error_code)
-                                if status.last_entry_reject_key and status.last_entry_reject_key == reject_key:
-                                    storage.log("INFO", "ENTRY_SKIP_DUPLICATE_REJECT", reject_key)
-                                    status.pending_entry_side = None
+                    if force_close_time_reached:
+                        status.pending_entry_side = None
+                        status.pending_entry_ts = None
+                    else:
+                        side = status.pending_entry_side
+                        enter_ok, _ = can_enter(side, f.ts, status)
+                        if enter_ok:
+                            candidate_pos = create_position(p, f, config)
+                            if not adaptive.allow_strat(candidate_pos.strategy, f.ts):
+                                storage.log("INFO", "ADAPTIVE_SKIP_ENTRY", f"side={candidate_pos.side} strategy={candidate_pos.strategy} reason=STRAT_1M_FROZEN until={adaptive.freeze_strat_1m_until}")
+                                status.pending_entry_side = None
+                            elif config["live_mode"]:
+                                rec = reconcile_live_position(client, config, status, storage, expected_side=side, reason="PRE_ENTRY", ts=f.ts, expected_margin_trade_type=margin_trade_type_for_side(config, side))
+                                if not rec.ok_for_entry or status.open_position is not None:
+                                    storage.log_structured(
+                                        "WARN",
+                                        "ENTRY_SKIP_RECOVERY",
+                                        {
+                                            "side": side,
+                                            "strategy_name": candidate_pos.strategy,
+                                            "signal_reason": p.reason_1,
+                                            "reconcile_result": asdict(rec),
+                                            "internal_state": position_state_payload(status.open_position),
+                                        },
+                                        mirror_message=f"side={side} reason={rec.message}",
+                                    )
                                 else:
-                                    status.live_state = "ENTRY_SENT"
-                                    result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
-                                    if not result.ok:
-                                        status.live_state = "FLAT"
-                                        status.last_error_code = result.api_code
-                                        status.last_error_message = result.message
-                                        storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
-                                        if result.api_code:
-                                            status.last_entry_reject_key = entry_reject_key(config, side, candidate_pos.strategy, p, result.api_code)
-                                        if result.message.startswith("ENTRY_RESTRICTED_100368"):
-                                            block_sec = int(config.get("entry_error_block_sec", ENTRY_ERROR_BLOCK_SEC))
-                                            status.entry_global_block_until = f.ts + timedelta(seconds=max(block_sec, 1))
-                                            storage.log("WARN", "ENTRY_GLOBAL_BLOCK", f"reason={result.message} until={status.entry_global_block_until.isoformat()}")
-                                    else:
-                                        storage.log("INFO", "LIVE_ENTRY_OK", f"{side} order_id={result.order_id}")
-                                        candidate_pos.entry_order_id = result.order_id
-                                        try:
-                                            entry_positions = fetch_positions(client, config, storage, reason="POST_ENTRY_FILL_PRICE")
-                                            candidate_pos.entry_fill_price = average_price_from_positions(
-                                                entry_positions,
-                                                side,
-                                                margin_trade_type=candidate_pos.margin_trade_type,
-                                            )
-                                        except Exception:
-                                            candidate_pos.entry_fill_price = None
-                                        storage.insert_execution_fill_price(
-                                            "ENTRY_FILL_PRICE",
-                                            result.order_id,
-                                            side,
-                                            candidate_pos.strategy,
-                                            p.reason_1,
-                                            candidate_pos.entry_fill_price,
-                                        )
-                                        status.open_position = candidate_pos
-                                        status.live_state = "OPEN"
-                                        take_profit_cfg = config.get("take_profit_execution", {})
-                                        if not isinstance(take_profit_cfg, dict) or bool(take_profit_cfg.get("enabled", True)):
-                                            tp_result = place_take_profit_limit_order(client, config, storage, candidate_pos, p, status)
-                                            if tp_result.ok:
-                                                candidate_pos.take_profit_order_id = tp_result.order_id
-                                                storage.log("INFO", "TAKE_PROFIT_LIMIT_OK", f"{side} order_id={tp_result.order_id} price={take_profit_limit_price(candidate_pos):.1f}")
-                                            else:
-                                                storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
-                                        status.last_entry_reject_key = ""
-                                        status.last_entry_ts_by_side[side] = f.ts
+                                    reject_key = entry_reject_key(config, side, candidate_pos.strategy, p, status.last_error_code)
+                                    if status.last_entry_reject_key and status.last_entry_reject_key == reject_key:
+                                        storage.log("INFO", "ENTRY_SKIP_DUPLICATE_REJECT", reject_key)
                                         status.pending_entry_side = None
-                                        mfe_ticks = 0.0
-                                        mae_ticks = 0.0
-                        else:
-                            status.open_position = candidate_pos
-                            status.live_state = "OPEN"
-                            status.last_entry_ts_by_side[side] = f.ts
-                            status.pending_entry_side = None
-                            mfe_ticks = 0.0
-                            mae_ticks = 0.0
+                                    else:
+                                        status.live_state = "ENTRY_SENT"
+                                        result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
+                                        if not result.ok:
+                                            status.live_state = "FLAT"
+                                            status.last_error_code = result.api_code
+                                            status.last_error_message = result.message
+                                            storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
+                                            if result.api_code:
+                                                status.last_entry_reject_key = entry_reject_key(config, side, candidate_pos.strategy, p, result.api_code)
+                                            if result.message.startswith("ENTRY_RESTRICTED_100368"):
+                                                block_sec = int(config.get("entry_error_block_sec", ENTRY_ERROR_BLOCK_SEC))
+                                                status.entry_global_block_until = f.ts + timedelta(seconds=max(block_sec, 1))
+                                                storage.log("WARN", "ENTRY_GLOBAL_BLOCK", f"reason={result.message} until={status.entry_global_block_until.isoformat()}")
+                                        else:
+                                            storage.log("INFO", "LIVE_ENTRY_OK", f"{side} order_id={result.order_id}")
+                                            candidate_pos.entry_order_id = result.order_id
+                                            try:
+                                                entry_positions = fetch_positions(client, config, storage, reason="POST_ENTRY_FILL_PRICE")
+                                                candidate_pos.entry_fill_price = average_price_from_positions(
+                                                    entry_positions,
+                                                    side,
+                                                    margin_trade_type=candidate_pos.margin_trade_type,
+                                                )
+                                            except Exception:
+                                                candidate_pos.entry_fill_price = None
+                                            storage.insert_execution_fill_price(
+                                                "ENTRY_FILL_PRICE",
+                                                result.order_id,
+                                                side,
+                                                candidate_pos.strategy,
+                                                p.reason_1,
+                                                candidate_pos.entry_fill_price,
+                                            )
+                                            status.open_position = candidate_pos
+                                            status.live_state = "OPEN"
+                                            take_profit_cfg = config.get("take_profit_execution", {})
+                                            if candidate_pos.strategy == "RSI9":
+                                                storage.log("INFO", "RSI9_TAKE_PROFIT_LIMIT_SKIP", f"side={candidate_pos.side} strategy=RSI9")
+                                            elif not isinstance(take_profit_cfg, dict) or bool(take_profit_cfg.get("enabled", True)):
+                                                tp_result = place_take_profit_limit_order(client, config, storage, candidate_pos, p, status)
+                                                if tp_result.ok:
+                                                    candidate_pos.take_profit_order_id = tp_result.order_id
+                                                    storage.log("INFO", "TAKE_PROFIT_LIMIT_OK", f"{side} order_id={tp_result.order_id} price={take_profit_limit_price(candidate_pos):.1f}")
+                                                else:
+                                                    storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
+                                            status.last_entry_reject_key = ""
+                                            status.last_entry_ts_by_side[side] = f.ts
+                                            status.pending_entry_side = None
+                                            mfe_ticks = 0.0
+                                            mae_ticks = 0.0
+                            else:
+                                status.open_position = candidate_pos
+                                status.live_state = "OPEN"
+                                status.last_entry_ts_by_side[side] = f.ts
+                                status.pending_entry_side = None
+                                mfe_ticks = 0.0
+                                mae_ticks = 0.0
                 elif status.open_position is not None:
                     skip_exit_eval = False
                     if config["live_mode"] and status.live_state == "RECOVERING":
@@ -3193,7 +3268,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     )
                                 elif exit_confirmed:
                                     status.live_state = "EXIT_SENT"
-                                    result = execute_live_exit(client, config, pos.side, storage, pos, p, status)
+                                    result = execute_live_exit(
+                                        client,
+                                        config,
+                                        pos.side,
+                                        storage,
+                                        pos,
+                                        p,
+                                        status,
+                                        latest_snapshot=snap,
+                                        force_marketable_limit=(pos.strategy == "RSI9"),
+                                        force_market_order=False,
+                                    )
                                     if not result.ok:
                                         exit_confirmed = False
                                         status.exit_fail_count += 1
@@ -3324,7 +3410,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             time.sleep(config["poll_interval_sec"])
         except KeyboardInterrupt:
             storage.log("INFO", "STOP", "keyboard interrupt")
-            force_close_open_position(client, config, storage, status, "KEYBOARD_INTERRUPT", now_jst(), last_pred)
+            force_close_open_position(client, config, storage, status, "KEYBOARD_INTERRUPT", now_jst(), last_pred, latest_snapshot=None, use_market_order=False)
             break
         except Exception as e:
             print(f"[ERROR] {e}")
