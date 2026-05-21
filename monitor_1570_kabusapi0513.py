@@ -2727,7 +2727,14 @@ def execute_live_exit(
                 exit_order_mode = "market_1520_force_close"
             elif force_marketable_limit or pos.strategy == "RSI9":
                 front_order_type = 20
-                limit_price = marketable_exit_limit_price(pos, latest_snapshot)
+                refreshed_snapshot = latest_snapshot
+                try:
+                    raw_board = client.get_board(str(config.get("symbol", SYMBOL_DEFAULT)), int(config.get("exchange", EXCHANGE_DEFAULT)))
+                    refreshed_snapshot = extract_snapshot(raw_board)
+                    latest_snapshot = refreshed_snapshot
+                except Exception as e:
+                    storage.log("WARN", "EXIT_BOARD_REFRESH_FAILED", f"attempt={attempt+1} side={side} strategy={pos.strategy} error={e}")
+                limit_price = marketable_exit_limit_price(pos, refreshed_snapshot)
                 exit_order_mode = "marketable_limit"
                 if limit_price is None or limit_price <= 0:
                     return LiveOrderResult(False, "MARKETABLE_EXIT_LIMIT_PRICE_UNAVAILABLE", recoverable=True)
