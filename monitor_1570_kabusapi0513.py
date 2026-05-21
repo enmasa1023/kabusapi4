@@ -117,10 +117,10 @@ SCALP_EXIT_PARAMS: dict[str, tuple[int, int, int, int]] = {
 
 RSI9_PERIOD = 9
 RSI9_LONG_ENTRY = 20.0
-RSI9_LONG_TP = 70.0
+RSI9_LONG_TP = 50.0
 RSI9_LONG_SL = 0.0
-RSI9_SHORT_ENTRY = 80.0
-RSI9_SHORT_TP = 30.0
+RSI9_SHORT_ENTRY = 70.0
+RSI9_SHORT_TP = 40.0
 RSI9_SHORT_SL = 0.0
 
 
@@ -465,7 +465,6 @@ class PositionState:
     take_profit_trigger_ts: Optional[datetime] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
-    rsi_added: bool = False
 
 
 @dataclass
@@ -1505,18 +1504,33 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
     if bar1 is None:
         return None
     closes = [b.close for b in history]
-    rsi = rsi9_wilder(closes, RSI9_PERIOD)
-    if rsi is None:
+    if len(closes) <= RSI9_PERIOD + 1:
         return None
+
+    # latest RSI and previous RSI (2-consecutive condition)
+    rsi_now = rsi9_wilder(closes, RSI9_PERIOD)
+    rsi_prev = rsi9_wilder(closes[:-1], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 1 else None
+    if rsi_now is None or rsi_prev is None:
+        return None
+
     signal = "NO_ACTION"
     side = "NEUTRAL"
-    if open_pos is None:
-        if rsi <= RSI9_LONG_ENTRY:
-            signal, side = "LONG_CANDIDATE", "LONG"
-        elif rsi >= RSI9_SHORT_ENTRY:
-            signal, side = "SHORT_CANDIDATE", "SHORT"
-    else:
+
+    # No-entry window: 09:00-09:15 JST (inclusive)
+    in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
+
+    if open_pos is None and not in_no_entry:
+        ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
+        if ma_ok:
+            long_ma = bar1.ma75 > bar1.ma25 > bar1.ma5
+            short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
+            if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
+                signal, side = "LONG_CANDIDATE", "LONG"
+            elif short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
+                signal, side = "SHORT_CANDIDATE", "SHORT"
+    elif open_pos is not None:
         side = open_pos.side
+
     return PredictionSnapshot(
         ts=bar1.ts,
         regime="RSI9",
@@ -1525,9 +1539,9 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
         p_up_3m=0.5,
         p_down_3m=0.5,
         signal=signal,
-        rsi9_value=rsi,
+        rsi9_value=rsi_now,
         reason_1="RSI9_ONLY",
-        reason_2=f"rsi9={rsi:.2f}",
+        reason_2=f"rsi9={rsi_now:.2f}",
         reason_3="rule_based",
     )
 
@@ -1621,12 +1635,10 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
                 rsi = None
         if rsi is not None:
             if pos.side == "LONG":
-                tp = 60.0 if pos.rsi_added else RSI9_LONG_TP
-                if rsi >= tp:
+                if rsi >= RSI9_LONG_TP:
                     return True, "TAKE_PROFIT", 0.0
             else:
-                tp = 40.0 if pos.rsi_added else RSI9_SHORT_TP
-                if rsi <= tp:
+                if rsi <= RSI9_SHORT_TP:
                     return True, "TAKE_PROFIT", 0.0
         # RSI9 is TP-only by design: disable all generic market-stop/time-stop exits.
         return False, "HOLD", 0.0
@@ -3124,18 +3136,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         mfe_ticks = max(mfe_ticks, cur_pnl_ticks)
                         mae_ticks = min(mae_ticks, cur_pnl_ticks)
                         live_tp_already_filled = False
-                        # RSI9 add-on: +1 lot on extreme RSI, executed on next 1m open tick
-                        if pos.strategy == "RSI9" and current_rsi is not None and not pos.rsi_added:
-                            if (pos.side == "LONG" and current_rsi <= 10.0) or (pos.side == "SHORT" and current_rsi >= 90.0):
-                                if config["live_mode"]:
-                                    add_result = execute_live_entry(client, config, pos.side, storage, pos, p, status, latest_snapshot=snap)
-                                    if add_result.ok:
-                                        pos.rsi_added = True
-                                        pos.entry_price = (pos.entry_price + f.price) / 2.0
-                                        storage.log("INFO", "RSI_ADD_OK", f"side={pos.side} order_id={add_result.order_id} rsi={current_rsi:.2f}")
-                                else:
-                                    pos.rsi_added = True
-                                    pos.entry_price = (pos.entry_price + f.price) / 2.0
 
                         if config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
                             pos.exit_fill_price = take_profit_limit_price(pos)
