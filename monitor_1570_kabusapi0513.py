@@ -1628,6 +1628,8 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
                 tp = 40.0 if pos.rsi_added else RSI9_SHORT_TP
                 if rsi <= tp:
                     return True, "TAKE_PROFIT", 0.0
+        # RSI9 is TP-only by design: disable all generic market-stop/time-stop exits.
+        return False, "HOLD", 0.0
 
     pnl_ticks = price_to_ticks(f.price - pos.entry_price, pos.entry_price)
     if pos.side == "SHORT":
@@ -2778,6 +2780,9 @@ def force_close_open_position(
     pos = status.open_position
     if pos is None:
         return
+    if pos.strategy == "RSI9":
+        storage.log("WARN", "FORCE_EXIT_SKIPPED_RSI9", f"reason={reason} side={pos.side}")
+        return
     if not config.get("live_mode"):
         storage.log("WARN", "FORCE_EXIT_PAPER_CLEAR", f"reason={reason} side={pos.side}")
         status.open_position = None
@@ -3145,11 +3150,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 pos.take_profit_trigger_ts = f.ts
                             signal_wait_sec = (f.ts - pos.take_profit_trigger_ts).total_seconds()
                             fallback_wait_sec = take_profit_fallback_after_signal_sec(config)
-                            if holding_sec_now >= pos.max_hold_sec:
+                            if pos.strategy != "RSI9" and holding_sec_now >= pos.max_hold_sec:
                                 ex_reason = "TIME_STOP"
                                 pnl_ticks = cur_pnl_ticks
                                 storage.log("WARN", "TAKE_PROFIT_LIMIT_TIMEOUT", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} holding_sec={holding_sec_now:.1f}")
-                            elif signal_wait_sec >= fallback_wait_sec:
+                            elif pos.strategy != "RSI9" and signal_wait_sec >= fallback_wait_sec:
                                 ex_reason = "TAKE_PROFIT_MARKET_FALLBACK"
                                 pnl_ticks = cur_pnl_ticks
                                 storage.log("WARN", "TAKE_PROFIT_LIMIT_FALLBACK", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} signal_wait_sec={signal_wait_sec:.1f} fallback_wait_sec={fallback_wait_sec:.1f}")
