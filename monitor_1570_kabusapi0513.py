@@ -2833,6 +2833,14 @@ def force_close_open_position(
         status.live_state = "FLAT"
         return
 
+    if latest_snapshot is None and not use_market_order:
+        try:
+            raw_board = client.get_board(str(config.get("symbol", SYMBOL_DEFAULT)), int(config.get("exchange", EXCHANGE_DEFAULT)))
+            latest_snapshot = extract_snapshot(raw_board)
+            storage.log("INFO", "FORCE_CLOSE_SNAPSHOT_REFRESHED", f"reason={reason} side={pos.side} strategy={pos.strategy}")
+        except Exception as e:
+            storage.log("ERROR", "FORCE_CLOSE_SNAPSHOT_REFRESH_FAILED", f"reason={reason} side={pos.side} strategy={pos.strategy} error={e}")
+
     context = order_context(config, pos.side, pos, last_pred, status)
     context["force_exit_reason"] = reason
     if pos.take_profit_order_id:
@@ -2874,6 +2882,8 @@ def force_close_open_position(
     status.last_error_message = result.message
     status.live_state = "EXIT_VERIFYING"
     storage.log("ERROR", "FORCE_EXIT_FAIL", f"reason={reason} side={pos.side} message={result.message}")
+    if not use_market_order and status.open_position is not None:
+        storage.log("ERROR", "MANUAL_POSITION_CHECK_REQUIRED", f"reason={reason} side={pos.side} strategy={pos.strategy} message={result.message}")
     rec = reconcile_live_position(
         client,
         config,
@@ -3018,6 +3028,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     last_feature: Optional[FeatureSnapshot] = None
     last_pred: Optional[PredictionSnapshot] = None
     last_gate: Optional[GateDecision] = None
+    last_snapshot: Optional[TickSnapshot] = None
     mfe_ticks = 0.0
     mae_ticks = 0.0
 
@@ -3026,15 +3037,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
         tstr = now_.strftime("%H:%M:%S")
         if end_ts and now_ >= end_ts:
             storage.log("INFO", "STOP_RUNTIME", "runtime end reached")
-            force_close_open_position(client, config, storage, status, "STOP_RUNTIME", now_, last_pred, latest_snapshot=None, use_market_order=False)
+            force_close_open_position(client, config, storage, status, "STOP_RUNTIME", now_, last_pred, latest_snapshot=last_snapshot, use_market_order=False)
             break
         if tstr >= STOP_AFTER:
             storage.log("INFO", "STOP_AFTER_SESSION", "session end reached")
-            force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred, latest_snapshot=None, use_market_order=False)
+            force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred, latest_snapshot=last_snapshot, use_market_order=False)
             break
         try:
             raw = client.get_board(config["symbol"], config["exchange"])
             snap = extract_snapshot(raw)
+            last_snapshot = snap
             tick_buf.append(snap)
             spread_ticks = calc_spread_ticks(snap)
             storage.insert_snapshot(snap, spread_ticks)
@@ -3220,22 +3232,43 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             ex, ex_reason, pnl_ticks = should_exit(pos, f, p)
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
-                            holding_sec_now = (f.ts - pos.entry_ts).total_seconds()
-                            if pos.take_profit_trigger_ts is None:
-                                pos.take_profit_trigger_ts = f.ts
-                            signal_wait_sec = (f.ts - pos.take_profit_trigger_ts).total_seconds()
-                            fallback_wait_sec = take_profit_fallback_after_signal_sec(config)
-                            if pos.strategy != "RSI9" and holding_sec_now >= pos.max_hold_sec:
-                                ex_reason = "TIME_STOP"
-                                pnl_ticks = cur_pnl_ticks
-                                storage.log("WARN", "TAKE_PROFIT_LIMIT_TIMEOUT", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} holding_sec={holding_sec_now:.1f}")
-                            elif pos.strategy != "RSI9" and signal_wait_sec >= fallback_wait_sec:
-                                ex_reason = "TAKE_PROFIT_MARKET_FALLBACK"
-                                pnl_ticks = cur_pnl_ticks
-                                storage.log("WARN", "TAKE_PROFIT_LIMIT_FALLBACK", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} signal_wait_sec={signal_wait_sec:.1f} fallback_wait_sec={fallback_wait_sec:.1f}")
+                            if pos.strategy == "RSI9":
+                                context = order_context(config, pos.side, pos, p, status)
+                                cancel_ok, filled_during_cancel = cancel_pending_take_profit_order(client, config, storage, pos, context)
+                                if filled_during_cancel:
+                                    live_tp_already_filled = True
+                                    ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                                    pnl_ticks = take_profit_filled_ticks(pos)
+                                elif not cancel_ok:
+                                    ex = False
+                                    status.live_state = "RECOVERING"
+                                    status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                                    storage.log("ERROR", "RSI9_OLD_TP_CANCEL_FAILED", f"side={pos.side} strategy={pos.strategy} order_id={pos.take_profit_order_id}")
+                                else:
+                                    pos.take_profit_order_id = None
+                                    storage.log("INFO", "RSI9_OLD_TP_CANCELLED_BEFORE_EXIT", f"side={pos.side} strategy={pos.strategy}")
+                            if ex and not live_tp_already_filled and pos.strategy == "RSI9":
+                                pass
+                            elif pos.strategy == "RSI9":
+                                # do not enter TAKE_PROFIT_LIMIT_WAIT flow for RSI9
+                                pass
                             else:
-                                storage.log("INFO", "TAKE_PROFIT_LIMIT_WAIT", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} signal_wait_sec={signal_wait_sec:.1f} fallback_wait_sec={fallback_wait_sec:.1f}")
-                                ex = False
+                                holding_sec_now = (f.ts - pos.entry_ts).total_seconds()
+                                if pos.take_profit_trigger_ts is None:
+                                    pos.take_profit_trigger_ts = f.ts
+                                signal_wait_sec = (f.ts - pos.take_profit_trigger_ts).total_seconds()
+                                fallback_wait_sec = take_profit_fallback_after_signal_sec(config)
+                                if holding_sec_now >= pos.max_hold_sec:
+                                    ex_reason = "TIME_STOP"
+                                    pnl_ticks = cur_pnl_ticks
+                                    storage.log("WARN", "TAKE_PROFIT_LIMIT_TIMEOUT", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} holding_sec={holding_sec_now:.1f}")
+                                elif signal_wait_sec >= fallback_wait_sec:
+                                    ex_reason = "TAKE_PROFIT_MARKET_FALLBACK"
+                                    pnl_ticks = cur_pnl_ticks
+                                    storage.log("WARN", "TAKE_PROFIT_LIMIT_FALLBACK", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} signal_wait_sec={signal_wait_sec:.1f} fallback_wait_sec={fallback_wait_sec:.1f}")
+                                else:
+                                    storage.log("INFO", "TAKE_PROFIT_LIMIT_WAIT", f"{pos.side} order_id={pos.take_profit_order_id} target={take_profit_limit_price(pos):.1f} signal_wait_sec={signal_wait_sec:.1f} fallback_wait_sec={fallback_wait_sec:.1f}")
+                                    ex = False
                         elif not (ex and ex_reason == "TAKE_PROFIT"):
                             pos.take_profit_trigger_ts = None
 
@@ -3410,7 +3443,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             time.sleep(config["poll_interval_sec"])
         except KeyboardInterrupt:
             storage.log("INFO", "STOP", "keyboard interrupt")
-            force_close_open_position(client, config, storage, status, "KEYBOARD_INTERRUPT", now_jst(), last_pred, latest_snapshot=None, use_market_order=False)
+            force_close_open_position(client, config, storage, status, "KEYBOARD_INTERRUPT", now_jst(), last_pred, latest_snapshot=last_snapshot, use_market_order=False)
             break
         except Exception as e:
             print(f"[ERROR] {e}")
