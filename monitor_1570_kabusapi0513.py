@@ -466,6 +466,9 @@ class PositionState:
     take_profit_trigger_ts: Optional[datetime] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
+    rsi_special_entry: bool = False
+    rsi_special_tp_stage: int = 0
+    rsi_special_tp_order_ts: Optional[datetime] = None
 
 
 @dataclass
@@ -1528,7 +1531,10 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
             if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
                 signal, side = "LONG_CANDIDATE", "LONG"
-            elif short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
+            rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
+            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (bar1.close > (bar1.ma5 or 1e18)) and (bar1.close > (bar1.ma25 or 1e18)) and (bar1.close > (bar1.ma75 or 1e18)):
+                signal, side = "LONG_CANDIDATE", "LONG"
+            elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
     elif open_pos is not None:
         side = open_pos.side
@@ -1623,6 +1629,7 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
+        rsi_special_entry=(pred.reason_3 == "rule_based"),
     )
 
 
@@ -3230,6 +3237,29 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         mfe_ticks = max(mfe_ticks, cur_pnl_ticks)
                         mae_ticks = min(mae_ticks, cur_pnl_ticks)
                         live_tp_already_filled = False
+
+                        if pos.strategy == "RSI9" and pos.rsi_special_entry and config["live_mode"] and pos.entry_fill_price is not None:
+                            elapsed_special = (f.ts - (pos.rsi_special_tp_order_ts or pos.entry_ts)).total_seconds() if pos.rsi_special_tp_order_ts else 0
+                            target_ticks = 10 if pos.rsi_special_tp_stage == 0 else 5
+                            if pos.take_profit_order_id is None:
+                                pos.take_ticks = target_ticks
+                                tp_res = place_take_profit_limit_order(client, config, storage, pos, p, status)
+                                if tp_res.ok:
+                                    pos.take_profit_order_id = tp_res.order_id
+                                    pos.rsi_special_tp_order_ts = f.ts
+                            elif pos.rsi_special_tp_stage == 0 and elapsed_special >= 300:
+                                context = order_context(config, pos.side, pos, p, status)
+                                cancel_ok, filled = cancel_pending_take_profit_order(client, config, storage, pos, context)
+                                if filled:
+                                    live_tp_already_filled = True
+                                    ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
+                                elif cancel_ok:
+                                    pos.rsi_special_tp_stage = 1
+                                    pos.take_ticks = 5
+                                    tp_res2 = place_take_profit_limit_order(client, config, storage, pos, p, status)
+                                    if tp_res2.ok:
+                                        pos.take_profit_order_id = tp_res2.order_id
+                                        pos.rsi_special_tp_order_ts = f.ts
 
                         if config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
                             pos.exit_fill_price = take_profit_limit_price(pos)
