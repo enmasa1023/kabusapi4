@@ -1520,6 +1520,7 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
 
     signal = "NO_ACTION"
     side = "NEUTRAL"
+    entry_rule = "none"
 
     # No-entry window: 09:00-09:15 JST (inclusive)
     in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
@@ -1531,12 +1532,15 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
             if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
                 signal, side = "LONG_CANDIDATE", "LONG"
+                entry_rule = "long_a"
             rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
             if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (not all_ma_below):
                 signal, side = "LONG_CANDIDATE", "LONG"
+                entry_rule = "long_b_drop"
             elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
+                entry_rule = "short_frozen"
     elif open_pos is not None:
         side = open_pos.side
 
@@ -1551,7 +1555,7 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
         rsi9_value=rsi_now,
         reason_1="RSI9_ONLY",
         reason_2=f"rsi9={rsi_now:.2f}",
-        reason_3="rule_based",
+        reason_3=entry_rule,
     )
 
 
@@ -1630,7 +1634,7 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
-        rsi_special_entry=(pred.reason_3 == "rule_based"),
+        rsi_special_entry=(pred.reason_3 == "long_b_drop"),
     )
 
 
