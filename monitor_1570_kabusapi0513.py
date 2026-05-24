@@ -1644,7 +1644,7 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
                 rsi = None
         if rsi is not None:
             if pos.side == "LONG":
-                if rsi >= RSI9_LONG_TP:
+                if (not pos.rsi_special_entry) and rsi >= RSI9_LONG_TP:
                     return True, "TAKE_PROFIT", 0.0
             else:
                 if rsi <= RSI9_SHORT_TP:
