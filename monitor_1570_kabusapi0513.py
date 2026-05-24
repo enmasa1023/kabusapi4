@@ -1532,7 +1532,8 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
             if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
                 signal, side = "LONG_CANDIDATE", "LONG"
             rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
-            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (bar1.close > (bar1.ma5 or 1e18)) and (bar1.close > (bar1.ma25 or 1e18)) and (bar1.close > (bar1.ma75 or 1e18)):
+            all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
+            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (not all_ma_below):
                 signal, side = "LONG_CANDIDATE", "LONG"
             elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
