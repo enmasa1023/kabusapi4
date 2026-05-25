@@ -1052,6 +1052,61 @@ class RollingBars:
         return bar
 
 
+
+def preload_prev_day_1m_bars(outdir: str, today_db_path: str, limit: int = 120) -> list[Bar]:
+    """Load recent 1m bars from the most recent previous monitor DB in outdir."""
+    today_name = os.path.basename(today_db_path)
+    cands: list[tuple[str, str]] = []
+    for name in os.listdir(outdir):
+        if not (name.startswith("monitor_1570_") and name.endswith(".db")):
+            continue
+        if name == today_name:
+            continue
+        date_part = name[len("monitor_1570_"):-len(".db")]
+        if len(date_part) == 8 and date_part.isdigit():
+            cands.append((date_part, os.path.join(outdir, name)))
+    if not cands:
+        return []
+    cands.sort(key=lambda x: x[0], reverse=True)
+    prev_db_path = cands[0][1]
+    con = sqlite3.connect(prev_db_path)
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT ts,open,high,low,close,volume,vwap,ma5,ma13,ma25,ma75,atr14
+            FROM bars_1m
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    finally:
+        con.close()
+    bars: list[Bar] = []
+    for row in reversed(rows):
+        try:
+            bars.append(
+                Bar(
+                    ts=datetime.fromisoformat(str(row[0])),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5] or 0.0),
+                    vwap=float(row[6] or row[4]),
+                    ma5=(float(row[7]) if row[7] is not None else None),
+                    ma13=(float(row[8]) if row[8] is not None else None),
+                    ma25=(float(row[9]) if row[9] is not None else None),
+                    ma75=(float(row[10]) if row[10] is not None else None),
+                    atr14=(float(row[11]) if row[11] is not None else None),
+                )
+            )
+        except Exception:
+            continue
+    return bars
+
 def extract_snapshot(raw: dict[str, Any]) -> TickSnapshot:
     def g(path: str) -> Any:
         cur: Any = raw
@@ -3032,6 +3087,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     tick_buf: deque[TickSnapshot] = deque(maxlen=2000)
     rb1 = RollingBars(1)
     rb3 = RollingBars(3)
+    try:
+        warm_bars = preload_prev_day_1m_bars(outdir, db_path, limit=int(config.get("prev_day_warmup_bars", 120)))
+        if warm_bars:
+            for b in warm_bars:
+                rb1.history.append(b)
+            storage.log("INFO", "WARMUP_1M_PREV_DB", f"loaded={len(warm_bars)}")
+        else:
+            storage.log("INFO", "WARMUP_1M_PREV_DB", "loaded=0")
+    except Exception as e:
+        storage.log("WARN", "WARMUP_1M_PREV_DB_FAIL", str(e))
     status = MonitorStatus()
     adaptive = AdaptiveControlState(enabled=bool(config.get("adaptive_control", ADAPTIVE_CONTROL_ENABLED)))
     volatility_gate = VolatilityRegimeGate(config.get("volatility_regime_gate", {}))
