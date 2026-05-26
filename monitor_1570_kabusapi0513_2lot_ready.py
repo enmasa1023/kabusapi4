@@ -144,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--api-password", dest="api_password", default=None)
     p.add_argument("--live-mode", action="store_true")
+    p.add_argument("--paper-mode", action="store_true")
     p.add_argument("--order-password", default=None)
     p.add_argument("--order-qty", type=int, default=None)
     p.add_argument("--account-type", type=int, default=None)
@@ -1637,8 +1638,8 @@ def can_enter(side: str, now_: datetime, state: MonitorStatus) -> tuple[bool, st
         return False, "ENTRY_GLOBAL_BLOCK"
     if state.recovery_until and now_ < state.recovery_until:
         return False, "RECOVERY_COOLDOWN"
-    if state.live_state == "RECOVERING":
-        return False, "RECOVERING"
+    if state.live_state in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
+        return False, state.live_state
     block_until = state.reentry_block_until_by_side.get(side)
     if block_until and now_ < block_until:
         return False, "REENTRY_BLOCK"
@@ -3082,6 +3083,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     storage.log_structured("INFO", "STARTUP_CONFIG", {"live_mode": config.get("live_mode"), "order_qty": config.get("order_qty"), "entry_min_fill_qty": config.get("entry_min_fill_qty"), "order_exchange": config.get("order_exchange"), "exit_order_exchange": config.get("exit_order_exchange")})
 
     client = KabuApiClient(config["base_url"])
+    status = MonitorStatus()
     token_ok = False
     start_errors: list[str] = []
     for _ in range(3):
@@ -3104,7 +3106,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             tq,mq = summarize_positions(sp)
             storage.log_structured("INFO", "STARTUP_POSITION_CHECK", {"total_qty": tq, "matching_qty": mq, "positions_json": sp})
             if tq > 0:
-                status = MonitorStatus(live_state="RECOVERING")
+                status.live_state = "MANUAL_POSITION_CHECK_REQUIRED"
                 storage.log("WARN", "MANUAL_POSITION_CHECK_REQUIRED", "startup detected existing positions; new entry paused")
         except Exception as e:
             storage.log("ERROR", "STARTUP_POSITION_CHECK", str(e))
@@ -3130,7 +3132,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             storage.log("INFO", "WARMUP_1M_PREV_DB", "loaded=0")
     except Exception as e:
         storage.log("WARN", "WARMUP_1M_PREV_DB_FAIL", str(e))
-    status = MonitorStatus()
     adaptive = AdaptiveControlState(enabled=bool(config.get("adaptive_control", ADAPTIVE_CONTROL_ENABLED)))
     volatility_gate = VolatilityRegimeGate(config.get("volatility_regime_gate", {}))
     set_vwap_mode(str(config.get("initial_vwap_mode", adaptive.vwap_mode)))
@@ -3263,7 +3264,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         status.live_state = "ENTRY_SENT"
                                         result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
                                         if not result.ok:
-                                            status.live_state = "FLAT"
+                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else 0
+                                            if actual_qty > 0:
+                                                candidate_pos.filled_qty = int(actual_qty)
+                                                candidate_pos.order_qty = int(config.get("order_qty", 2))
+                                                candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
+                                                status.open_position = candidate_pos
+                                                status.live_state = "OPEN"
+                                                storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
+                                            else:
+                                                status.live_state = "FLAT"
                                             status.last_error_code = result.api_code
                                             status.last_error_message = result.message
                                             storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
