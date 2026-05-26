@@ -22,7 +22,7 @@ import os
 import sqlite3
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib import error, request
