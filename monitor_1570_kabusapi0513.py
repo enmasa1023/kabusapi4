@@ -2755,7 +2755,8 @@ def execute_live_exit(
     force_marketable_limit: bool = False,
     force_market_order: bool = False,
 ) -> LiveOrderResult:
-    retries = max(int(config.get("live_retry_max", LIVE_RETRY_MAX)), 0)
+    exit_exec = config.get("exit_execution", {}) if isinstance(config.get("exit_execution", {}), dict) else {}
+    retries = max(int(exit_exec.get("max_reprice_attempts", config.get("live_retry_max", LIVE_RETRY_MAX))), 0)
     timeout_sec = int(config.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC))
     context = order_context(config, side, pos, pred, status)
     last = LiveOrderResult(False, "EXIT_UNKNOWN_ERROR", recoverable=True)
@@ -2786,6 +2787,7 @@ def execute_live_exit(
                 recoverable=True,
             )
 
+        initial_leaves_qty = leaves_qty
         order_ids: list[str] = []
         for position_exchange, close_positions, group_total_qty in close_position_groups:
             if force_market_order:
@@ -2884,6 +2886,18 @@ def execute_live_exit(
                         return LiveOrderResult(True, order_id, order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""))
                     last = LiveOrderResult(False, f"EXIT_CANCEL_ALREADY_FILLED_VERIFY_POSITION order_id={order_id}", order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""), recoverable=True)
                     break
+        remaining_leaves_qty, _, _ = get_matching_position_quantities(
+            fetch_positions(client, config, storage, reason="EXIT_REPRICE_REMAINING_QTY"),
+            side,
+            margin_trade_type=pos.margin_trade_type,
+        )
+        storage.log_structured(
+            "INFO",
+            "EXIT_REPRICE_LOOP",
+            {**context, "attempt": attempt + 1, "initial_leaves_qty": initial_leaves_qty, "remaining_leaves_qty": remaining_leaves_qty, "order_ids": order_ids},
+        )
+        if remaining_leaves_qty <= 0:
+            return LiveOrderResult(True, combined_order_id, order_id=combined_order_id)
     return last
 
 
