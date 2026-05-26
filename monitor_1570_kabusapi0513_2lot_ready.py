@@ -22,7 +22,7 @@ import os
 import sqlite3
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib import error, request
@@ -463,6 +463,10 @@ class PositionState:
     entry_order_id: Optional[str] = None
     exit_order_id: Optional[str] = None
     take_profit_order_id: Optional[str] = None
+    take_profit_order_ids: list[str] = field(default_factory=list)
+    order_qty: int = 2
+    filled_qty: int = 0
+    remaining_qty: int = 0
     take_profit_trigger_ts: Optional[datetime] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
@@ -1690,6 +1694,9 @@ def create_position(
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
         rsi_special_entry=(pred.reason_3 == "long_b_drop"),
+        order_qty=int(config.get("order_qty",2)),
+        filled_qty=0,
+        remaining_qty=0,
     )
 
 
@@ -2779,6 +2786,7 @@ def execute_live_exit(
         if not positions:
             return LiveOrderResult(False, "NO_POSITIONS_FOR_EXIT", recoverable=True)
         if leaves_qty <= 0:
+            storage.log("INFO", "POSITION_ALREADY_CLOSED", f"side={side}")
             return LiveOrderResult(False, "NO_MATCHING_OPEN_POSITION", recoverable=True)
         if total_qty <= 0 or not close_position_groups:
             return LiveOrderResult(
@@ -3071,6 +3079,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     midday_report_path = os.path.join(outdir, f"midday_report_{jst_date_str()}.md")
     storage = Storage(db_path)
     storage.log("INFO", "START", "monitor start")
+    storage.log_structured("INFO", "STARTUP_CONFIG", {"live_mode": config.get("live_mode"), "order_qty": config.get("order_qty"), "entry_min_fill_qty": config.get("entry_min_fill_qty"), "order_exchange": config.get("order_exchange"), "exit_order_exchange": config.get("exit_order_exchange")})
 
     client = KabuApiClient(config["base_url"])
     token_ok = False
@@ -3089,6 +3098,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             print(f"[ERROR] startup auth/register failed: {err}")
             storage.log("ERROR", "TOKEN_FAIL", err)
             time.sleep(1)
+    if config.get("live_mode"):
+        try:
+            sp = fetch_positions(client, config, storage, reason="STARTUP_POSITION_CHECK")
+            tq,mq = summarize_positions(sp)
+            storage.log_structured("INFO", "STARTUP_POSITION_CHECK", {"total_qty": tq, "matching_qty": mq, "positions_json": sp})
+            if tq > 0:
+                status = MonitorStatus(live_state="RECOVERING")
+                storage.log("WARN", "MANUAL_POSITION_CHECK_REQUIRED", "startup detected existing positions; new entry paused")
+        except Exception as e:
+            storage.log("ERROR", "STARTUP_POSITION_CHECK", str(e))
     if not token_ok:
         generate_report(db_path, daily_report_path)
         detail = start_errors[-1] if start_errors else "unknown startup error"
@@ -3274,8 +3293,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 p.reason_1,
                                                 candidate_pos.entry_fill_price,
                                             )
+                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else int(config.get("order_qty", 2))
+                                            candidate_pos.filled_qty = int(actual_qty)
+                                            candidate_pos.order_qty = int(config.get("order_qty", 2))
+                                            candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
                                             status.open_position = candidate_pos
                                             status.live_state = "OPEN"
+                                            if candidate_pos.filled_qty >= candidate_pos.order_qty:
+                                                storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
+                                            elif candidate_pos.filled_qty > 0:
+                                                storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
+                                            else:
+                                                storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
                                             take_profit_cfg = config.get("take_profit_execution", {})
                                             if candidate_pos.strategy == "RSI9":
                                                 storage.log("INFO", "RSI9_TAKE_PROFIT_LIMIT_SKIP", f"side={candidate_pos.side} strategy=RSI9")
@@ -3468,6 +3497,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         status.exit_fail_count = 0
                                         status.live_state = "FLAT"
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
+                                        rem_qty = get_open_position_qty(client, config, pos.side, margin_trade_type=pos.margin_trade_type)
+                                        if rem_qty <= 0:
+                                            storage.log("INFO", "EXIT_FULLY_FILLED", f"side={pos.side}")
+                                        else:
+                                            storage.log("WARN", "EXIT_PARTIAL_REMAINING", f"side={pos.side} remaining_qty={rem_qty}")
                                         storage.insert_execution_fill_price(
                                             "EXIT_FILL_PRICE",
                                             result.order_id,
@@ -3595,10 +3629,10 @@ def main() -> None:
     apply_runtime_threshold_overrides(cfg)
     config = {
         "api_password": args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "live_mode": bool(args.live_mode or cfg.get("live_mode", False)),
+        "live_mode": (False if args.paper_mode else bool(args.live_mode or cfg.get("live_mode", True))),
         "order_password": args.order_password or cfg.get("order_password") or args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "order_qty": int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 1)),
-        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", cfg.get("order_qty", 1))),
+        "order_qty": int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)),
+        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", (args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)))),
         "account_type": int(args.account_type if args.account_type is not None else cfg.get("account_type", 4)),
         "margin_trade_type": int(args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3)),
         "margin_trade_type_long": int(cfg.get("margin_trade_type_long", args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3))),
@@ -3650,6 +3684,10 @@ def main() -> None:
         raise SystemExit("entry_min_fill_qty must be > 0 in live_mode.")
     if config["live_mode"] and int(config["entry_min_fill_qty"]) > int(config["order_qty"]):
         raise SystemExit("entry_min_fill_qty must be <= order_qty in live_mode.")
+    if config["live_mode"] and int(config["order_qty"]) != 2:
+        raise SystemExit("2lot-ready mode requires order_qty == 2 in live_mode.")
+    if config["live_mode"] and int(config["entry_min_fill_qty"]) != 2:
+        raise SystemExit("2lot-ready mode requires entry_min_fill_qty == 2 in live_mode.")
     if config["live_mode"] and int(config["live_entry_timeout_sec"]) <= 0:
         raise SystemExit("live_entry_timeout_sec must be > 0 in live_mode.")
     if config["live_mode"] and int(config["live_exit_timeout_sec"]) <= 0:
