@@ -85,5 +85,6 @@
   "take_profit_execution": {
     "enabled": true,
     "fallback_market_after_signal_sec": 180.0
-  }
+  },
+  "force_close_after": "15:20:00"
 }
