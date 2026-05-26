@@ -3271,6 +3271,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
                                                 status.open_position = candidate_pos
                                                 status.live_state = "OPEN"
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
+                                                status.last_entry_ts_by_side[side] = f.ts
                                                 storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
                                             else:
                                                 status.live_state = "FLAT"
@@ -3505,12 +3508,17 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.exit_order_id = result.order_id
                                         pos.exit_fill_price = f.price
                                         status.exit_fail_count = 0
-                                        status.live_state = "FLAT"
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
                                         rem_qty = get_open_position_qty(client, config, pos.side, margin_trade_type=pos.margin_trade_type)
                                         if rem_qty <= 0:
+                                            status.live_state = "FLAT"
                                             storage.log("INFO", "EXIT_FULLY_FILLED", f"side={pos.side}")
                                         else:
+                                            pos.filled_qty = int(rem_qty)
+                                            pos.remaining_qty = 0
+                                            status.open_position = pos
+                                            status.live_state = "RECOVERING"
+                                            exit_confirmed = False
                                             storage.log("WARN", "EXIT_PARTIAL_REMAINING", f"side={pos.side} remaining_qty={rem_qty}")
                                         storage.insert_execution_fill_price(
                                             "EXIT_FILL_PRICE",
