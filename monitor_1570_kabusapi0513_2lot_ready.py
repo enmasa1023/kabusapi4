@@ -2441,68 +2441,34 @@ def cancel_pending_take_profit_order(
     pos: PositionState,
     context: dict[str, Any],
 ) -> tuple[bool, bool]:
-    order_id = pos.take_profit_order_id
-    if not order_id:
+    order_ids = list(pos.take_profit_order_ids or [])
+    if not order_ids and pos.take_profit_order_id:
+        order_ids = [pos.take_profit_order_id]
+    if not order_ids:
         return True, False
-    cancel_payload = {"OrderId": order_id}
-    storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_REQUEST", {**context, "order_id": order_id, "request_json": cancel_payload})
-    try:
-        cres = client.cancel_order(order_id, config["order_password"])
-        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_RESPONSE", {**context, "order_id": order_id, "raw_response_json": cres})
-        pos.take_profit_order_id = None
-        unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
-            client,
-            config,
-            pos.side,
-            margin_trade_type=pos.margin_trade_type,
-            timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
-        )
-        storage.log_structured(
-            "INFO" if unlocked else "WARN",
-            "TAKE_PROFIT_CANCEL_VERIFY",
-            {
-                **context,
-                "order_id": order_id,
-                "unlocked": unlocked,
-                "filled": filled,
-                "leaves_qty": leaves,
-                "hold_qty": hold,
-                "available_qty": available,
-                "positions_json": positions,
-            },
-        )
-        return unlocked, filled
-    except Exception as e:
-        ep = api_error_payload(e)
-        code = str(ep.get("api_code") or "")
-        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_FAIL", {**context, "order_id": order_id, **ep}, mirror_message=f"TAKE_PROFIT_CANCEL_FAIL order_id={order_id} Code={code} Message={ep.get('api_message')}")
-        unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
-            client,
-            config,
-            pos.side,
-            margin_trade_type=pos.margin_trade_type,
-            timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
-        )
-        storage.log_structured(
-            "INFO" if unlocked else "WARN",
-            "TAKE_PROFIT_CANCEL_FAIL_VERIFY",
-            {
-                **context,
-                "order_id": order_id,
-                "api_code": code,
-                "unlocked": unlocked,
-                "filled": filled,
-                "leaves_qty": leaves,
-                "hold_qty": hold,
-                "available_qty": available,
-                "positions_json": positions,
-            },
-        )
-        if unlocked:
-            pos.take_profit_order_id = None
-            return True, filled
-        return False, False
-
+    any_fail = False
+    for order_id in order_ids:
+        cancel_payload = {"OrderId": order_id}
+        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_SENT", {**context, "order_id": order_id, "request_json": cancel_payload})
+        try:
+            cres = client.cancel_order(order_id, config["order_password"])
+            storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_RESPONSE", {**context, "order_id": order_id, "raw_response_json": cres})
+        except Exception as e:
+            ep = api_error_payload(e)
+            any_fail = True
+            storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_FAIL", {**context, "order_id": order_id, **ep})
+    pos.take_profit_order_id = None
+    pos.take_profit_order_ids = []
+    unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
+        client,
+        config,
+        pos.side,
+        margin_trade_type=pos.margin_trade_type,
+        timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
+    )
+    if any_fail:
+        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_PARTIAL_FAILED", {**context, "leaves_qty": leaves, "positions_json": positions})
+    return unlocked, filled
 
 def place_take_profit_limit_order(
     client: KabuApiClient,
@@ -2522,52 +2488,35 @@ def place_take_profit_limit_order(
     )
     if not close_position_groups:
         return LiveOrderResult(False, "TAKE_PROFIT_NO_MATCHING_OPEN_POSITION", recoverable=True)
-    if len(close_position_groups) > 1:
-        storage.log_structured(
-            "WARN",
-            "TAKE_PROFIT_MULTI_EXCHANGE_UNSUPPORTED",
-            {
-                **context,
-                "close_position_groups": [
-                    {"exchange": exchange, "close_positions": close_positions, "total_qty": total_qty}
-                    for exchange, close_positions, total_qty in close_position_groups
-                ],
-                "positions_json": positions,
-            },
-        )
-        return LiveOrderResult(False, "TAKE_PROFIT_MULTI_EXCHANGE_UNSUPPORTED", recoverable=True)
-    position_exchange, close_positions, total_qty = close_position_groups[0]
-    if total_qty <= 0 or not close_positions:
-        return LiveOrderResult(False, "TAKE_PROFIT_NO_MATCHING_OPEN_POSITION", recoverable=True)
     limit_price = take_profit_limit_price(pos)
-    payload = build_exit_order_payload(
-        config,
-        pos.side,
-        close_positions=close_positions,
-        qty=total_qty,
-        front_order_type=20,
-        price=limit_price,
-        margin_trade_type=pos.margin_trade_type,
-        exchange=position_exchange,
-    )
-    storage.log_structured(
-        "INFO",
-        "TAKE_PROFIT_ORDER_REQUEST",
-        {**context, "position_exchange": position_exchange, "request_json": payload, "limit_price": limit_price, "positions_json": positions},
-    )
-    try:
-        res = client.send_order(payload)
-    except Exception as e:
-        ep = api_error_payload(e)
-        code = str(ep.get("api_code") or "")
-        storage.log_structured("ERROR", "TAKE_PROFIT_ORDER_FAIL", {**context, **ep, "request_json": payload, "positions_json": positions}, mirror_message=f"TAKE_PROFIT_SEND_ERROR Code={code} Message={ep.get('api_message')}")
-        return LiveOrderResult(False, f"TAKE_PROFIT_SEND_ERROR Code={code} Message={ep.get('api_message')}: {ep.get('raw_error')}", api_code=code, api_message=str(ep.get("api_message") or ""), recoverable=True)
-    order_id = str(res.get("OrderId") or res.get("OrderID") or "")
-    storage.log_structured("INFO", "TAKE_PROFIT_ORDER_RESPONSE", {**context, "order_id": order_id, "raw_response_json": res})
-    if not order_id:
-        return LiveOrderResult(False, f"TAKE_PROFIT_ORDER_ID_MISSING: {res}", recoverable=True)
-    return LiveOrderResult(True, order_id, order_id=order_id)
-
+    order_ids: list[str] = []
+    for position_exchange, close_positions, total_qty in close_position_groups:
+        if total_qty <= 0 or not close_positions:
+            continue
+        payload = build_exit_order_payload(
+            config,
+            pos.side,
+            close_positions=close_positions,
+            qty=total_qty,
+            front_order_type=20,
+            price=limit_price,
+            margin_trade_type=pos.margin_trade_type,
+            exchange=position_exchange,
+        )
+        storage.log_structured("INFO", "TAKE_PROFIT_ORDER_SENT", {**context, "position_exchange": position_exchange, "request_json": payload, "limit_price": limit_price})
+        try:
+            res = client.send_order(payload)
+        except Exception as e:
+            ep = api_error_payload(e)
+            return LiveOrderResult(False, f"TAKE_PROFIT_SEND_ERROR Code={ep.get('api_code')} Message={ep.get('api_message')}: {ep.get('raw_error')}", api_code=str(ep.get('api_code') or ''), api_message=str(ep.get('api_message') or ''), recoverable=True)
+        order_id = str(res.get("OrderId") or res.get("OrderID") or "")
+        if order_id:
+            order_ids.append(order_id)
+    if not order_ids:
+        return LiveOrderResult(False, "TAKE_PROFIT_ORDER_ID_MISSING", recoverable=True)
+    pos.take_profit_order_ids = order_ids
+    pos.take_profit_order_id = order_ids[0]
+    return LiveOrderResult(True, ",".join(order_ids), order_id=",".join(order_ids))
 
 def verify_position_after_entry_cancel(
     client: KabuApiClient,
@@ -3277,6 +3226,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
                                             else:
                                                 status.live_state = "FLAT"
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
                                             status.last_error_code = result.api_code
                                             status.last_error_message = result.message
                                             storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
