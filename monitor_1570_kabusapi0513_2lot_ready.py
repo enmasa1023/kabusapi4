@@ -1631,14 +1631,19 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
                 entry_rule = "long_a"
             rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
-            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (not all_ma_below):
+            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
                 slope2m = ma75_slope_2m(history)
                 ma75_current = history[-1].ma75 if len(history) >= 1 else None
                 ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
                 if slope2m is not None and slope2m > 0:
-                    signal, side = "LONG_CANDIDATE", "LONG"
-                    entry_rule = "long_b_drop_ma75_up"
-                    print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                    if all_ma_below:
+                        signal, side = "NO_ACTION", "NEUTRAL"
+                        entry_rule = "drop17_long_blocked_all_ma_below"
+                        print(f"[INFO] DROP17_LONG_BLOCKED_ALL_MA_BELOW rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                    else:
+                        signal, side = "LONG_CANDIDATE", "LONG"
+                        entry_rule = "long_b_drop_ma75_up"
+                        print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
                 elif slope2m is not None and slope2m < 0:
                     signal, side = "SHORT_CANDIDATE", "SHORT"
                     entry_rule = "short_b_drop_ma75_down"
