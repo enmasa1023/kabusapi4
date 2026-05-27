@@ -3243,31 +3243,47 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
 
                 if status.pending_add and status.open_position is not None and status.open_position.side == "LONG":
                     pos_add = status.open_position
-                    if force_close_time_reached:
+                    if pos_add.rsi10_add_done:
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=ALREADY_ADDED_PENDING_CLEARED")
+                    elif pos_add.take_profit_order_id is not None:
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=ACTIVE_TP_ORDER_PENDING_CLEARED")
+                    elif status.live_state != "OPEN":
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason=LIVE_STATE_{status.live_state}_PENDING_CLEARED")
+                    elif force_close_time_reached:
                         status.pending_add = False
                     else:
                         current_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else int(pos_add.filled_qty)
-                        add_qty = int(config.get("order_qty", 2))
-                        target_total_qty = int(current_qty + add_qty)
-                        add_pred = PredictionSnapshot(ts=f.ts, regime="RSI9", p_up_1m=0.5,p_down_1m=0.5,p_up_3m=0.5,p_down_3m=0.5, signal="LONG_CANDIDATE", rsi9_value=current_rsi, reason_1="RSI9_ADD", reason_2=f"rsi9={current_rsi if current_rsi is not None else 0:.2f}", reason_3="rsi10_add")
-                        add_res = execute_live_entry(client, config, "LONG", storage, pos_add, add_pred, status, latest_snapshot=snap, target_total_qty_override=target_total_qty, qty_override=add_qty)
-                        if add_res.ok:
-                            pos_add.rsi10_add_done = True
-                            new_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else target_total_qty
-                            pos_add.filled_qty = int(new_qty)
-                            pos_add.order_qty = int(new_qty)
-                            pos_add.remaining_qty = 0
-                            try:
-                                entry_positions = fetch_positions(client, config, storage, reason="POST_ADD_FILL_PRICE")
-                                avg = average_price_from_positions(entry_positions, "LONG", margin_trade_type=pos_add.margin_trade_type)
-                                if avg is not None:
-                                    pos_add.entry_fill_price = avg
-                                    pos_add.entry_price = avg
-                            except Exception:
-                                pass
-                            storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
+                        if config.get("live_mode") and current_qty <= 0:
+                            status.pending_add = False
+                            status.live_state = "RECOVERING"
+                            storage.log("WARN", "RSI9_LONG_ADD_FAIL", "reason=INCONSISTENT_NO_POSITION existing_qty=0")
                         else:
-                            storage.log("WARN", "RSI9_LONG_ADD_FAIL", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} message={add_res.message}")
+                            add_qty = int(config.get("order_qty", 2))
+                            target_total_qty = int(current_qty + add_qty)
+                            add_pred = PredictionSnapshot(ts=f.ts, regime="RSI9", p_up_1m=0.5,p_down_1m=0.5,p_up_3m=0.5,p_down_3m=0.5, signal="LONG_CANDIDATE", rsi9_value=current_rsi, reason_1="RSI9_ADD", reason_2=f"rsi9={current_rsi if current_rsi is not None else 0:.2f}", reason_3="rsi10_add")
+                            add_res = execute_live_entry(client, config, "LONG", storage, pos_add, add_pred, status, latest_snapshot=snap, target_total_qty_override=target_total_qty, qty_override=add_qty)
+                            if add_res.ok:
+                                status.pending_add = False
+                                pos_add.rsi10_add_done = True
+                                new_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else target_total_qty
+                                pos_add.filled_qty = int(new_qty)
+                                pos_add.order_qty = int(new_qty)
+                                pos_add.remaining_qty = 0
+                                try:
+                                    entry_positions = fetch_positions(client, config, storage, reason="POST_ADD_FILL_PRICE")
+                                    avg = average_price_from_positions(entry_positions, "LONG", margin_trade_type=pos_add.margin_trade_type)
+                                    if avg is not None:
+                                        pos_add.entry_fill_price = avg
+                                        pos_add.entry_price = avg
+                                except Exception:
+                                    pass
+                                storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
+                            else:
+                                status.pending_add = False
+                                storage.log("WARN", "RSI9_LONG_ADD_FAIL", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} message={add_res.message}")
 
                 if status.pending_entry_side and status.open_position is None:
                     if force_close_time_reached:
