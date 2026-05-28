@@ -54,7 +54,8 @@ TRADE_WINDOWS = [
 ]
 STOP_AFTER = "15:30:00"
 FORCE_CLOSE_AFTER = "15:20:00"
-MIDDAY_ORDER_CANCEL_TIME = "11:29:00"
+MIDDAY_ORDER_CANCEL_START = "11:29:00"
+MIDDAY_ORDER_CANCEL_END = "11:30:30"
 
 # v1.6 exit-tuned parameters
 SPREAD_TICKS_MAX = 2.0
@@ -544,6 +545,7 @@ class MonitorStatus:
     pending_exit: bool = False
     force_market_close_sent: bool = False
     midday_order_cleanup_done: bool = False
+    midday_bar_finalize_done: bool = False
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -1011,7 +1013,9 @@ class RollingBars:
             bar = self._finalize_bar(self.current_bucket, self.rows)
             self.history.append(bar)
             self.rows = []
+            self.current_bucket = None
             return self._decorate_bar(bar)
+        self.current_bucket = None
         return None
 
     def latest(self) -> Optional[Bar]:
@@ -3101,33 +3105,63 @@ def midday_order_cleanup(
     storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_START", {"ts": ts.isoformat(), "live_state": status.live_state, "open_position": position_state_payload(pos)})
     order_ids: list[str] = []
     if pos is not None:
-        order_ids.extend(_split_order_ids(pos.entry_order_id))
         order_ids.extend(_split_order_ids(pos.exit_order_id))
         order_ids.extend(_split_order_ids(pos.take_profit_order_id))
         order_ids.extend([oid for oid in (pos.take_profit_order_ids or []) if oid])
-    dedup=[]
-    seen=set()
+        if status.live_state in {"ENTRY_SENT", "ENTRY_PARTIAL", "ENTRY_RETRY"}:
+            order_ids.extend(_split_order_ids(pos.entry_order_id))
+    dedup: list[str] = []
+    seen: set[str] = set()
     for oid in order_ids:
-        if oid not in seen:
-            seen.add(oid); dedup.append(oid)
-    had_cancel_fail=False
+        if oid and oid not in seen:
+            seen.add(oid)
+            dedup.append(oid)
+
+    had_cancel_fail = False
+    cancelled_any = False
     for oid in dedup:
-        req={"OrderId": oid}
+        req = {"OrderId": oid}
         storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_REQUEST", {"order_id": oid, "request_json": req, "live_state": status.live_state, "open_position": position_state_payload(pos)})
         try:
-            res=client.cancel_order(oid, config["order_password"])
+            res = client.cancel_order(oid, config["order_password"])
+            cancelled_any = True
             storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_RESPONSE", {"order_id": oid, "raw_response_json": res})
         except Exception as e:
-            had_cancel_fail=True
+            had_cancel_fail = True
             storage.log_structured("ERROR", "MIDDAY_ORDER_CANCEL_FAIL", {"order_id": oid, **api_error_payload(e)})
+
     positions = fetch_positions(client, config, storage, reason="MIDDAY_ORDER_CLEANUP_POST_CHECK") if config.get("live_mode") else []
-    if had_cancel_fail:
+    rec_ok = True
+    rec_message = ""
+    if config.get("live_mode") and pos is not None:
+        rec = reconcile_live_position(
+            client,
+            config,
+            status,
+            storage,
+            expected_side=pos.side,
+            reason="MIDDAY_ORDER_CLEANUP_POST_CHECK",
+            ts=ts,
+            expected_margin_trade_type=pos.margin_trade_type,
+        )
+        rec_ok = rec.ok
+        rec_message = rec.message
+
+    if pos is not None and cancelled_any:
+        pos.take_profit_order_id = None
+        pos.take_profit_order_ids = []
+        pos.exit_order_id = None
+
+    if had_cancel_fail and (not rec_ok):
         status.live_state = "RECOVERING"
-        storage.log_structured("WARN", "MIDDAY_ORDER_CLEANUP_RECOVERING", {"positions_json": positions, "live_state": status.live_state})
+        storage.log_structured("WARN", "MIDDAY_ORDER_CLEANUP_RECOVERING", {"positions_json": positions, "live_state": status.live_state, "reason": rec_message})
+    elif status.open_position is not None and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
+        status.live_state = "OPEN"
+
     status.pending_entry_side = None
     status.pending_entry_ts = None
     status.pending_add = False
-    if not had_cancel_fail:
+    if (not had_cancel_fail) or rec_ok:
         status.pending_exit = False
     status.midday_order_cleanup_done = True
     storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_DONE", {"positions_json": positions, "live_state": status.live_state, "open_position": position_state_payload(status.open_position)})
@@ -3237,14 +3271,25 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             if bar3_new:
                 storage.insert_bar("bars_3m", bar3_new)
 
-            if (not status.midday_order_cleanup_done) and tstr >= str(config.get("midday_order_cancel_time", MIDDAY_ORDER_CANCEL_TIME)):
+            midday_cancel_start = str(config.get("midday_order_cancel_start", MIDDAY_ORDER_CANCEL_START))
+            midday_cancel_end = str(config.get("midday_order_cancel_end", MIDDAY_ORDER_CANCEL_END))
+            if (
+                not status.midday_order_cleanup_done
+                and midday_cancel_start <= tstr < midday_cancel_end
+            ):
+                midday_order_cleanup(client, config, storage, status, now_)
+
+            if (
+                not status.midday_bar_finalize_done
+                and "11:30:00" <= tstr < "11:31:00"
+            ):
                 b1f = rb1.force_finalize()
                 if b1f:
                     storage.insert_bar("bars_1m", b1f)
                 b3f = rb3.force_finalize()
                 if b3f:
                     storage.insert_bar("bars_3m", b3f)
-                midday_order_cleanup(client, config, storage, status, now_)
+                status.midday_bar_finalize_done = True
 
             set_vwap_mode(adaptive.vwap_mode)
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
