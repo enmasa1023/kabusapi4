@@ -54,6 +54,7 @@ TRADE_WINDOWS = [
 ]
 STOP_AFTER = "15:30:00"
 FORCE_CLOSE_AFTER = "15:20:00"
+MIDDAY_ORDER_CANCEL_TIME = "11:29:00"
 
 # v1.6 exit-tuned parameters
 SPREAD_TICKS_MAX = 2.0
@@ -542,6 +543,7 @@ class MonitorStatus:
     pending_add: bool = False
     pending_exit: bool = False
     force_market_close_sent: bool = False
+    midday_order_cleanup_done: bool = False
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -3080,6 +3082,56 @@ def reconcile_live_position(
     return ReconcileResult(True, status.live_state, "MATCHED_OPEN", total_qty, matching_qty, positions)
 
 
+
+
+def _split_order_ids(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def midday_order_cleanup(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    ts: datetime,
+) -> None:
+    pos = status.open_position
+    storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_START", {"ts": ts.isoformat(), "live_state": status.live_state, "open_position": position_state_payload(pos)})
+    order_ids: list[str] = []
+    if pos is not None:
+        order_ids.extend(_split_order_ids(pos.entry_order_id))
+        order_ids.extend(_split_order_ids(pos.exit_order_id))
+        order_ids.extend(_split_order_ids(pos.take_profit_order_id))
+        order_ids.extend([oid for oid in (pos.take_profit_order_ids or []) if oid])
+    dedup=[]
+    seen=set()
+    for oid in order_ids:
+        if oid not in seen:
+            seen.add(oid); dedup.append(oid)
+    had_cancel_fail=False
+    for oid in dedup:
+        req={"OrderId": oid}
+        storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_REQUEST", {"order_id": oid, "request_json": req, "live_state": status.live_state, "open_position": position_state_payload(pos)})
+        try:
+            res=client.cancel_order(oid, config["order_password"])
+            storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_RESPONSE", {"order_id": oid, "raw_response_json": res})
+        except Exception as e:
+            had_cancel_fail=True
+            storage.log_structured("ERROR", "MIDDAY_ORDER_CANCEL_FAIL", {"order_id": oid, **api_error_payload(e)})
+    positions = fetch_positions(client, config, storage, reason="MIDDAY_ORDER_CLEANUP_POST_CHECK") if config.get("live_mode") else []
+    if had_cancel_fail:
+        status.live_state = "RECOVERING"
+        storage.log_structured("WARN", "MIDDAY_ORDER_CLEANUP_RECOVERING", {"positions_json": positions, "live_state": status.live_state})
+    status.pending_entry_side = None
+    status.pending_entry_ts = None
+    status.pending_add = False
+    if not had_cancel_fail:
+        status.pending_exit = False
+    status.midday_order_cleanup_done = True
+    storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_DONE", {"positions_json": positions, "live_state": status.live_state, "open_position": position_state_payload(status.open_position)})
+
 def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     outdir = config["outdir"]
     ensure_dir(outdir)
@@ -3184,6 +3236,15 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             bar3_new = rb3.update(snap)
             if bar3_new:
                 storage.insert_bar("bars_3m", bar3_new)
+
+            if (not status.midday_order_cleanup_done) and tstr >= str(config.get("midday_order_cancel_time", MIDDAY_ORDER_CANCEL_TIME)):
+                b1f = rb1.force_finalize()
+                if b1f:
+                    storage.insert_bar("bars_1m", b1f)
+                b3f = rb3.force_finalize()
+                if b3f:
+                    storage.insert_bar("bars_3m", b3f)
+                midday_order_cleanup(client, config, storage, status, now_)
 
             set_vwap_mode(adaptive.vwap_mode)
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
@@ -3753,6 +3814,12 @@ def main() -> None:
         "take_profit_execution": cfg.get("take_profit_execution", {"enabled": True, "fallback_market_after_signal_sec": 5.0}),
         "scalping": cfg.get("scalping", {"enabled": SCALPING_ENABLED}),
     }
+    afternoon_trade_start = str(cfg.get("afternoon_trade_start", "12:30:00"))
+    globals()["TRADE_WINDOWS"] = [
+        ("09:03:00", "11:25:00"),
+        (afternoon_trade_start, "15:20:00"),
+    ]
+
     if not config["api_password"]:
         raise SystemExit(
             "API password is required. Set API_PASSWORD_HARDCODED at the top, "
