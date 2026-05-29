@@ -1642,14 +1642,9 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
                 ma75_current = history[-1].ma75 if len(history) >= 1 else None
                 ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
                 if slope2m is not None and slope2m > 0:
-                    if all_ma_below:
-                        signal, side = "NO_ACTION", "NEUTRAL"
-                        entry_rule = "drop17_long_blocked_all_ma_below"
-                        print(f"[INFO] DROP17_LONG_BLOCKED_ALL_MA_BELOW rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
-                    else:
-                        signal, side = "LONG_CANDIDATE", "LONG"
-                        entry_rule = "long_b_drop_ma75_up"
-                        print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                    signal, side = "LONG_CANDIDATE", "LONG"
+                    entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
+                    print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
                 elif slope2m is not None and slope2m < 0:
                     signal, side = "SHORT_CANDIDATE", "SHORT"
                     entry_rule = "short_b_drop_ma75_down"
@@ -1754,7 +1749,7 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
-        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "short_b_drop_ma75_down"}),
+        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down"}),
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
