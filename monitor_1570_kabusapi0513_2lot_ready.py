@@ -3102,69 +3102,84 @@ def midday_order_cleanup(
     ts: datetime,
 ) -> None:
     pos = status.open_position
-    storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_START", {"ts": ts.isoformat(), "live_state": status.live_state, "open_position": position_state_payload(pos)})
-    order_ids: list[str] = []
-    if pos is not None:
-        order_ids.extend(_split_order_ids(pos.exit_order_id))
-        order_ids.extend(_split_order_ids(pos.take_profit_order_id))
-        order_ids.extend([oid for oid in (pos.take_profit_order_ids or []) if oid])
-        if status.live_state in {"ENTRY_SENT", "ENTRY_PARTIAL", "ENTRY_RETRY"}:
-            order_ids.extend(_split_order_ids(pos.entry_order_id))
+    kept_payload = {
+        "kept_take_profit_order_id": pos.take_profit_order_id if pos else None,
+        "kept_take_profit_order_ids": list(pos.take_profit_order_ids or []) if pos else [],
+        "kept_exit_order_id": pos.exit_order_id if pos else None,
+    }
+    base_payload = {
+        "ts": ts.isoformat(),
+        "live_state": status.live_state,
+        "pending_entry_side": status.pending_entry_side,
+        "open_position": position_state_payload(pos),
+        **kept_payload,
+    }
+    storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_START", base_payload)
+
+    entry_order_ids: list[str] = []
+    entry_order_state = status.live_state in {"ENTRY_SENT", "ENTRY_PARTIAL", "ENTRY_RETRY"}
+    pending_entry_state = status.pending_entry_side is not None
+    if pos is not None and (entry_order_state or pending_entry_state):
+        entry_order_ids.extend(_split_order_ids(pos.entry_order_id))
+
     dedup: list[str] = []
     seen: set[str] = set()
-    for oid in order_ids:
+    for oid in entry_order_ids:
         if oid and oid not in seen:
             seen.add(oid)
             dedup.append(oid)
+
+    if not dedup:
+        storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_SKIPPED_NO_ENTRY_ORDER", base_payload)
 
     had_cancel_fail = False
     cancelled_any = False
     for oid in dedup:
         req = {"OrderId": oid}
-        storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_REQUEST", {"order_id": oid, "request_json": req, "live_state": status.live_state, "open_position": position_state_payload(pos)})
+        storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CANCEL_REQUEST", {**base_payload, "order_id": oid, "request_json": req})
         try:
             res = client.cancel_order(oid, config["order_password"])
             cancelled_any = True
-            storage.log_structured("WARN", "MIDDAY_ORDER_CANCEL_RESPONSE", {"order_id": oid, "raw_response_json": res})
+            storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CANCEL_RESPONSE", {**base_payload, "order_id": oid, "raw_response_json": res})
         except Exception as e:
             had_cancel_fail = True
-            storage.log_structured("ERROR", "MIDDAY_ORDER_CANCEL_FAIL", {"order_id": oid, **api_error_payload(e)})
+            storage.log_structured("ERROR", "MIDDAY_ENTRY_ORDER_CANCEL_FAIL", {**base_payload, "order_id": oid, **api_error_payload(e)})
 
-    positions = fetch_positions(client, config, storage, reason="MIDDAY_ORDER_CLEANUP_POST_CHECK") if config.get("live_mode") else []
+    positions = fetch_positions(client, config, storage, reason="MIDDAY_ENTRY_ORDER_CLEANUP_POST_CHECK") if config.get("live_mode") and (cancelled_any or had_cancel_fail) else []
     rec_ok = True
     rec_message = ""
-    if config.get("live_mode") and pos is not None:
+    if config.get("live_mode") and pos is not None and (cancelled_any or had_cancel_fail):
         rec = reconcile_live_position(
             client,
             config,
             status,
             storage,
             expected_side=pos.side,
-            reason="MIDDAY_ORDER_CLEANUP_POST_CHECK",
+            reason="MIDDAY_ENTRY_ORDER_CLEANUP_POST_CHECK",
             ts=ts,
             expected_margin_trade_type=pos.margin_trade_type,
         )
         rec_ok = rec.ok_for_entry
         rec_message = rec.message
 
-    if pos is not None and cancelled_any:
-        pos.take_profit_order_id = None
-        pos.take_profit_order_ids = []
-        pos.exit_order_id = None
-
     if had_cancel_fail and (not rec_ok):
         status.live_state = "RECOVERING"
-        storage.log_structured("WARN", "MIDDAY_ORDER_CLEANUP_RECOVERING", {"positions_json": positions, "live_state": status.live_state, "reason": rec_message})
-    elif status.open_position is not None and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
-        status.live_state = "OPEN"
+        storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CLEANUP_RECOVERING", {**base_payload, "positions_json": positions, "live_state": status.live_state, "reason": rec_message})
 
     status.pending_entry_side = None
     status.pending_entry_ts = None
     status.pending_add = False
-    if (not had_cancel_fail) or rec_ok:
-        status.pending_exit = False
     status.midday_order_cleanup_done = True
-    storage.log_structured("INFO", "MIDDAY_ORDER_CLEANUP_DONE", {"positions_json": positions, "live_state": status.live_state, "open_position": position_state_payload(status.open_position)})
+    done_payload = {
+        **base_payload,
+        "cancelled_entry_order_ids": dedup,
+        "cancelled_any": cancelled_any,
+        "had_cancel_fail": had_cancel_fail,
+        "positions_json": positions,
+        "live_state": status.live_state,
+        "open_position": position_state_payload(status.open_position),
+    }
+    storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_DONE", done_payload)
 
 def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     outdir = config["outdir"]
