@@ -3572,7 +3572,13 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.take_profit_order_id = tp_res2.order_id
                                         pos.rsi_special_tp_order_ts = f.ts
 
-                        if config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
+                        if live_tp_already_filled:
+                            ex = True
+                            ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                            if pos.exit_fill_price is None:
+                                pos.exit_fill_price = take_profit_limit_price(pos)
+                            pnl_ticks = take_profit_filled_ticks(pos)
+                        elif config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
                             pos.exit_fill_price = take_profit_limit_price(pos)
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
                             live_tp_already_filled = True
@@ -3586,6 +3592,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 if filled_during_cancel:
                                     live_tp_already_filled = True
                                     ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                                    if pos.exit_fill_price is None:
+                                        pos.exit_fill_price = take_profit_limit_price(pos)
                                     pnl_ticks = take_profit_filled_ticks(pos)
                                 elif not cancel_ok:
                                     ex = False
@@ -3629,6 +3637,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     if filled_during_cancel:
                                         live_tp_already_filled = True
                                         ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                                        if pos.exit_fill_price is None:
+                                            pos.exit_fill_price = take_profit_limit_price(pos)
                                         pnl_ticks = take_profit_filled_ticks(pos)
                                     elif not cancel_ok:
                                         exit_confirmed = False
@@ -3638,6 +3648,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 if exit_confirmed and live_tp_already_filled:
                                     status.exit_fail_count = 0
                                     status.live_state = "FLAT"
+                                    status.open_position = None
+                                    status.pending_exit = False
+                                    status.pending_add = False
                                     storage.log("INFO", "LIVE_TAKE_PROFIT_FILLED", f"{pos.side} order_id={pos.take_profit_order_id or pos.exit_order_id}")
                                     storage.insert_execution_fill_price(
                                         "EXIT_FILL_PRICE",
