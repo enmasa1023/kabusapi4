@@ -1759,7 +1759,7 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
-        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down"}),
+        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down", "short_c_rise17_no_ma75_slope"}),
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
