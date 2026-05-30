@@ -126,6 +126,7 @@ RSI9_SHORT_ENTRY = 70.0
 RSI9_SHORT_TP = 40.0
 RSI9_SHORT_SL = 0.0
 RSI9_LONG_ADD_ENTRY = 10.0
+RSI9_RISE_2M_SHORT_DELTA = 17.0
 
 
 def now_jst() -> datetime:
@@ -1628,34 +1629,43 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
     in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
 
     if open_pos is None and not in_no_entry:
-        ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
-        if ma_ok:
-            long_ma = bar1.ma75 > bar1.ma25 > bar1.ma5
-            short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
-            if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
-                signal, side = "LONG_CANDIDATE", "LONG"
-                entry_rule = "long_a"
-            rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
-            all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
-            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
-                slope2m = ma75_slope_2m(history)
-                ma75_current = history[-1].ma75 if len(history) >= 1 else None
-                ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
-                if slope2m is not None and slope2m > 0:
+        rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
+        if rsi_prev2 is not None and (rsi_now - rsi_prev2) >= RSI9_RISE_2M_SHORT_DELTA:
+            signal, side = "SHORT_CANDIDATE", "SHORT"
+            entry_rule = "short_c_rise17_no_ma75_slope"
+            print(
+                f"[INFO] RISE17_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} "
+                f"rsi_prev2={rsi_prev2:.2f} delta={rsi_now - rsi_prev2:.2f} ma75_slope_ignored=True",
+                flush=True,
+            )
+        else:
+            ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
+            if ma_ok:
+                long_ma = bar1.ma75 > bar1.ma25 > bar1.ma5
+                short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
+                if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
                     signal, side = "LONG_CANDIDATE", "LONG"
-                    entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
-                    print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
-                elif slope2m is not None and slope2m < 0:
+                    entry_rule = "long_a"
+                all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
+                if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
+                    slope2m = ma75_slope_2m(history)
+                    ma75_current = history[-1].ma75 if len(history) >= 1 else None
+                    ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
+                    if slope2m is not None and slope2m > 0:
+                        signal, side = "LONG_CANDIDATE", "LONG"
+                        entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
+                        print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
+                    elif slope2m is not None and slope2m < 0:
+                        signal, side = "SHORT_CANDIDATE", "SHORT"
+                        entry_rule = "short_b_drop_ma75_down"
+                        print(f"[INFO] DROP17_MA75_SLOPE_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                    else:
+                        signal, side = "NO_ACTION", "NEUTRAL"
+                        entry_rule = "drop17_ma75_flat_or_unknown"
+                        print(f"[INFO] DROP17_MA75_SLOPE_SKIP rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                     signal, side = "SHORT_CANDIDATE", "SHORT"
-                    entry_rule = "short_b_drop_ma75_down"
-                    print(f"[INFO] DROP17_MA75_SLOPE_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
-                else:
-                    signal, side = "NO_ACTION", "NEUTRAL"
-                    entry_rule = "drop17_ma75_flat_or_unknown"
-                    print(f"[INFO] DROP17_MA75_SLOPE_SKIP rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
-            elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
-                signal, side = "SHORT_CANDIDATE", "SHORT"
-                entry_rule = "short_frozen"
+                    entry_rule = "short_frozen"
     elif open_pos is not None:
         side = open_pos.side
 
