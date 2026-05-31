@@ -22,7 +22,7 @@ import os
 import sqlite3
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from urllib import error, request
@@ -54,6 +54,8 @@ TRADE_WINDOWS = [
 ]
 STOP_AFTER = "15:30:00"
 FORCE_CLOSE_AFTER = "15:20:00"
+MIDDAY_ORDER_CANCEL_START = "11:29:00"
+MIDDAY_ORDER_CANCEL_END = "11:30:30"
 
 # v1.6 exit-tuned parameters
 SPREAD_TICKS_MAX = 2.0
@@ -123,6 +125,8 @@ RSI9_LONG_SL = 0.0
 RSI9_SHORT_ENTRY = 70.0
 RSI9_SHORT_TP = 40.0
 RSI9_SHORT_SL = 0.0
+RSI9_LONG_ADD_ENTRY = 10.0
+RSI20_LONG_WATCH_MINUTES = 10
 
 
 def now_jst() -> datetime:
@@ -144,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--api-password", dest="api_password", default=None)
     p.add_argument("--live-mode", action="store_true")
+    p.add_argument("--paper-mode", action="store_true")
     p.add_argument("--order-password", default=None)
     p.add_argument("--order-qty", type=int, default=None)
     p.add_argument("--account-type", type=int, default=None)
@@ -463,12 +468,17 @@ class PositionState:
     entry_order_id: Optional[str] = None
     exit_order_id: Optional[str] = None
     take_profit_order_id: Optional[str] = None
+    take_profit_order_ids: list[str] = field(default_factory=list)
+    order_qty: int = 2
+    filled_qty: int = 0
+    remaining_qty: int = 0
     take_profit_trigger_ts: Optional[datetime] = None
     entry_fill_price: Optional[float] = None
     exit_fill_price: Optional[float] = None
     rsi_special_entry: bool = False
     rsi_special_tp_stage: int = 0
     rsi_special_tp_order_ts: Optional[datetime] = None
+    rsi10_add_done: bool = False
 
 
 @dataclass
@@ -535,6 +545,12 @@ class MonitorStatus:
     pending_add: bool = False
     pending_exit: bool = False
     force_market_close_sent: bool = False
+    midday_order_cleanup_done: bool = False
+    midday_bar_finalize_done: bool = False
+    rsi20_long_watch_active: bool = False
+    rsi20_long_watch_started_at: Optional[datetime] = None
+    rsi20_long_watch_expires_at: Optional[datetime] = None
+    rsi20_long_watch_started_rsi: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -1002,7 +1018,9 @@ class RollingBars:
             bar = self._finalize_bar(self.current_bucket, self.rows)
             self.history.append(bar)
             self.rows = []
+            self.current_bucket = None
             return self._decorate_bar(bar)
+        self.current_bucket = None
         return None
 
     def latest(self) -> Optional[Bar]:
@@ -1560,7 +1578,100 @@ def rsi9_wilder(closes: list[float], period: int = RSI9_PERIOD) -> Optional[floa
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Optional[PositionState]) -> Optional[PredictionSnapshot]:
+
+
+def ma75_slope_2m(history: list[Bar]) -> Optional[float]:
+    if len(history) < 3:
+        return None
+    current = history[-1].ma75
+    two_min_ago = history[-3].ma75
+    if current is None or two_min_ago is None:
+        return None
+    return current - two_min_ago
+
+
+def should_rsi9_long_add(bar1: Optional[Bar], history: list[Bar], open_pos: Optional[PositionState]) -> tuple[bool, str]:
+    if bar1 is None or open_pos is None:
+        return False, "NO_BAR_OR_POSITION"
+    if open_pos.side != "LONG" or open_pos.strategy != "RSI9":
+        return False, "NOT_LONG_RSI9"
+    if open_pos.rsi10_add_done:
+        return False, "ALREADY_ADDED"
+    if open_pos.take_profit_order_id is not None:
+        return False, "ACTIVE_TP_ORDER"
+    closes=[b.close for b in history]
+    if len(closes) <= RSI9_PERIOD + 1:
+        return False, "INSUFFICIENT_HISTORY"
+    rsi_now = rsi9_wilder(closes, RSI9_PERIOD)
+    rsi_prev = rsi9_wilder(closes[:-1], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 1 else None
+    if rsi_now is None or rsi_prev is None:
+        return False, "RSI_UNAVAILABLE"
+    in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
+    if in_no_entry:
+        return False, "NO_ENTRY_WINDOW"
+    if rsi_now <= RSI9_LONG_ADD_ENTRY and rsi_prev <= RSI9_LONG_ADD_ENTRY:
+        return True, "rsi10_add"
+    return False, "RSI_NOT_LOW_ENOUGH"
+def clear_rsi20_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    event: str,
+    ts: datetime,
+    rsi_now: Optional[float],
+    rsi_prev: Optional[float],
+    reason: str,
+) -> None:
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "watch_started_at": status.rsi20_long_watch_started_at.isoformat() if status.rsi20_long_watch_started_at else None,
+        "watch_expires_at": status.rsi20_long_watch_expires_at.isoformat() if status.rsi20_long_watch_expires_at else None,
+        "reason": reason,
+    }
+    if storage is not None:
+        storage.log_structured("INFO", event, payload)
+    else:
+        print(f"[INFO] {event} {payload}", flush=True)
+    status.rsi20_long_watch_active = False
+    status.rsi20_long_watch_started_at = None
+    status.rsi20_long_watch_expires_at = None
+    status.rsi20_long_watch_started_rsi = None
+
+
+def start_rsi20_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    ts: datetime,
+    rsi_now: float,
+    rsi_prev: float,
+) -> None:
+    status.rsi20_long_watch_active = True
+    status.rsi20_long_watch_started_at = ts
+    status.rsi20_long_watch_expires_at = ts + timedelta(minutes=RSI20_LONG_WATCH_MINUTES)
+    status.rsi20_long_watch_started_rsi = rsi_now
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "watch_started_at": status.rsi20_long_watch_started_at.isoformat(),
+        "watch_expires_at": status.rsi20_long_watch_expires_at.isoformat(),
+        "reason": "RSI20_TWO_BARS_AND_REVERSE_MA",
+    }
+    if storage is not None:
+        storage.log_structured("INFO", "RSI20_LONG_WATCH_START", payload)
+    else:
+        print(f"[INFO] RSI20_LONG_WATCH_START {payload}", flush=True)
+
+
+def build_rsi9_prediction(
+    bar1: Optional[Bar],
+    history: list[Bar],
+    open_pos: Optional[PositionState],
+    status: Optional[MonitorStatus] = None,
+    storage: Optional[Storage] = None,
+    allow_new_entry: bool = True,
+) -> Optional[PredictionSnapshot]:
     if bar1 is None:
         return None
     closes = [b.close for b in history]
@@ -1580,22 +1691,57 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
     # No-entry window: 09:00-09:15 JST (inclusive)
     in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
 
-    if open_pos is None and not in_no_entry:
+    rsi20_watch_expired_this_bar = False
+    if status is not None and status.rsi20_long_watch_active:
+        if open_pos is not None:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "POSITION_OPEN")
+        elif in_no_entry:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NO_ENTRY_WINDOW")
+        elif not allow_new_entry:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NEW_ENTRY_NOT_ALLOWED")
+        elif status.rsi20_long_watch_expires_at and bar1.ts > status.rsi20_long_watch_expires_at:
+            rsi20_watch_expired_this_bar = True
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_EXPIRED", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
+
+    if open_pos is None and not in_no_entry and allow_new_entry:
+        rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
         ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
+        long_a_start = False
         if ma_ok:
             long_ma = bar1.ma75 > bar1.ma25 > bar1.ma5
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
-            if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
-                signal, side = "LONG_CANDIDATE", "LONG"
-                entry_rule = "long_a"
-            rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
+            long_a_start = long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
-            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0 and (not all_ma_below):
-                signal, side = "LONG_CANDIDATE", "LONG"
-                entry_rule = "long_b_drop"
+            if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
+                slope2m = ma75_slope_2m(history)
+                ma75_current = history[-1].ma75 if len(history) >= 1 else None
+                ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
+                if slope2m is not None and slope2m > 0:
+                    signal, side = "LONG_CANDIDATE", "LONG"
+                    entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
+                    print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
+                elif slope2m is not None and slope2m < 0:
+                    signal, side = "SHORT_CANDIDATE", "SHORT"
+                    entry_rule = "short_b_drop_ma75_down"
+                    print(f"[INFO] DROP17_MA75_SLOPE_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                else:
+                    signal, side = "NO_ACTION", "NEUTRAL"
+                    entry_rule = "drop17_ma75_flat_or_unknown"
+                    print(f"[INFO] DROP17_MA75_SLOPE_SKIP rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
             elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
                 entry_rule = "short_frozen"
+
+        if status is not None:
+            if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
+                if status.rsi20_long_watch_active:
+                    clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, f"SIGNAL_{entry_rule}")
+            elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
+                signal, side = "LONG_CANDIDATE", "LONG"
+                entry_rule = "long_a_reversal_watch"
+                clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, "RSI_TURNED_UP")
+            elif long_a_start and not status.rsi20_long_watch_active and not rsi20_watch_expired_this_bar:
+                start_rsi20_long_watch(status, storage, bar1.ts, rsi_now, rsi_prev)
     elif open_pos is not None:
         side = open_pos.side
 
@@ -1633,8 +1779,8 @@ def can_enter(side: str, now_: datetime, state: MonitorStatus) -> tuple[bool, st
         return False, "ENTRY_GLOBAL_BLOCK"
     if state.recovery_until and now_ < state.recovery_until:
         return False, "RECOVERY_COOLDOWN"
-    if state.live_state == "RECOVERING":
-        return False, "RECOVERING"
+    if state.live_state in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
+        return False, state.live_state
     block_until = state.reentry_block_until_by_side.get(side)
     if block_until and now_ < block_until:
         return False, "REENTRY_BLOCK"
@@ -1689,7 +1835,10 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
-        rsi_special_entry=(pred.reason_3 == "long_b_drop"),
+        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down"}),
+        order_qty=int(config.get("order_qty",2)),
+        filled_qty=0,
+        remaining_qty=0,
     )
 
 
@@ -1703,8 +1852,10 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
             except Exception:
                 rsi = None
         if rsi is not None:
+            if pos.rsi_special_entry:
+                return False, "HOLD", 0.0
             if pos.side == "LONG":
-                if (not pos.rsi_special_entry) and rsi >= RSI9_LONG_TP:
+                if rsi >= RSI9_LONG_TP:
                     return True, "TAKE_PROFIT", 0.0
             else:
                 if rsi <= RSI9_SHORT_TP:
@@ -2283,9 +2434,10 @@ def build_entry_order_payload(
     side: str,
     front_order_type: Optional[int] = None,
     price: Optional[float] = None,
+    qty_override: Optional[int] = None,
 ) -> dict[str, Any]:
     order_password = config["order_password"]
-    qty = int(config["order_qty"])
+    qty = int(qty_override if qty_override is not None else config["order_qty"])
     side_code = "2" if side == "LONG" else "1"
     payload: dict[str, Any] = {
         "Password": order_password,
@@ -2433,68 +2585,34 @@ def cancel_pending_take_profit_order(
     pos: PositionState,
     context: dict[str, Any],
 ) -> tuple[bool, bool]:
-    order_id = pos.take_profit_order_id
-    if not order_id:
+    order_ids = list(pos.take_profit_order_ids or [])
+    if not order_ids and pos.take_profit_order_id:
+        order_ids = [pos.take_profit_order_id]
+    if not order_ids:
         return True, False
-    cancel_payload = {"OrderId": order_id}
-    storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_REQUEST", {**context, "order_id": order_id, "request_json": cancel_payload})
-    try:
-        cres = client.cancel_order(order_id, config["order_password"])
-        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_RESPONSE", {**context, "order_id": order_id, "raw_response_json": cres})
-        pos.take_profit_order_id = None
-        unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
-            client,
-            config,
-            pos.side,
-            margin_trade_type=pos.margin_trade_type,
-            timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
-        )
-        storage.log_structured(
-            "INFO" if unlocked else "WARN",
-            "TAKE_PROFIT_CANCEL_VERIFY",
-            {
-                **context,
-                "order_id": order_id,
-                "unlocked": unlocked,
-                "filled": filled,
-                "leaves_qty": leaves,
-                "hold_qty": hold,
-                "available_qty": available,
-                "positions_json": positions,
-            },
-        )
-        return unlocked, filled
-    except Exception as e:
-        ep = api_error_payload(e)
-        code = str(ep.get("api_code") or "")
-        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_FAIL", {**context, "order_id": order_id, **ep}, mirror_message=f"TAKE_PROFIT_CANCEL_FAIL order_id={order_id} Code={code} Message={ep.get('api_message')}")
-        unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
-            client,
-            config,
-            pos.side,
-            margin_trade_type=pos.margin_trade_type,
-            timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
-        )
-        storage.log_structured(
-            "INFO" if unlocked else "WARN",
-            "TAKE_PROFIT_CANCEL_FAIL_VERIFY",
-            {
-                **context,
-                "order_id": order_id,
-                "api_code": code,
-                "unlocked": unlocked,
-                "filled": filled,
-                "leaves_qty": leaves,
-                "hold_qty": hold,
-                "available_qty": available,
-                "positions_json": positions,
-            },
-        )
-        if unlocked:
-            pos.take_profit_order_id = None
-            return True, filled
-        return False, False
-
+    any_fail = False
+    for order_id in order_ids:
+        cancel_payload = {"OrderId": order_id}
+        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_SENT", {**context, "order_id": order_id, "request_json": cancel_payload})
+        try:
+            cres = client.cancel_order(order_id, config["order_password"])
+            storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_RESPONSE", {**context, "order_id": order_id, "raw_response_json": cres})
+        except Exception as e:
+            ep = api_error_payload(e)
+            any_fail = True
+            storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_FAIL", {**context, "order_id": order_id, **ep})
+    pos.take_profit_order_id = None
+    pos.take_profit_order_ids = []
+    unlocked, filled, leaves, hold, available, positions = wait_for_position_unlocked_or_flat(
+        client,
+        config,
+        pos.side,
+        margin_trade_type=pos.margin_trade_type,
+        timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
+    )
+    if any_fail:
+        storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_PARTIAL_FAILED", {**context, "leaves_qty": leaves, "positions_json": positions})
+    return unlocked, filled
 
 def place_take_profit_limit_order(
     client: KabuApiClient,
@@ -2514,52 +2632,35 @@ def place_take_profit_limit_order(
     )
     if not close_position_groups:
         return LiveOrderResult(False, "TAKE_PROFIT_NO_MATCHING_OPEN_POSITION", recoverable=True)
-    if len(close_position_groups) > 1:
-        storage.log_structured(
-            "WARN",
-            "TAKE_PROFIT_MULTI_EXCHANGE_UNSUPPORTED",
-            {
-                **context,
-                "close_position_groups": [
-                    {"exchange": exchange, "close_positions": close_positions, "total_qty": total_qty}
-                    for exchange, close_positions, total_qty in close_position_groups
-                ],
-                "positions_json": positions,
-            },
-        )
-        return LiveOrderResult(False, "TAKE_PROFIT_MULTI_EXCHANGE_UNSUPPORTED", recoverable=True)
-    position_exchange, close_positions, total_qty = close_position_groups[0]
-    if total_qty <= 0 or not close_positions:
-        return LiveOrderResult(False, "TAKE_PROFIT_NO_MATCHING_OPEN_POSITION", recoverable=True)
     limit_price = take_profit_limit_price(pos)
-    payload = build_exit_order_payload(
-        config,
-        pos.side,
-        close_positions=close_positions,
-        qty=total_qty,
-        front_order_type=20,
-        price=limit_price,
-        margin_trade_type=pos.margin_trade_type,
-        exchange=position_exchange,
-    )
-    storage.log_structured(
-        "INFO",
-        "TAKE_PROFIT_ORDER_REQUEST",
-        {**context, "position_exchange": position_exchange, "request_json": payload, "limit_price": limit_price, "positions_json": positions},
-    )
-    try:
-        res = client.send_order(payload)
-    except Exception as e:
-        ep = api_error_payload(e)
-        code = str(ep.get("api_code") or "")
-        storage.log_structured("ERROR", "TAKE_PROFIT_ORDER_FAIL", {**context, **ep, "request_json": payload, "positions_json": positions}, mirror_message=f"TAKE_PROFIT_SEND_ERROR Code={code} Message={ep.get('api_message')}")
-        return LiveOrderResult(False, f"TAKE_PROFIT_SEND_ERROR Code={code} Message={ep.get('api_message')}: {ep.get('raw_error')}", api_code=code, api_message=str(ep.get("api_message") or ""), recoverable=True)
-    order_id = str(res.get("OrderId") or res.get("OrderID") or "")
-    storage.log_structured("INFO", "TAKE_PROFIT_ORDER_RESPONSE", {**context, "order_id": order_id, "raw_response_json": res})
-    if not order_id:
-        return LiveOrderResult(False, f"TAKE_PROFIT_ORDER_ID_MISSING: {res}", recoverable=True)
-    return LiveOrderResult(True, order_id, order_id=order_id)
-
+    order_ids: list[str] = []
+    for position_exchange, close_positions, total_qty in close_position_groups:
+        if total_qty <= 0 or not close_positions:
+            continue
+        payload = build_exit_order_payload(
+            config,
+            pos.side,
+            close_positions=close_positions,
+            qty=total_qty,
+            front_order_type=20,
+            price=limit_price,
+            margin_trade_type=pos.margin_trade_type,
+            exchange=position_exchange,
+        )
+        storage.log_structured("INFO", "TAKE_PROFIT_ORDER_SENT", {**context, "position_exchange": position_exchange, "request_json": payload, "limit_price": limit_price})
+        try:
+            res = client.send_order(payload)
+        except Exception as e:
+            ep = api_error_payload(e)
+            return LiveOrderResult(False, f"TAKE_PROFIT_SEND_ERROR Code={ep.get('api_code')} Message={ep.get('api_message')}: {ep.get('raw_error')}", api_code=str(ep.get('api_code') or ''), api_message=str(ep.get('api_message') or ''), recoverable=True)
+        order_id = str(res.get("OrderId") or res.get("OrderID") or "")
+        if order_id:
+            order_ids.append(order_id)
+    if not order_ids:
+        return LiveOrderResult(False, "TAKE_PROFIT_ORDER_ID_MISSING", recoverable=True)
+    pos.take_profit_order_ids = order_ids
+    pos.take_profit_order_id = order_ids[0]
+    return LiveOrderResult(True, ",".join(order_ids), order_id=",".join(order_ids))
 
 def verify_position_after_entry_cancel(
     client: KabuApiClient,
@@ -2596,13 +2697,15 @@ def execute_live_entry(
     pred: PredictionSnapshot,
     status: MonitorStatus,
     latest_snapshot: Optional[TickSnapshot] = None,
+    target_total_qty_override: Optional[int] = None,
+    qty_override: Optional[int] = None,
 ) -> LiveOrderResult:
     entry_exec = entry_execution_config(config)
     limit_entry = use_limit_entry(config)
     retries = max(int(config.get("live_retry_max", LIVE_RETRY_MAX)), 0)
     if limit_entry:
         retries = max(int(entry_exec.get("max_reprice_attempts", 0)), 0)
-    target_qty = int(config.get("entry_min_fill_qty", config["order_qty"]))
+    target_qty = int(target_total_qty_override if target_total_qty_override is not None else config.get("entry_min_fill_qty", config["order_qty"]))
     timeout_sec = int(config.get("live_entry_timeout_sec", LIVE_ENTRY_TIMEOUT_SEC))
     if limit_entry:
         timeout_sec = max(float(entry_exec.get("timeout_sec", timeout_sec)), 0.5)
@@ -2636,7 +2739,7 @@ def execute_live_entry(
                     mirror_message=f"side={side} limit_mode={limit_mode}",
                 )
                 return last
-        payload = build_entry_order_payload(config, side, front_order_type=front_order_type, price=limit_price)
+        payload = build_entry_order_payload(config, side, front_order_type=front_order_type, price=limit_price, qty_override=qty_override)
         storage.log_structured(
             "INFO",
             "ENTRY_ORDER_REQUEST",
@@ -2779,6 +2882,7 @@ def execute_live_exit(
         if not positions:
             return LiveOrderResult(False, "NO_POSITIONS_FOR_EXIT", recoverable=True)
         if leaves_qty <= 0:
+            storage.log("INFO", "POSITION_ALREADY_CLOSED", f"side={side}")
             return LiveOrderResult(False, "NO_MATCHING_OPEN_POSITION", recoverable=True)
         if total_qty <= 0 or not close_position_groups:
             return LiveOrderResult(
@@ -3063,6 +3167,101 @@ def reconcile_live_position(
     return ReconcileResult(True, status.live_state, "MATCHED_OPEN", total_qty, matching_qty, positions)
 
 
+
+
+def _split_order_ids(raw: Optional[str]) -> list[str]:
+    if not raw:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+
+def midday_order_cleanup(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    ts: datetime,
+) -> None:
+    pos = status.open_position
+    kept_payload = {
+        "kept_take_profit_order_id": pos.take_profit_order_id if pos else None,
+        "kept_take_profit_order_ids": list(pos.take_profit_order_ids or []) if pos else [],
+        "kept_exit_order_id": pos.exit_order_id if pos else None,
+    }
+    base_payload = {
+        "ts": ts.isoformat(),
+        "live_state": status.live_state,
+        "pending_entry_side": status.pending_entry_side,
+        "open_position": position_state_payload(pos),
+        **kept_payload,
+    }
+    storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_START", base_payload)
+
+    entry_order_ids: list[str] = []
+    entry_order_state = status.live_state in {"ENTRY_SENT", "ENTRY_PARTIAL", "ENTRY_RETRY"}
+    pending_entry_state = status.pending_entry_side is not None
+    if pos is not None and (entry_order_state or pending_entry_state):
+        entry_order_ids.extend(_split_order_ids(pos.entry_order_id))
+
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for oid in entry_order_ids:
+        if oid and oid not in seen:
+            seen.add(oid)
+            dedup.append(oid)
+
+    if not dedup:
+        storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_SKIPPED_NO_ENTRY_ORDER", base_payload)
+
+    had_cancel_fail = False
+    cancelled_any = False
+    for oid in dedup:
+        req = {"OrderId": oid}
+        storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CANCEL_REQUEST", {**base_payload, "order_id": oid, "request_json": req})
+        try:
+            res = client.cancel_order(oid, config["order_password"])
+            cancelled_any = True
+            storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CANCEL_RESPONSE", {**base_payload, "order_id": oid, "raw_response_json": res})
+        except Exception as e:
+            had_cancel_fail = True
+            storage.log_structured("ERROR", "MIDDAY_ENTRY_ORDER_CANCEL_FAIL", {**base_payload, "order_id": oid, **api_error_payload(e)})
+
+    positions = fetch_positions(client, config, storage, reason="MIDDAY_ENTRY_ORDER_CLEANUP_POST_CHECK") if config.get("live_mode") and (cancelled_any or had_cancel_fail) else []
+    rec_ok = True
+    rec_message = ""
+    if config.get("live_mode") and pos is not None and (cancelled_any or had_cancel_fail):
+        rec = reconcile_live_position(
+            client,
+            config,
+            status,
+            storage,
+            expected_side=pos.side,
+            reason="MIDDAY_ENTRY_ORDER_CLEANUP_POST_CHECK",
+            ts=ts,
+            expected_margin_trade_type=pos.margin_trade_type,
+        )
+        rec_ok = rec.ok_for_entry
+        rec_message = rec.message
+
+    if had_cancel_fail and (not rec_ok):
+        status.live_state = "RECOVERING"
+        storage.log_structured("WARN", "MIDDAY_ENTRY_ORDER_CLEANUP_RECOVERING", {**base_payload, "positions_json": positions, "live_state": status.live_state, "reason": rec_message})
+
+    status.pending_entry_side = None
+    status.pending_entry_ts = None
+    status.pending_add = False
+    status.midday_order_cleanup_done = True
+    done_payload = {
+        **base_payload,
+        "cancelled_entry_order_ids": dedup,
+        "cancelled_any": cancelled_any,
+        "had_cancel_fail": had_cancel_fail,
+        "positions_json": positions,
+        "live_state": status.live_state,
+        "open_position": position_state_payload(status.open_position),
+    }
+    storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_DONE", done_payload)
+
 def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     outdir = config["outdir"]
     ensure_dir(outdir)
@@ -3071,8 +3270,10 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     midday_report_path = os.path.join(outdir, f"midday_report_{jst_date_str()}.md")
     storage = Storage(db_path)
     storage.log("INFO", "START", "monitor start")
+    storage.log_structured("INFO", "STARTUP_CONFIG", {"live_mode": config.get("live_mode"), "order_qty": config.get("order_qty"), "entry_min_fill_qty": config.get("entry_min_fill_qty"), "order_exchange": config.get("order_exchange"), "exit_order_exchange": config.get("exit_order_exchange")})
 
     client = KabuApiClient(config["base_url"])
+    status = MonitorStatus()
     token_ok = False
     start_errors: list[str] = []
     for _ in range(3):
@@ -3089,6 +3290,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             print(f"[ERROR] startup auth/register failed: {err}")
             storage.log("ERROR", "TOKEN_FAIL", err)
             time.sleep(1)
+    if config.get("live_mode"):
+        try:
+            sp = fetch_positions(client, config, storage, reason="STARTUP_POSITION_CHECK")
+            tq,mq = summarize_positions(sp)
+            storage.log_structured("INFO", "STARTUP_POSITION_CHECK", {"total_qty": tq, "matching_qty": mq, "positions_json": sp})
+            if tq > 0:
+                status.live_state = "MANUAL_POSITION_CHECK_REQUIRED"
+                storage.log("WARN", "MANUAL_POSITION_CHECK_REQUIRED", "startup detected existing positions; new entry paused")
+        except Exception as e:
+            storage.log("ERROR", "STARTUP_POSITION_CHECK", str(e))
     if not token_ok:
         generate_report(db_path, daily_report_path)
         detail = start_errors[-1] if start_errors else "unknown startup error"
@@ -3111,7 +3322,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             storage.log("INFO", "WARMUP_1M_PREV_DB", "loaded=0")
     except Exception as e:
         storage.log("WARN", "WARMUP_1M_PREV_DB_FAIL", str(e))
-    status = MonitorStatus()
     adaptive = AdaptiveControlState(enabled=bool(config.get("adaptive_control", ADAPTIVE_CONTROL_ENABLED)))
     volatility_gate = VolatilityRegimeGate(config.get("volatility_regime_gate", {}))
     set_vwap_mode(str(config.get("initial_vwap_mode", adaptive.vwap_mode)))
@@ -3157,11 +3367,45 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             if bar3_new:
                 storage.insert_bar("bars_3m", bar3_new)
 
+            midday_cancel_start = str(config.get("midday_order_cancel_start", MIDDAY_ORDER_CANCEL_START))
+            midday_cancel_end = str(config.get("midday_order_cancel_end", MIDDAY_ORDER_CANCEL_END))
+            if (
+                not status.midday_order_cleanup_done
+                and midday_cancel_start <= tstr < midday_cancel_end
+            ):
+                midday_order_cleanup(client, config, storage, status, now_)
+
+            if (
+                not status.midday_bar_finalize_done
+                and "11:30:00" <= tstr < "11:31:00"
+            ):
+                b1f = rb1.force_finalize()
+                if b1f:
+                    storage.insert_bar("bars_1m", b1f)
+                b3f = rb3.force_finalize()
+                if b3f:
+                    storage.insert_bar("bars_3m", b3f)
+                status.midday_bar_finalize_done = True
+
             set_vwap_mode(adaptive.vwap_mode)
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
             if f is not None:
                 storage.insert_feature(f)
-                p = build_rsi9_prediction(rb1.latest(), list(rb1.history), status.open_position)
+                force_close_time_reached = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
+                allow_new_entry = (
+                    time_in_windows(tstr, TRADE_WINDOWS)
+                    and not force_close_time_reached
+                    and status.pending_entry_side is None
+                    and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
+                )
+                p = build_rsi9_prediction(
+                    rb1.latest(),
+                    list(rb1.history),
+                    status.open_position,
+                    status=status,
+                    storage=storage,
+                    allow_new_entry=allow_new_entry,
+                )
                 if p is None:
                     continue
                 storage.insert_prediction(p)
@@ -3174,7 +3418,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 last_gate = gate_decision
                 effective_signal = p.signal
                 current_rsi = extract_rsi_from_pred(p)
-                force_close_time_reached = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
 
                 if force_close_time_reached:
                     effective_signal = "NO_ACTION"
@@ -3207,6 +3450,60 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         status.pending_entry_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
                         status.pending_entry_ts = f.ts
                         storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
+
+                if (not force_close_time_reached) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
+                    add_ok, add_reason = should_rsi9_long_add(rb1.latest(), list(rb1.history), status.open_position)
+                    if status.pending_exit:
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=PENDING_EXIT")
+                    elif add_ok and not status.pending_add:
+                        status.pending_add = True
+                        storage.log("INFO", "RSI9_LONG_ADD_PENDING", f"reason={add_reason}")
+                    elif not add_ok:
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason={add_reason}")
+
+                if status.pending_add and status.open_position is not None and status.open_position.side == "LONG":
+                    pos_add = status.open_position
+                    if pos_add.rsi10_add_done:
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=ALREADY_ADDED_PENDING_CLEARED")
+                    elif pos_add.take_profit_order_id is not None:
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=ACTIVE_TP_ORDER_PENDING_CLEARED")
+                    elif status.live_state != "OPEN":
+                        status.pending_add = False
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason=LIVE_STATE_{status.live_state}_PENDING_CLEARED")
+                    elif force_close_time_reached:
+                        status.pending_add = False
+                    else:
+                        current_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else int(pos_add.filled_qty)
+                        if config.get("live_mode") and current_qty <= 0:
+                            status.pending_add = False
+                            status.live_state = "RECOVERING"
+                            storage.log("WARN", "RSI9_LONG_ADD_FAIL", "reason=INCONSISTENT_NO_POSITION existing_qty=0")
+                        else:
+                            add_qty = int(config.get("order_qty", 2))
+                            target_total_qty = int(current_qty + add_qty)
+                            add_pred = PredictionSnapshot(ts=f.ts, regime="RSI9", p_up_1m=0.5,p_down_1m=0.5,p_up_3m=0.5,p_down_3m=0.5, signal="LONG_CANDIDATE", rsi9_value=current_rsi, reason_1="RSI9_ADD", reason_2=f"rsi9={current_rsi if current_rsi is not None else 0:.2f}", reason_3="rsi10_add")
+                            add_res = execute_live_entry(client, config, "LONG", storage, pos_add, add_pred, status, latest_snapshot=snap, target_total_qty_override=target_total_qty, qty_override=add_qty)
+                            if add_res.ok:
+                                status.pending_add = False
+                                pos_add.rsi10_add_done = True
+                                new_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else target_total_qty
+                                pos_add.filled_qty = int(new_qty)
+                                pos_add.order_qty = int(new_qty)
+                                pos_add.remaining_qty = 0
+                                try:
+                                    entry_positions = fetch_positions(client, config, storage, reason="POST_ADD_FILL_PRICE")
+                                    avg = average_price_from_positions(entry_positions, "LONG", margin_trade_type=pos_add.margin_trade_type)
+                                    if avg is not None:
+                                        pos_add.entry_fill_price = avg
+                                        pos_add.entry_price = avg
+                                except Exception:
+                                    pass
+                                storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
+                            else:
+                                status.pending_add = False
+                                storage.log("WARN", "RSI9_LONG_ADD_FAIL", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} message={add_res.message}")
 
                 if status.pending_entry_side and status.open_position is None:
                     if force_close_time_reached:
@@ -3244,7 +3541,21 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         status.live_state = "ENTRY_SENT"
                                         result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
                                         if not result.ok:
-                                            status.live_state = "FLAT"
+                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else 0
+                                            if actual_qty > 0:
+                                                candidate_pos.filled_qty = int(actual_qty)
+                                                candidate_pos.order_qty = int(config.get("order_qty", 2))
+                                                candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
+                                                status.open_position = candidate_pos
+                                                status.live_state = "OPEN"
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
+                                                status.last_entry_ts_by_side[side] = f.ts
+                                                storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
+                                            else:
+                                                status.live_state = "FLAT"
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
                                             status.last_error_code = result.api_code
                                             status.last_error_message = result.message
                                             storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
@@ -3274,8 +3585,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 p.reason_1,
                                                 candidate_pos.entry_fill_price,
                                             )
+                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else int(config.get("order_qty", 2))
+                                            candidate_pos.filled_qty = int(actual_qty)
+                                            candidate_pos.order_qty = int(config.get("order_qty", 2))
+                                            candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
                                             status.open_position = candidate_pos
                                             status.live_state = "OPEN"
+                                            if candidate_pos.filled_qty >= candidate_pos.order_qty:
+                                                storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
+                                            elif candidate_pos.filled_qty > 0:
+                                                storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
+                                            else:
+                                                storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
                                             take_profit_cfg = config.get("take_profit_execution", {})
                                             if candidate_pos.strategy == "RSI9":
                                                 storage.log("INFO", "RSI9_TAKE_PROFIT_LIMIT_SKIP", f"side={candidate_pos.side} strategy=RSI9")
@@ -3345,7 +3666,13 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.take_profit_order_id = tp_res2.order_id
                                         pos.rsi_special_tp_order_ts = f.ts
 
-                        if config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
+                        if live_tp_already_filled:
+                            ex = True
+                            ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                            if pos.exit_fill_price is None:
+                                pos.exit_fill_price = take_profit_limit_price(pos)
+                            pnl_ticks = take_profit_filled_ticks(pos)
+                        elif config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
                             pos.exit_fill_price = take_profit_limit_price(pos)
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
                             live_tp_already_filled = True
@@ -3359,6 +3686,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 if filled_during_cancel:
                                     live_tp_already_filled = True
                                     ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                                    if pos.exit_fill_price is None:
+                                        pos.exit_fill_price = take_profit_limit_price(pos)
                                     pnl_ticks = take_profit_filled_ticks(pos)
                                 elif not cancel_ok:
                                     ex = False
@@ -3402,6 +3731,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     if filled_during_cancel:
                                         live_tp_already_filled = True
                                         ex_reason = "TAKE_PROFIT_LIMIT_FILLED"
+                                        if pos.exit_fill_price is None:
+                                            pos.exit_fill_price = take_profit_limit_price(pos)
                                         pnl_ticks = take_profit_filled_ticks(pos)
                                     elif not cancel_ok:
                                         exit_confirmed = False
@@ -3411,6 +3742,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 if exit_confirmed and live_tp_already_filled:
                                     status.exit_fail_count = 0
                                     status.live_state = "FLAT"
+                                    status.open_position = None
+                                    status.pending_exit = False
+                                    status.pending_add = False
                                     storage.log("INFO", "LIVE_TAKE_PROFIT_FILLED", f"{pos.side} order_id={pos.take_profit_order_id or pos.exit_order_id}")
                                     storage.insert_execution_fill_price(
                                         "EXIT_FILL_PRICE",
@@ -3466,8 +3800,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.exit_order_id = result.order_id
                                         pos.exit_fill_price = f.price
                                         status.exit_fail_count = 0
-                                        status.live_state = "FLAT"
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
+                                        rem_qty = get_open_position_qty(client, config, pos.side, margin_trade_type=pos.margin_trade_type)
+                                        if rem_qty <= 0:
+                                            status.live_state = "FLAT"
+                                            storage.log("INFO", "EXIT_FULLY_FILLED", f"side={pos.side}")
+                                        else:
+                                            pos.filled_qty = int(rem_qty)
+                                            pos.remaining_qty = 0
+                                            status.open_position = pos
+                                            status.live_state = "RECOVERING"
+                                            exit_confirmed = False
+                                            storage.log("WARN", "EXIT_PARTIAL_REMAINING", f"side={pos.side} remaining_qty={rem_qty}")
                                         storage.insert_execution_fill_price(
                                             "EXIT_FILL_PRICE",
                                             result.order_id,
@@ -3595,10 +3939,10 @@ def main() -> None:
     apply_runtime_threshold_overrides(cfg)
     config = {
         "api_password": args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "live_mode": bool(args.live_mode or cfg.get("live_mode", False)),
+        "live_mode": (False if args.paper_mode else bool(args.live_mode or cfg.get("live_mode", True))),
         "order_password": args.order_password or cfg.get("order_password") or args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "order_qty": int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 1)),
-        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", cfg.get("order_qty", 1))),
+        "order_qty": int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)),
+        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", (args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)))),
         "account_type": int(args.account_type if args.account_type is not None else cfg.get("account_type", 4)),
         "margin_trade_type": int(args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3)),
         "margin_trade_type_long": int(cfg.get("margin_trade_type_long", args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3))),
@@ -3637,6 +3981,12 @@ def main() -> None:
         "take_profit_execution": cfg.get("take_profit_execution", {"enabled": True, "fallback_market_after_signal_sec": 5.0}),
         "scalping": cfg.get("scalping", {"enabled": SCALPING_ENABLED}),
     }
+    afternoon_trade_start = str(cfg.get("afternoon_trade_start", "12:30:00"))
+    globals()["TRADE_WINDOWS"] = [
+        ("09:03:00", "11:25:00"),
+        (afternoon_trade_start, "15:20:00"),
+    ]
+
     if not config["api_password"]:
         raise SystemExit(
             "API password is required. Set API_PASSWORD_HARDCODED at the top, "
@@ -3650,6 +4000,10 @@ def main() -> None:
         raise SystemExit("entry_min_fill_qty must be > 0 in live_mode.")
     if config["live_mode"] and int(config["entry_min_fill_qty"]) > int(config["order_qty"]):
         raise SystemExit("entry_min_fill_qty must be <= order_qty in live_mode.")
+    if config["live_mode"] and int(config["order_qty"]) != 2:
+        raise SystemExit("2lot-ready mode requires order_qty == 2 in live_mode.")
+    if config["live_mode"] and int(config["entry_min_fill_qty"]) != 2:
+        raise SystemExit("2lot-ready mode requires entry_min_fill_qty == 2 in live_mode.")
     if config["live_mode"] and int(config["live_entry_timeout_sec"]) <= 0:
         raise SystemExit("live_entry_timeout_sec must be > 0 in live_mode.")
     if config["live_mode"] and int(config["live_exit_timeout_sec"]) <= 0:
