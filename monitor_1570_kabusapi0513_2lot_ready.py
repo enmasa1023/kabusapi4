@@ -126,6 +126,7 @@ RSI9_SHORT_ENTRY = 70.0
 RSI9_SHORT_TP = 40.0
 RSI9_SHORT_SL = 0.0
 RSI9_LONG_ADD_ENTRY = 10.0
+RSI20_LONG_WATCH_MINUTES = 10
 
 
 def now_jst() -> datetime:
@@ -546,6 +547,10 @@ class MonitorStatus:
     force_market_close_sent: bool = False
     midday_order_cleanup_done: bool = False
     midday_bar_finalize_done: bool = False
+    rsi20_long_watch_active: bool = False
+    rsi20_long_watch_started_at: Optional[datetime] = None
+    rsi20_long_watch_expires_at: Optional[datetime] = None
+    rsi20_long_watch_started_rsi: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -1607,7 +1612,66 @@ def should_rsi9_long_add(bar1: Optional[Bar], history: list[Bar], open_pos: Opti
     if rsi_now <= RSI9_LONG_ADD_ENTRY and rsi_prev <= RSI9_LONG_ADD_ENTRY:
         return True, "rsi10_add"
     return False, "RSI_NOT_LOW_ENOUGH"
-def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Optional[PositionState]) -> Optional[PredictionSnapshot]:
+def clear_rsi20_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    event: str,
+    ts: datetime,
+    rsi_now: Optional[float],
+    rsi_prev: Optional[float],
+    reason: str,
+) -> None:
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "watch_started_at": status.rsi20_long_watch_started_at.isoformat() if status.rsi20_long_watch_started_at else None,
+        "watch_expires_at": status.rsi20_long_watch_expires_at.isoformat() if status.rsi20_long_watch_expires_at else None,
+        "reason": reason,
+    }
+    if storage is not None:
+        storage.log_structured("INFO", event, payload)
+    else:
+        print(f"[INFO] {event} {payload}", flush=True)
+    status.rsi20_long_watch_active = False
+    status.rsi20_long_watch_started_at = None
+    status.rsi20_long_watch_expires_at = None
+    status.rsi20_long_watch_started_rsi = None
+
+
+def start_rsi20_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    ts: datetime,
+    rsi_now: float,
+    rsi_prev: float,
+) -> None:
+    status.rsi20_long_watch_active = True
+    status.rsi20_long_watch_started_at = ts
+    status.rsi20_long_watch_expires_at = ts + timedelta(minutes=RSI20_LONG_WATCH_MINUTES)
+    status.rsi20_long_watch_started_rsi = rsi_now
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "watch_started_at": status.rsi20_long_watch_started_at.isoformat(),
+        "watch_expires_at": status.rsi20_long_watch_expires_at.isoformat(),
+        "reason": "RSI20_TWO_BARS_AND_REVERSE_MA",
+    }
+    if storage is not None:
+        storage.log_structured("INFO", "RSI20_LONG_WATCH_START", payload)
+    else:
+        print(f"[INFO] RSI20_LONG_WATCH_START {payload}", flush=True)
+
+
+def build_rsi9_prediction(
+    bar1: Optional[Bar],
+    history: list[Bar],
+    open_pos: Optional[PositionState],
+    status: Optional[MonitorStatus] = None,
+    storage: Optional[Storage] = None,
+    allow_new_entry: bool = True,
+) -> Optional[PredictionSnapshot]:
     if bar1 is None:
         return None
     closes = [b.close for b in history]
@@ -1627,15 +1691,26 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
     # No-entry window: 09:00-09:15 JST (inclusive)
     in_no_entry = (bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15)
 
-    if open_pos is None and not in_no_entry:
+    rsi20_watch_expired_this_bar = False
+    if status is not None and status.rsi20_long_watch_active:
+        if open_pos is not None:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "POSITION_OPEN")
+        elif in_no_entry:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NO_ENTRY_WINDOW")
+        elif not allow_new_entry:
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NEW_ENTRY_NOT_ALLOWED")
+        elif status.rsi20_long_watch_expires_at and bar1.ts > status.rsi20_long_watch_expires_at:
+            rsi20_watch_expired_this_bar = True
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_EXPIRED", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
+
+    if open_pos is None and not in_no_entry and allow_new_entry:
         rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
         ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
+        long_a_start = False
         if ma_ok:
             long_ma = bar1.ma75 > bar1.ma25 > bar1.ma5
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
-            if long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY:
-                signal, side = "LONG_CANDIDATE", "LONG"
-                entry_rule = "long_a"
+            long_a_start = long_ma and rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
             if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
                 slope2m = ma75_slope_2m(history)
@@ -1656,6 +1731,17 @@ def build_rsi9_prediction(bar1: Optional[Bar], history: list[Bar], open_pos: Opt
             elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
                 entry_rule = "short_frozen"
+
+        if status is not None:
+            if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
+                if status.rsi20_long_watch_active:
+                    clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, f"SIGNAL_{entry_rule}")
+            elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
+                signal, side = "LONG_CANDIDATE", "LONG"
+                entry_rule = "long_a_reversal_watch"
+                clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, "RSI_TURNED_UP")
+            elif long_a_start and not status.rsi20_long_watch_active and not rsi20_watch_expired_this_bar:
+                start_rsi20_long_watch(status, storage, bar1.ts, rsi_now, rsi_prev)
     elif open_pos is not None:
         side = open_pos.side
 
@@ -3305,7 +3391,21 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
             if f is not None:
                 storage.insert_feature(f)
-                p = build_rsi9_prediction(rb1.latest(), list(rb1.history), status.open_position)
+                force_close_time_reached = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
+                allow_new_entry = (
+                    time_in_windows(tstr, TRADE_WINDOWS)
+                    and not force_close_time_reached
+                    and status.pending_entry_side is None
+                    and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
+                )
+                p = build_rsi9_prediction(
+                    rb1.latest(),
+                    list(rb1.history),
+                    status.open_position,
+                    status=status,
+                    storage=storage,
+                    allow_new_entry=allow_new_entry,
+                )
                 if p is None:
                     continue
                 storage.insert_prediction(p)
@@ -3318,7 +3418,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 last_gate = gate_decision
                 effective_signal = p.signal
                 current_rsi = extract_rsi_from_pred(p)
-                force_close_time_reached = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
 
                 if force_close_time_reached:
                     effective_signal = "NO_ACTION"
