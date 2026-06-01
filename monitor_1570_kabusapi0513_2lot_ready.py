@@ -1800,9 +1800,14 @@ def create_position(
     f: FeatureSnapshot,
     config: dict[str, Any],
     entry_order_id: Optional[str] = None,
+    side_override: Optional[str] = None,
 ) -> PositionState:
-    is_long = pred.signal == "LONG_CANDIDATE"
-    side = "LONG" if is_long else "SHORT"
+    if side_override in {"LONG", "SHORT"}:
+        side = side_override
+    else:
+        is_long = pred.signal == "LONG_CANDIDATE"
+        side = "LONG" if is_long else "SHORT"
+    is_long = side == "LONG"
     if pred.reason_1 == "RSI9_ONLY":
         strategy = "RSI9"
         stop_ticks, take_ticks, min_hold, max_hold = 9999, 9999, 0, 3600
@@ -2407,6 +2412,230 @@ def average_price_from_positions(
     return float(sum(prices) / len(prices))
 
 
+def side_from_api_position(position: dict[str, Any]) -> str:
+    return "LONG" if str(position.get("Side")) == "2" else "SHORT"
+
+
+def actual_position_price(position: dict[str, Any], fallback: float = 0.0) -> float:
+    try:
+        price = float(position.get("Price"))
+        return price if price > 0 else fallback
+    except Exception:
+        return fallback
+
+
+def find_matching_actual_position(
+    positions: list[dict[str, Any]],
+    expected_side: str,
+    expected_margin_trade_type: Optional[int],
+) -> Optional[dict[str, Any]]:
+    candidates = [
+        p for p in positions
+        if position_matches(p, side=expected_side, margin_trade_type=expected_margin_trade_type)
+        and position_leaves_qty(p) > 0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=position_leaves_qty)
+
+
+def create_position_from_actual_position(
+    api_pos: dict[str, Any],
+    template_pos: PositionState,
+    expected_side: str,
+    config: dict[str, Any],
+    entry_order_id: str,
+) -> PositionState:
+    actual_side = side_from_api_position(api_pos)
+    if actual_side != expected_side:
+        raise ValueError(f"actual side mismatch: expected={expected_side} actual={actual_side}")
+    leaves_qty = position_leaves_qty(api_pos)
+    margin_trade_type = _to_int(api_pos.get("MarginTradeType"), margin_trade_type_for_side(config, expected_side))
+    entry_price = actual_position_price(api_pos, template_pos.entry_price)
+    return PositionState(
+        side=actual_side,
+        strategy=template_pos.strategy,
+        entry_ts=template_pos.entry_ts,
+        entry_price=entry_price,
+        entry_p_up_1m=template_pos.entry_p_up_1m,
+        entry_p_up_3m=template_pos.entry_p_up_3m,
+        stop_ticks=template_pos.stop_ticks,
+        take_ticks=template_pos.take_ticks,
+        min_hold_sec=template_pos.min_hold_sec,
+        max_hold_sec=template_pos.max_hold_sec,
+        entry_vwap_gap_bps=template_pos.entry_vwap_gap_bps,
+        entry_regime=template_pos.entry_regime,
+        entry_vwap_mode=template_pos.entry_vwap_mode,
+        margin_trade_type=margin_trade_type,
+        entry_order_id=entry_order_id,
+        order_qty=leaves_qty,
+        filled_qty=leaves_qty,
+        remaining_qty=0,
+        entry_fill_price=entry_price,
+        rsi_special_entry=template_pos.rsi_special_entry,
+        rsi_special_tp_stage=template_pos.rsi_special_tp_stage,
+        rsi_special_tp_order_ts=template_pos.rsi_special_tp_order_ts,
+        rsi10_add_done=template_pos.rsi10_add_done,
+    )
+
+
+def verify_position_before_exit(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    pos: PositionState,
+    intended_exit_reason: str,
+    ts: datetime,
+) -> bool:
+    storage.log_structured("INFO", "EXIT_POSITION_VERIFY_START", {
+        "ts": ts.isoformat(),
+        "intended_exit_reason": intended_exit_reason,
+        "internal_position": position_state_payload(pos),
+    })
+    try:
+        positions = fetch_positions(client, config, storage, reason="EXIT_POSITION_VERIFY")
+    except Exception as e:
+        status.live_state = "RECOVERING"
+        status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+        storage.log_structured("ERROR", "POSITION_NOT_FOUND_BEFORE_EXIT", {
+            "internal_side": pos.side,
+            "internal_margin_trade_type": pos.margin_trade_type,
+            "internal_entry_price": pos.entry_price,
+            "intended_exit_reason": intended_exit_reason,
+            "internal_position": position_state_payload(pos),
+            **api_error_payload(e),
+        })
+        return False
+    actual = find_matching_actual_position(positions, pos.side, pos.margin_trade_type)
+    if actual is None:
+        first = next((p for p in positions if position_leaves_qty(p) > 0), None)
+        event = "POSITION_SIDE_MISMATCH_BEFORE_EXIT" if first is not None else "POSITION_NOT_FOUND_BEFORE_EXIT"
+        status.live_state = "RECOVERING"
+        status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+        storage.log_structured("ERROR", event, {
+            "internal_side": pos.side,
+            "actual_side": side_from_api_position(first) if first else None,
+            "internal_margin_trade_type": pos.margin_trade_type,
+            "actual_margin_trade_type": _to_int(first.get("MarginTradeType"), -1) if first else None,
+            "internal_entry_price": pos.entry_price,
+            "actual_price": actual_position_price(first) if first else None,
+            "actual_leaves_qty": position_leaves_qty(first) if first else 0,
+            "intended_exit_reason": intended_exit_reason,
+            "internal_position": position_state_payload(pos),
+            "actual_position": first,
+            "positions_json": positions,
+        })
+        return False
+    storage.log_structured("INFO", "EXIT_POSITION_VERIFY_OK", {
+        "internal_side": pos.side,
+        "actual_side": side_from_api_position(actual),
+        "internal_margin_trade_type": pos.margin_trade_type,
+        "actual_margin_trade_type": _to_int(actual.get("MarginTradeType"), -1),
+        "internal_entry_price": pos.entry_price,
+        "actual_price": actual_position_price(actual),
+        "actual_leaves_qty": position_leaves_qty(actual),
+        "intended_exit_reason": intended_exit_reason,
+        "internal_position": position_state_payload(pos),
+        "actual_position": actual,
+    })
+    return True
+
+
+def verify_entry_position_after_order(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    template_pos: PositionState,
+    expected_side: str,
+    order_id: str,
+    pred: PredictionSnapshot,
+    status: MonitorStatus,
+    ts: datetime,
+) -> Optional[PositionState]:
+    expected_margin = template_pos.margin_trade_type
+    storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_START", {
+        "ts": ts.isoformat(),
+        "order_id": order_id,
+        "expected_side": expected_side,
+        "expected_margin_trade_type": expected_margin,
+        "pred_signal": pred.signal,
+        "pred_reason_1": pred.reason_1,
+        "pred_reason_2": pred.reason_2,
+        "pred_reason_3": pred.reason_3,
+        "live_state": status.live_state,
+        "pending_entry_side": status.pending_entry_side,
+        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+        "internal_position": position_state_payload(template_pos),
+    })
+    try:
+        positions = fetch_positions(client, config, storage, reason="ENTRY_POSITION_VERIFY")
+    except Exception as e:
+        storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
+            "ts": ts.isoformat(),
+            "order_id": order_id,
+            "expected_side": expected_side,
+            "expected_margin_trade_type": expected_margin,
+            "internal_position": position_state_payload(template_pos),
+            **api_error_payload(e),
+        })
+        return None
+
+    actual = find_matching_actual_position(positions, expected_side, expected_margin)
+    if actual is None:
+        first = next((p for p in positions if position_leaves_qty(p) > 0), None)
+        storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
+            "ts": ts.isoformat(),
+            "order_id": order_id,
+            "expected_side": expected_side,
+            "actual_side": side_from_api_position(first) if first else None,
+            "expected_qty": int(config.get("order_qty", 2)),
+            "actual_qty": position_leaves_qty(first) if first else 0,
+            "expected_margin_trade_type": expected_margin,
+            "actual_margin_trade_type": _to_int(first.get("MarginTradeType"), -1) if first else None,
+            "pred_signal": pred.signal,
+            "pred_reason_1": pred.reason_1,
+            "pred_reason_2": pred.reason_2,
+            "pred_reason_3": pred.reason_3,
+            "live_state": status.live_state,
+            "pending_entry_side": status.pending_entry_side,
+            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+            "internal_position": position_state_payload(template_pos),
+            "actual_position": first,
+            "positions_json": positions,
+        })
+        return None
+
+    actual_pos = create_position_from_actual_position(actual, template_pos, expected_side, config, order_id)
+    storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_OK", {
+        "ts": ts.isoformat(),
+        "order_id": order_id,
+        "expected_side": expected_side,
+        "actual_side": actual_pos.side,
+        "expected_qty": int(config.get("order_qty", 2)),
+        "actual_qty": actual_pos.filled_qty,
+        "expected_margin_trade_type": expected_margin,
+        "actual_margin_trade_type": actual_pos.margin_trade_type,
+        "pred_signal": pred.signal,
+        "pred_reason_1": pred.reason_1,
+        "pred_reason_2": pred.reason_2,
+        "pred_reason_3": pred.reason_3,
+        "live_state": status.live_state,
+        "pending_entry_side": status.pending_entry_side,
+        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+        "actual_position": actual,
+        "internal_position": position_state_payload(actual_pos),
+    })
+    storage.log_structured("INFO", "POSITION_STATE_CREATED_FROM_ACTUAL", {
+        "ts": ts.isoformat(),
+        "order_id": order_id,
+        "expected_side": expected_side,
+        "actual_position": actual,
+        "internal_position": position_state_payload(actual_pos),
+    })
+    return actual_pos
+
+
 def wait_for_position_unlocked_or_flat(
     client: KabuApiClient,
     config: dict[str, Any],
@@ -2869,6 +3098,17 @@ def execute_live_exit(
     context = order_context(config, side, pos, pred, status)
     last = LiveOrderResult(False, "EXIT_UNKNOWN_ERROR", recoverable=True)
 
+    if not verify_position_before_exit(
+        client,
+        config,
+        storage,
+        status,
+        pos,
+        "FORCE_MARKET_ORDER" if force_market_order else "LIVE_EXIT",
+        now_jst(),
+    ):
+        return LiveOrderResult(False, "POSITION_VERIFY_FAILED_BEFORE_EXIT", recoverable=True)
+
     for attempt in range(retries + 1):
         positions = fetch_positions(client, config, storage, reason="EXIT_BUILD_CLOSE_POSITIONS")
         close_position_groups = close_position_groups_for_side(
@@ -3079,6 +3319,19 @@ def force_close_open_position(
     status.last_error_message = result.message
     status.live_state = "EXIT_VERIFYING"
     storage.log("ERROR", "FORCE_EXIT_FAIL", f"reason={reason} side={pos.side} message={result.message}")
+    storage.log_structured(
+        "ERROR",
+        "FORCE_CLOSE_FAILED",
+        {
+            "reason": reason,
+            "side": pos.side,
+            "strategy": pos.strategy,
+            "message": result.message,
+            "api_code": result.api_code,
+            "internal_position": position_state_payload(pos),
+        },
+        mirror_message=f"reason={reason} side={pos.side} message={result.message}",
+    )
     if not use_market_order and status.open_position is not None:
         storage.log("ERROR", "MANUAL_POSITION_CHECK_REQUIRED", f"reason={reason} side={pos.side} strategy={pos.strategy} message={result.message}")
     rec = reconcile_live_position(
@@ -3149,21 +3402,42 @@ def reconcile_live_position(
             status.recovery_until = ts + timedelta(seconds=cooldown) if cooldown else None
             after = {"live_state": status.live_state, "internal_position": position_state_payload(status.open_position), "recovery_until": status.recovery_until}
             storage.log_structured("WARN", "INTERNAL_STATE_SYNC", {**payload_base, "after_state": after, "action": "STALE_INTERNAL_POSITION_CLEARED"}, mirror_message="STALE_INTERNAL_POSITION_CLEARED actual_qty=0")
+            storage.log_structured("WARN", "INTERNAL_POSITION_CLEARED_AFTER_CONFIRMED_FLAT", {**payload_base, "after_state": after})
             return ReconcileResult(True, status.live_state, "STALE_INTERNAL_POSITION_CLEARED", total_qty, matching_qty, positions)
         status.live_state = "FLAT"
         storage.log_structured("INFO", "POSITION_RECONCILE_RESULT", {**payload_base, "after_state": {"live_state": status.live_state}, "action": "FLAT_CONFIRMED"})
         return ReconcileResult(True, status.live_state, "FLAT_CONFIRMED", total_qty, matching_qty, positions)
 
     if status.open_position is None:
-        status.live_state = "RECOVERING"
-        status.recovery_until = None
-        storage.log_structured("ERROR", "RECOVERY_ENTER", {**payload_base, "after_state": {"live_state": status.live_state}, "action": "ORPHAN_API_POSITION"}, mirror_message="ORPHAN_API_POSITION actual position exists while internal state is FLAT")
+        status.live_state = "MANUAL_POSITION_CHECK_REQUIRED"
+        status.pending_entry_side = None
+        status.pending_entry_ts = None
+        status.pending_add = False
+        status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+        after = {
+            "live_state": status.live_state,
+            "recovery_until": status.recovery_until.isoformat() if status.recovery_until else None,
+            "pending_entry_side": status.pending_entry_side,
+            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+        }
+        storage.log_structured("ERROR", "ORPHAN_API_POSITION_BLOCK_ENTRY", {**payload_base, "after_state": after, "action": "ORPHAN_API_POSITION"}, mirror_message="ORPHAN_API_POSITION actual position exists while internal state is FLAT")
+        storage.log_structured("ERROR", "RECOVERY_ENTER", {**payload_base, "after_state": after, "action": "ORPHAN_API_POSITION"}, mirror_message="ORPHAN_API_POSITION actual position exists while internal state is FLAT")
         return ReconcileResult(False, status.live_state, "ORPHAN_API_POSITION", total_qty, matching_qty, positions)
 
     if matching_qty <= 0:
-        status.live_state = "RECOVERING"
-        status.recovery_until = None
-        storage.log_structured("ERROR", "RECOVERY_ENTER", {**payload_base, "after_state": {"live_state": status.live_state}, "action": "SIDE_MISMATCH"}, mirror_message="SIDE_MISMATCH actual position side does not match internal state")
+        status.live_state = "MANUAL_POSITION_CHECK_REQUIRED"
+        status.pending_entry_side = None
+        status.pending_entry_ts = None
+        status.pending_add = False
+        status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+        after = {
+            "live_state": status.live_state,
+            "recovery_until": status.recovery_until.isoformat() if status.recovery_until else None,
+            "pending_entry_side": status.pending_entry_side,
+            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+        }
+        storage.log_structured("ERROR", "SIDE_MISMATCH_BLOCK_ENTRY", {**payload_base, "after_state": after, "action": "SIDE_MISMATCH"}, mirror_message="SIDE_MISMATCH actual position side does not match internal state")
+        storage.log_structured("ERROR", "RECOVERY_ENTER", {**payload_base, "after_state": after, "action": "SIDE_MISMATCH"}, mirror_message="SIDE_MISMATCH actual position side does not match internal state")
         return ReconcileResult(False, status.live_state, "SIDE_MISMATCH", total_qty, matching_qty, positions)
 
     status.live_state = "OPEN"
@@ -3518,8 +3792,28 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         side = status.pending_entry_side
                         enter_ok, _ = can_enter(side, f.ts, status)
                         if enter_ok:
-                            candidate_pos = create_position(p, f, config)
-                            if not adaptive.allow_strat(candidate_pos.strategy, f.ts):
+                            candidate_pos = create_position(p, f, config, side_override=side)
+                            if candidate_pos.side != side:
+                                storage.log_structured(
+                                    "ERROR",
+                                    "ENTRY_SIDE_MISMATCH_BLOCK",
+                                    {
+                                        "expected_side": side,
+                                        "candidate_pos_side": candidate_pos.side,
+                                        "pred_signal": p.signal,
+                                        "pred_reason_1": p.reason_1,
+                                        "pred_reason_2": p.reason_2,
+                                        "pred_reason_3": p.reason_3,
+                                        "ts": f.ts.isoformat(),
+                                    },
+                                    mirror_message=f"expected_side={side} candidate_pos_side={candidate_pos.side}",
+                                )
+                                status.pending_entry_side = None
+                                status.pending_entry_ts = None
+                                status.pending_add = False
+                                status.live_state = "RECOVERING"
+                                status.recovery_until = now_jst() + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                            elif not adaptive.allow_strat(candidate_pos.strategy, f.ts):
                                 storage.log("INFO", "ADAPTIVE_SKIP_ENTRY", f"side={candidate_pos.side} strategy={candidate_pos.strategy} reason=STRAT_1M_FROZEN until={adaptive.freeze_strat_1m_until}")
                                 status.pending_entry_side = None
                             elif config["live_mode"]:
@@ -3545,22 +3839,53 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     else:
                                         status.live_state = "ENTRY_SENT"
                                         result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
+                                        verified_pos = verify_entry_position_after_order(
+                                            client,
+                                            config,
+                                            storage,
+                                            candidate_pos,
+                                            side,
+                                            result.order_id or "",
+                                            p,
+                                            status,
+                                            f.ts,
+                                        )
                                         if not result.ok:
-                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else 0
-                                            if actual_qty > 0:
-                                                candidate_pos.filled_qty = int(actual_qty)
-                                                candidate_pos.order_qty = int(config.get("order_qty", 2))
-                                                candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
+                                            if verified_pos is not None and verified_pos.filled_qty > 0:
+                                                candidate_pos = verified_pos
                                                 status.open_position = candidate_pos
                                                 status.live_state = "OPEN"
                                                 status.pending_entry_side = None
                                                 status.pending_entry_ts = None
+                                                status.pending_add = False
                                                 status.last_entry_ts_by_side[side] = f.ts
                                                 storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
                                             else:
-                                                status.live_state = "FLAT"
+                                                status.open_position = None
+                                                status.live_state = "RECOVERING"
+                                                status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
                                                 status.pending_entry_side = None
                                                 status.pending_entry_ts = None
+                                                status.pending_add = False
+                                                storage.log_structured(
+                                                    "WARN",
+                                                    "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
+                                                    {
+                                                        "ts": f.ts.isoformat(),
+                                                        "order_id": result.order_id,
+                                                        "expected_side": side,
+                                                        "expected_qty": int(config.get("order_qty", 2)),
+                                                        "actual_qty": 0,
+                                                        "pred_signal": p.signal,
+                                                        "pred_reason_1": p.reason_1,
+                                                        "pred_reason_2": p.reason_2,
+                                                        "pred_reason_3": p.reason_3,
+                                                        "live_state": status.live_state,
+                                                        "pending_entry_side": status.pending_entry_side,
+                                                        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                    },
+                                                )
+                                                storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
                                             status.last_error_code = result.api_code
                                             status.last_error_message = result.message
                                             storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
@@ -3572,51 +3897,79 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 storage.log("WARN", "ENTRY_GLOBAL_BLOCK", f"reason={result.message} until={status.entry_global_block_until.isoformat()}")
                                         else:
                                             storage.log("INFO", "LIVE_ENTRY_OK", f"{side} order_id={result.order_id}")
-                                            candidate_pos.entry_order_id = result.order_id
-                                            try:
-                                                entry_positions = fetch_positions(client, config, storage, reason="POST_ENTRY_FILL_PRICE")
-                                                candidate_pos.entry_fill_price = average_price_from_positions(
-                                                    entry_positions,
-                                                    side,
-                                                    margin_trade_type=candidate_pos.margin_trade_type,
+                                            if verified_pos is None or verified_pos.filled_qty <= 0:
+                                                status.open_position = None
+                                                status.live_state = "RECOVERING"
+                                                status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
+                                                status.pending_add = False
+                                                storage.log_structured(
+                                                    "WARN",
+                                                    "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
+                                                    {
+                                                        "ts": f.ts.isoformat(),
+                                                        "order_id": result.order_id,
+                                                        "expected_side": side,
+                                                        "expected_qty": int(config.get("order_qty", 2)),
+                                                        "actual_qty": 0,
+                                                        "pred_signal": p.signal,
+                                                        "pred_reason_1": p.reason_1,
+                                                        "pred_reason_2": p.reason_2,
+                                                        "pred_reason_3": p.reason_3,
+                                                        "live_state": status.live_state,
+                                                        "pending_entry_side": status.pending_entry_side,
+                                                        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                    },
                                                 )
-                                            except Exception:
-                                                candidate_pos.entry_fill_price = None
-                                            storage.insert_execution_fill_price(
-                                                "ENTRY_FILL_PRICE",
-                                                result.order_id,
-                                                side,
-                                                candidate_pos.strategy,
-                                                p.reason_1,
-                                                candidate_pos.entry_fill_price,
-                                            )
-                                            actual_qty = get_open_position_qty(client, config, side, margin_trade_type=candidate_pos.margin_trade_type) if config.get("live_mode") else int(config.get("order_qty", 2))
-                                            candidate_pos.filled_qty = int(actual_qty)
-                                            candidate_pos.order_qty = int(config.get("order_qty", 2))
-                                            candidate_pos.remaining_qty = max(candidate_pos.order_qty - candidate_pos.filled_qty, 0)
-                                            status.open_position = candidate_pos
-                                            status.live_state = "OPEN"
-                                            if candidate_pos.filled_qty >= candidate_pos.order_qty:
-                                                storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
-                                            elif candidate_pos.filled_qty > 0:
-                                                storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
-                                            else:
                                                 storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
-                                            take_profit_cfg = config.get("take_profit_execution", {})
-                                            if candidate_pos.strategy == "RSI9":
-                                                storage.log("INFO", "RSI9_TAKE_PROFIT_LIMIT_SKIP", f"side={candidate_pos.side} strategy=RSI9")
-                                            elif not isinstance(take_profit_cfg, dict) or bool(take_profit_cfg.get("enabled", True)):
-                                                tp_result = place_take_profit_limit_order(client, config, storage, candidate_pos, p, status)
-                                                if tp_result.ok:
-                                                    candidate_pos.take_profit_order_id = tp_result.order_id
-                                                    storage.log("INFO", "TAKE_PROFIT_LIMIT_OK", f"{side} order_id={tp_result.order_id} price={take_profit_limit_price(candidate_pos):.1f}")
+                                            else:
+                                                candidate_pos = verified_pos
+                                                storage.insert_execution_fill_price(
+                                                    "ENTRY_FILL_PRICE",
+                                                    result.order_id,
+                                                    side,
+                                                    candidate_pos.strategy,
+                                                    p.reason_1,
+                                                    candidate_pos.entry_fill_price,
+                                                )
+                                                status.open_position = candidate_pos
+                                                status.live_state = "OPEN"
+                                                if candidate_pos.filled_qty >= int(config.get("order_qty", 2)):
+                                                    storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
                                                 else:
-                                                    storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
-                                            status.last_entry_reject_key = ""
-                                            status.last_entry_ts_by_side[side] = f.ts
-                                            status.pending_entry_side = None
-                                            mfe_ticks = 0.0
-                                            mae_ticks = 0.0
+                                                    storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
+                                                take_profit_cfg = config.get("take_profit_execution", {})
+                                                if candidate_pos.strategy == "RSI9":
+                                                    event_type = "RSI9_SPECIAL_TP_MANAGED_SEPARATELY" if candidate_pos.rsi_special_entry else "RSI9_MARKET_EXIT_MANAGED_BY_RSI_THRESHOLD"
+                                                    storage.log_structured(
+                                                        "INFO",
+                                                        event_type,
+                                                        {
+                                                            "side": candidate_pos.side,
+                                                            "strategy": candidate_pos.strategy,
+                                                            "rsi_special_entry": candidate_pos.rsi_special_entry,
+                                                            "entry_rule": p.reason_3,
+                                                            "signal_reason": p.reason_1,
+                                                            "entry_price": candidate_pos.entry_price,
+                                                            "order_id": result.order_id,
+                                                        },
+                                                        mirror_message=f"side={candidate_pos.side} strategy=RSI9 rsi_special_entry={candidate_pos.rsi_special_entry}",
+                                                    )
+                                                elif not isinstance(take_profit_cfg, dict) or bool(take_profit_cfg.get("enabled", True)):
+                                                    tp_result = place_take_profit_limit_order(client, config, storage, candidate_pos, p, status)
+                                                    if tp_result.ok:
+                                                        candidate_pos.take_profit_order_id = tp_result.order_id
+                                                        storage.log("INFO", "TAKE_PROFIT_LIMIT_OK", f"{side} order_id={tp_result.order_id} price={take_profit_limit_price(candidate_pos):.1f}")
+                                                    else:
+                                                        storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
+                                                status.last_entry_reject_key = ""
+                                                status.last_entry_ts_by_side[side] = f.ts
+                                                status.pending_entry_side = None
+                                                status.pending_entry_ts = None
+                                                status.pending_add = False
+                                                mfe_ticks = 0.0
+                                                mae_ticks = 0.0
                             else:
                                 status.open_position = candidate_pos
                                 status.live_state = "OPEN"
@@ -3657,6 +4010,24 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 if tp_res.ok:
                                     pos.take_profit_order_id = tp_res.order_id
                                     pos.rsi_special_tp_order_ts = f.ts
+                                else:
+                                    status.live_state = "RECOVERING"
+                                    status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                                    storage.log_structured(
+                                        "ERROR",
+                                        "RSI9_SPECIAL_TP_ORDER_FAILED",
+                                        {
+                                            "ts": f.ts.isoformat(),
+                                            "side": pos.side,
+                                            "strategy": pos.strategy,
+                                            "rsi_special_entry": pos.rsi_special_entry,
+                                            "entry_rule": p.reason_3,
+                                            "order_result": asdict(tp_res),
+                                            "internal_position": position_state_payload(pos),
+                                        },
+                                        mirror_message=tp_res.message,
+                                    )
+                                    continue
                             elif pos.rsi_special_tp_stage == 0 and elapsed_special >= 300:
                                 context = order_context(config, pos.side, pos, p, status)
                                 cancel_ok, filled = cancel_pending_take_profit_order(client, config, storage, pos, context)
@@ -3670,6 +4041,41 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     if tp_res2.ok:
                                         pos.take_profit_order_id = tp_res2.order_id
                                         pos.rsi_special_tp_order_ts = f.ts
+                                    else:
+                                        status.live_state = "RECOVERING"
+                                        status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                                        storage.log_structured(
+                                            "ERROR",
+                                            "RSI9_SPECIAL_TP_REPLACE_FAILED",
+                                            {
+                                                "ts": f.ts.isoformat(),
+                                                "side": pos.side,
+                                                "strategy": pos.strategy,
+                                                "rsi_special_entry": pos.rsi_special_entry,
+                                                "entry_rule": p.reason_3,
+                                                "order_result": asdict(tp_res2),
+                                                "internal_position": position_state_payload(pos),
+                                            },
+                                            mirror_message=tp_res2.message,
+                                        )
+                                        continue
+                                else:
+                                    status.live_state = "RECOVERING"
+                                    status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+                                    storage.log_structured(
+                                        "ERROR",
+                                        "RSI9_SPECIAL_TP_CANCEL_FAILED",
+                                        {
+                                            "ts": f.ts.isoformat(),
+                                            "side": pos.side,
+                                            "strategy": pos.strategy,
+                                            "rsi_special_entry": pos.rsi_special_entry,
+                                            "entry_rule": p.reason_3,
+                                            "internal_position": position_state_payload(pos),
+                                        },
+                                        mirror_message=f"cancel failed order_id={pos.take_profit_order_id}",
+                                    )
+                                    continue
 
                         if live_tp_already_filled:
                             ex = True
@@ -3698,7 +4104,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     ex = False
                                     status.live_state = "RECOVERING"
                                     status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                    storage.log("ERROR", "RSI9_OLD_TP_CANCEL_FAILED", f"side={pos.side} strategy={pos.strategy} order_id={pos.take_profit_order_id}")
+                                    storage.log_structured(
+                                        "ERROR",
+                                        "RSI9_SPECIAL_TP_CANCEL_FAILED" if pos.rsi_special_entry else "RSI9_OLD_TP_CANCEL_FAILED",
+                                        {
+                                            "ts": f.ts.isoformat(),
+                                            "side": pos.side,
+                                            "strategy": pos.strategy,
+                                            "rsi_special_entry": pos.rsi_special_entry,
+                                            "entry_rule": p.reason_3,
+                                            "order_id": pos.take_profit_order_id,
+                                            "internal_position": position_state_payload(pos),
+                                        },
+                                        mirror_message=f"side={pos.side} strategy={pos.strategy} order_id={pos.take_profit_order_id}",
+                                    )
                                 else:
                                     pos.take_profit_order_id = None
                                     storage.log("INFO", "RSI9_OLD_TP_CANCELLED_BEFORE_EXIT", f"side={pos.side} strategy={pos.strategy}")
