@@ -42,6 +42,8 @@ LIVE_RETRY_MAX = 1
 ENTRY_ERROR_BLOCK_SEC = 300
 MARGIN_ENTRY_EXCHANGES = (9, 27)
 RECOVERY_COOLDOWN_SEC = 10
+ENTRY_POSITION_VERIFY_RETRY_MAX = 3
+ENTRY_POSITION_VERIFY_RETRY_INTERVAL_SEC = 0.5
 
 # ===== user-editable direct settings =====
 API_PASSWORD_HARDCODED = "enmasa1023"  # ここにAPIパスワードを入れる
@@ -2424,6 +2426,24 @@ def actual_position_price(position: dict[str, Any], fallback: float = 0.0) -> fl
         return fallback
 
 
+def positions_summary_for_log(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for pos in positions:
+        item = {
+            "Symbol": pos.get("Symbol"),
+            "Side": pos.get("Side"),
+            "LeavesQty": pos.get("LeavesQty"),
+            "Price": pos.get("Price"),
+            "MarginTradeType": pos.get("MarginTradeType"),
+        }
+        if "ExecutionID" in pos:
+            item["ExecutionID"] = pos.get("ExecutionID")
+        if "AccountType" in pos:
+            item["AccountType"] = pos.get("AccountType")
+        summary.append(item)
+    return summary
+
+
 def find_matching_actual_position(
     positions: list[dict[str, Any]],
     expected_side: str,
@@ -2554,11 +2574,17 @@ def verify_entry_position_after_order(
     ts: datetime,
 ) -> Optional[PositionState]:
     expected_margin = template_pos.margin_trade_type
-    storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_START", {
+    expected_qty = int(config.get("order_qty", 2))
+    retry_max = ENTRY_POSITION_VERIFY_RETRY_MAX
+    retry_interval_sec = ENTRY_POSITION_VERIFY_RETRY_INTERVAL_SEC
+    base_payload = {
         "ts": ts.isoformat(),
         "order_id": order_id,
         "expected_side": expected_side,
+        "expected_qty": expected_qty,
         "expected_margin_trade_type": expected_margin,
+        "retry_max": retry_max,
+        "retry_interval_sec": retry_interval_sec,
         "pred_signal": pred.signal,
         "pred_reason_1": pred.reason_1,
         "pred_reason_2": pred.reason_2,
@@ -2567,74 +2593,82 @@ def verify_entry_position_after_order(
         "pending_entry_side": status.pending_entry_side,
         "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
         "internal_position": position_state_payload(template_pos),
-    })
-    try:
-        positions = fetch_positions(client, config, storage, reason="ENTRY_POSITION_VERIFY")
-    except Exception as e:
-        storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
-            "ts": ts.isoformat(),
-            "order_id": order_id,
-            "expected_side": expected_side,
-            "expected_margin_trade_type": expected_margin,
-            "internal_position": position_state_payload(template_pos),
-            **api_error_payload(e),
-        })
-        return None
+    }
+    storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_START", base_payload)
 
-    actual = find_matching_actual_position(positions, expected_side, expected_margin)
-    if actual is None:
-        first = next((p for p in positions if position_leaves_qty(p) > 0), None)
-        storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
-            "ts": ts.isoformat(),
-            "order_id": order_id,
-            "expected_side": expected_side,
-            "actual_side": side_from_api_position(first) if first else None,
-            "expected_qty": int(config.get("order_qty", 2)),
-            "actual_qty": position_leaves_qty(first) if first else 0,
-            "expected_margin_trade_type": expected_margin,
-            "actual_margin_trade_type": _to_int(first.get("MarginTradeType"), -1) if first else None,
-            "pred_signal": pred.signal,
-            "pred_reason_1": pred.reason_1,
-            "pred_reason_2": pred.reason_2,
-            "pred_reason_3": pred.reason_3,
-            "live_state": status.live_state,
-            "pending_entry_side": status.pending_entry_side,
-            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
-            "internal_position": position_state_payload(template_pos),
-            "actual_position": first,
-            "positions_json": positions,
-        })
-        return None
+    last_positions: list[dict[str, Any]] = []
+    last_reason = "NO_MATCHING_POSITION"
+    last_error_payload: dict[str, Any] = {}
+    for attempt in range(1, retry_max + 1):
+        try:
+            positions = fetch_positions(client, config, storage, reason=f"ENTRY_POSITION_VERIFY_ATTEMPT_{attempt}")
+            last_positions = positions
+            last_error_payload = {}
+        except Exception as e:
+            positions = []
+            last_positions = []
+            last_reason = "FETCH_POSITIONS_ERROR"
+            last_error_payload = api_error_payload(e)
+            if attempt < retry_max:
+                storage.log_structured("WARN", "ENTRY_POSITION_VERIFY_RETRY", {
+                    **base_payload,
+                    "attempt": attempt,
+                    "reason": last_reason,
+                    "positions_count": 0,
+                    "positions_summary": [],
+                    **last_error_payload,
+                })
+                time.sleep(retry_interval_sec)
+                continue
+            break
 
-    actual_pos = create_position_from_actual_position(actual, template_pos, expected_side, config, order_id)
-    storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_OK", {
-        "ts": ts.isoformat(),
-        "order_id": order_id,
-        "expected_side": expected_side,
-        "actual_side": actual_pos.side,
-        "expected_qty": int(config.get("order_qty", 2)),
-        "actual_qty": actual_pos.filled_qty,
-        "expected_margin_trade_type": expected_margin,
-        "actual_margin_trade_type": actual_pos.margin_trade_type,
-        "pred_signal": pred.signal,
-        "pred_reason_1": pred.reason_1,
-        "pred_reason_2": pred.reason_2,
-        "pred_reason_3": pred.reason_3,
-        "live_state": status.live_state,
-        "pending_entry_side": status.pending_entry_side,
-        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
-        "actual_position": actual,
-        "internal_position": position_state_payload(actual_pos),
-    })
-    storage.log_structured("INFO", "POSITION_STATE_CREATED_FROM_ACTUAL", {
-        "ts": ts.isoformat(),
-        "order_id": order_id,
-        "expected_side": expected_side,
-        "actual_position": actual,
-        "internal_position": position_state_payload(actual_pos),
-    })
-    return actual_pos
+        actual = find_matching_actual_position(positions, expected_side, expected_margin)
+        positions_summary = positions_summary_for_log(positions)
+        if actual is not None:
+            actual_pos = create_position_from_actual_position(actual, template_pos, expected_side, config, order_id)
+            storage.log_structured("INFO", "ENTRY_POSITION_VERIFY_OK", {
+                **base_payload,
+                "actual_side": actual_pos.side,
+                "actual_qty": actual_pos.filled_qty,
+                "actual_leaves_qty": actual_pos.filled_qty,
+                "actual_price": actual_pos.entry_fill_price,
+                "actual_margin_trade_type": actual_pos.margin_trade_type,
+                "attempt": attempt,
+                "positions_count": len(positions),
+                "positions_summary": positions_summary,
+                "actual_position": positions_summary_for_log([actual])[0] if actual else None,
+                "internal_position": position_state_payload(actual_pos),
+            })
+            storage.log_structured("INFO", "POSITION_STATE_CREATED_FROM_ACTUAL", {
+                "ts": ts.isoformat(),
+                "order_id": order_id,
+                "expected_side": expected_side,
+                "attempt": attempt,
+                "actual_position": positions_summary_for_log([actual])[0] if actual else None,
+                "internal_position": position_state_payload(actual_pos),
+            })
+            return actual_pos
 
+        last_reason = "NO_MATCHING_POSITION"
+        if attempt < retry_max:
+            storage.log_structured("WARN", "ENTRY_POSITION_VERIFY_RETRY", {
+                **base_payload,
+                "attempt": attempt,
+                "reason": last_reason,
+                "positions_count": len(positions),
+                "positions_summary": positions_summary,
+            })
+            time.sleep(retry_interval_sec)
+
+    failed_summary = positions_summary_for_log(last_positions)
+    storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
+        **base_payload,
+        "reason": last_reason,
+        "positions_count": len(last_positions),
+        "positions_summary": failed_summary,
+        **last_error_payload,
+    })
+    return None
 
 def wait_for_position_unlocked_or_flat(
     client: KabuApiClient,
