@@ -1719,9 +1719,14 @@ def build_rsi9_prediction(
                 ma75_current = history[-1].ma75 if len(history) >= 1 else None
                 ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
                 if slope2m is not None and slope2m > 0:
-                    signal, side = "LONG_CANDIDATE", "LONG"
-                    entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
-                    print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
+                    if rsi_prev2 >= RSI9_SHORT_ENTRY:
+                        signal, side = "SHORT_CANDIDATE", "SHORT"
+                        entry_rule = "short_b_drop_from_rsi70_ma75_up"
+                        print(f"[INFO] DROP17_RSI70_MA75_UP_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} signal=SHORT_CANDIDATE reason_3=short_b_drop_from_rsi70_ma75_up", flush=True)
+                    else:
+                        signal, side = "LONG_CANDIDATE", "LONG"
+                        entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
+                        print(f"[INFO] DROP17_MA75_SLOPE_LONG rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} all_ma_below={all_ma_below}", flush=True)
                 elif slope2m is not None and slope2m < 0:
                     if rsi_now <= 29.9:
                         signal, side = "NO_ACTION", "NEUTRAL"
@@ -1847,7 +1852,7 @@ def create_position(
         entry_vwap_mode=CURRENT_VWAP_MODE,
         margin_trade_type=margin_trade_type_for_side(config, side),
         entry_order_id=entry_order_id,
-        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down"}),
+        rsi_special_entry=(pred.reason_3 in {"long_b_drop", "long_b_drop_ma75_up", "long_b_drop_ma75_up_all_ma_below_allowed", "short_b_drop_ma75_down", "short_b_drop_from_rsi70_ma75_up", "long_a_reversal_watch"}),
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
@@ -1867,8 +1872,9 @@ def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot
             if pos.rsi_special_entry:
                 return False, "HOLD", 0.0
             if pos.side == "LONG":
-                if rsi >= RSI9_LONG_TP:
-                    return True, "TAKE_PROFIT", 0.0
+                # RSI9 LONG exits are managed by the staged +10tick -> +5tick
+                # special take-profit limit flow, not by RSI50 threshold exits.
+                return False, "HOLD", 0.0
             else:
                 if rsi <= RSI9_SHORT_TP:
                     return True, "TAKE_PROFIT", 0.0
