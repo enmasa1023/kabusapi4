@@ -3629,18 +3629,33 @@ def reconcile_live_position(
     expected_margin = expected_margin_trade_type
     if expected_margin is None and status.open_position is not None:
         expected_margin = status.open_position.margin_trade_type
-    total_qty, matching_qty = summarize_positions(
-        positions,
-        expected_side or (status.open_position.side if status.open_position else None),
-        expected_margin_trade_type=expected_margin,
-    )
+    managed_execution_ids = list(status.open_position.managed_execution_ids or []) if status.open_position is not None else []
+    scoped_positions: list[dict[str, Any]] = []
+    if status.open_position is not None and managed_execution_ids:
+        scoped_positions = managed_positions_for(status.open_position, positions)
+        scoped_total_qty, scoped_hold_qty, scoped_available_qty = position_quantities(scoped_positions)
+        total_qty = scoped_total_qty
+        matching_qty = scoped_total_qty
+    else:
+        total_qty, matching_qty = summarize_positions(
+            positions,
+            expected_side or (status.open_position.side if status.open_position else None),
+            expected_margin_trade_type=expected_margin,
+        )
+        scoped_hold_qty = 0
+        scoped_available_qty = 0
     payload_base = {
         "reason": reason,
         "expected_side": expected_side,
         "expected_margin_trade_type": expected_margin,
+        "managed_execution_ids": managed_execution_ids,
+        "scoped_positions_summary": positions_summary_for_log(scoped_positions),
+        "scoped_hold_qty": scoped_hold_qty,
+        "scoped_available_qty": scoped_available_qty,
         "positions_count": len(positions),
         "total_leaves_qty": total_qty,
         "matching_leaves_qty": matching_qty,
+        "raw_positions_json": positions,
         "positions_json": positions,
         "before_state": before,
     }
