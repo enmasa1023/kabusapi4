@@ -1714,8 +1714,22 @@ def build_rsi9_prediction(
     if status is not None and status.rsi20_long_watch_active:
         if open_pos is not None:
             clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "POSITION_OPEN")
+        elif status.rsi20_long_watch_expires_at and bar1.ts > status.rsi20_long_watch_expires_at:
+            rsi20_watch_expired_this_bar = True
+            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_EXPIRED", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
         elif in_no_entry:
-            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NO_ENTRY_WINDOW")
+            payload = {
+                "ts": bar1.ts.isoformat(),
+                "rsi_now": rsi_now,
+                "rsi_prev": rsi_prev,
+                "watch_started_at": status.rsi20_long_watch_started_at.isoformat() if status.rsi20_long_watch_started_at else None,
+                "watch_expires_at": status.rsi20_long_watch_expires_at.isoformat() if status.rsi20_long_watch_expires_at else None,
+                "reason": "WATCH_ACTIVE_BUT_NO_ENTRY_WINDOW",
+            }
+            if storage is not None:
+                storage.log_structured("INFO", "WATCH_ACTIVE_BUT_NO_ENTRY_WINDOW", payload)
+            else:
+                print(f"[INFO] WATCH_ACTIVE_BUT_NO_ENTRY_WINDOW {payload}", flush=True)
         elif not allow_new_entry:
             payload = {
                 "ts": bar1.ts.isoformat(),
@@ -1729,9 +1743,6 @@ def build_rsi9_prediction(
                 storage.log_structured("INFO", "WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED", payload)
             else:
                 print(f"[INFO] WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED {payload}", flush=True)
-        elif status.rsi20_long_watch_expires_at and bar1.ts > status.rsi20_long_watch_expires_at:
-            rsi20_watch_expired_this_bar = True
-            clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_EXPIRED", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
 
     if open_pos is None and not in_no_entry:
         rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
@@ -1758,6 +1769,10 @@ def build_rsi9_prediction(
                         signal, side = "NO_ACTION", "NEUTRAL"
                         entry_rule = "short_b_drop_ma75_down_rsi_too_low_blocked"
                         print(f"[INFO] DROP17_MA75_SLOPE_SHORT_BLOCKED_RSI_LOW rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                    elif rsi_now > rsi_prev:
+                        signal, side = "NO_ACTION", "NEUTRAL"
+                        entry_rule = "short_b_drop_ma75_down_rsi_rebound_blocked"
+                        print(f"[INFO] DROP17_MA75_SLOPE_SHORT_BLOCKED_RSI_REBOUND rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} reason_3=short_b_drop_ma75_down_rsi_rebound_blocked", flush=True)
                     else:
                         signal, side = "SHORT_CANDIDATE", "SHORT"
                         entry_rule = "short_b_drop_ma75_down"
@@ -1772,8 +1787,7 @@ def build_rsi9_prediction(
 
         if status is not None:
             if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
-                if status.rsi20_long_watch_active:
-                    clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, f"SIGNAL_{entry_rule}")
+                pass
             elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
                 if allow_new_entry:
                     signal, side = "LONG_CANDIDATE", "LONG"
@@ -2310,6 +2324,20 @@ def position_execution_id(position: dict[str, Any]) -> str:
     return str(position.get("ExecutionID") or "")
 
 
+def managed_positions_for(position_state: PositionState, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    managed_set = {str(x) for x in (position_state.managed_execution_ids or []) if str(x)}
+    if not managed_set:
+        return positions
+    return [p for p in positions if position_execution_id(p) in managed_set]
+
+
+def position_quantities(positions: list[dict[str, Any]]) -> tuple[int, int, int]:
+    leaves_qty = sum(position_leaves_qty(p) for p in positions)
+    hold_qty = sum(min(position_hold_qty(p), position_leaves_qty(p)) for p in positions)
+    available_qty = sum(position_available_qty(p) for p in positions)
+    return leaves_qty, hold_qty, available_qty
+
+
 def position_identity(position: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(position.get("ExecutionID") or ""),
@@ -2607,9 +2635,24 @@ def verify_position_before_exit(
             **api_error_payload(e),
         })
         return False
-    actual = find_matching_actual_position(positions, pos.side, pos.margin_trade_type)
+    if pos.managed_execution_ids:
+        check_positions = managed_positions_for(pos, positions)
+        if not check_positions or sum(position_leaves_qty(p) for p in check_positions) <= 0:
+            status.live_state = "FLAT"
+            status.open_position = None
+            storage.log_structured("WARN", "POSITION_MANAGED_IDS_NOT_FOUND_BEFORE_EXIT", {
+                "managed_execution_ids": list(pos.managed_execution_ids),
+                "intended_exit_reason": intended_exit_reason,
+                "internal_position": position_state_payload(pos),
+                "positions_summary": positions_summary_for_log(positions),
+            })
+            return False
+        actual = find_matching_actual_position(check_positions, pos.side, pos.margin_trade_type)
+    else:
+        check_positions = positions
+        actual = find_matching_actual_position(positions, pos.side, pos.margin_trade_type)
     if actual is None:
-        first = next((p for p in positions if position_leaves_qty(p) > 0), None)
+        first = next((p for p in check_positions if position_leaves_qty(p) > 0), None)
         event = "POSITION_SIDE_MISMATCH_BEFORE_EXIT" if first is not None else "POSITION_NOT_FOUND_BEFORE_EXIT"
         status.live_state = "RECOVERING"
         status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
@@ -2624,7 +2667,7 @@ def verify_position_before_exit(
             "intended_exit_reason": intended_exit_reason,
             "internal_position": position_state_payload(pos),
             "actual_position": first,
-            "positions_json": positions,
+            "positions_summary": positions_summary_for_log(positions),
         })
         return False
     storage.log_structured("INFO", "EXIT_POSITION_VERIFY_OK", {
@@ -2988,12 +3031,16 @@ def place_take_profit_limit_order(
         positions,
         pos.side,
         margin_trade_type=pos.margin_trade_type,
+        available_only=True,
         default_exchange=exit_exchange(config),
         managed_execution_ids=pos.managed_execution_ids,
         storage=storage,
     )
     if not close_position_groups:
-        return LiveOrderResult(False, "TAKE_PROFIT_NO_MATCHING_OPEN_POSITION", recoverable=True)
+        managed_positions = managed_positions_for(pos, positions) if pos.managed_execution_ids else positions
+        leaves_qty, hold_qty, available_qty = position_quantities(managed_positions)
+        storage.log_structured("WARN", "TAKE_PROFIT_NO_AVAILABLE_POSITION", {**context, "leaves_qty": leaves_qty, "hold_qty": hold_qty, "available_qty": available_qty, "positions_summary": positions_summary_for_log(positions), "managed_execution_ids": list(pos.managed_execution_ids or [])})
+        return LiveOrderResult(False, "TAKE_PROFIT_NO_AVAILABLE_POSITION", recoverable=True)
     limit_price = take_profit_limit_price(pos)
     order_ids: list[str] = []
     for position_exchange, close_positions, total_qty in close_position_groups:
@@ -3244,6 +3291,8 @@ def execute_live_exit(
         "FORCE_MARKET_ORDER" if force_market_order else "LIVE_EXIT",
         now_jst(),
     ):
+        if status.open_position is None and status.live_state == "FLAT":
+            return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
         return LiveOrderResult(False, "POSITION_VERIFY_FAILED_BEFORE_EXIT", recoverable=True)
 
     for attempt in range(retries + 1):
@@ -3265,16 +3314,15 @@ def execute_live_exit(
         total_qty = sum(group_total_qty for _, _, group_total_qty in close_position_groups)
         if force_market_order:
             storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_AVAILABLE_CLOSE_POSITIONS", {**context, "close_position_groups": close_position_groups, "total_qty": total_qty})
-        leaves_qty, hold_qty, available_qty = get_matching_position_quantities(
-            positions,
-            side,
-            margin_trade_type=pos.margin_trade_type,
-        )
+        managed_positions = managed_positions_for(pos, positions) if pos.managed_execution_ids else positions
+        leaves_qty, hold_qty, available_qty = position_quantities(managed_positions)
         if not positions:
             return LiveOrderResult(False, "NO_POSITIONS_FOR_EXIT", recoverable=True)
         if leaves_qty <= 0:
-            storage.log("INFO", "POSITION_ALREADY_CLOSED", f"side={side}")
-            return LiveOrderResult(False, "NO_MATCHING_OPEN_POSITION", recoverable=True)
+            storage.log_structured("INFO", "POSITION_ALREADY_CLOSED", {**context, "managed_execution_ids": list(pos.managed_execution_ids or []), "positions_summary": positions_summary_for_log(positions)})
+            status.open_position = None
+            status.live_state = "FLAT"
+            return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
         if total_qty <= 0 or not close_position_groups:
             storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_WAIT_UNLOCK", {**context, "leaves_qty": leaves_qty, "hold_qty": hold_qty, "available_qty": available_qty, "positions_summary": positions_summary_for_log(positions)})
             return LiveOrderResult(
@@ -3864,10 +3912,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
             if f is not None:
                 storage.insert_feature(f)
-                force_close_time_reached = False
+                # 15:20強制決済は上位ブロックで処理済み。ここでは新規停止フラグとして扱わない。
+                force_close_handled_above = False
                 allow_new_entry = (
                     time_in_windows(tstr, TRADE_WINDOWS)
-                    and not force_close_time_reached
+                    and not force_close_handled_above
                     and status.pending_entry_side is None
                     and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
                 )
@@ -3892,39 +3941,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 effective_signal = p.signal
                 current_rsi = extract_rsi_from_pred(p)
 
-                if force_close_time_reached:
-                    effective_signal = "NO_ACTION"
-                    if status.pending_entry_side is not None:
-                        storage.log("WARN", "PENDING_ENTRY_CLEARED_FORCE_CLOSE_TIME", f"side={status.pending_entry_side}")
-                        status.pending_entry_side = None
-                        status.pending_entry_ts = None
-                    if (
-                        status.open_position is not None
-                        and not status.force_market_close_sent
-                        and status.live_state not in {"EXIT_SENT", "EXIT_VERIFYING", "RECOVERING"}
-                    ):
-                        storage.log("WARN", "FORCE_MARKET_CLOSE_1520", f"time={tstr} side={status.open_position.side} strategy={status.open_position.strategy}")
-                        status.force_market_close_sent = True
-                        force_close_open_position(
-                            client,
-                            config,
-                            storage,
-                            status,
-                            reason="FORCE_MARKET_CLOSE_1520",
-                            ts=now_,
-                            last_pred=last_pred,
-                            latest_snapshot=snap,
-                            use_market_order=True,
-                        )
-
                 # RSI threshold hit on closed 1m bar -> execute on next 1m bar open (first tick)
-                if (not force_close_time_reached) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
+                if (not force_close_handled_above) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
                     if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                         status.pending_entry_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
                         status.pending_entry_ts = f.ts
                         storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
 
-                if (not force_close_time_reached) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
+                if (not force_close_handled_above) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
                     add_ok, add_reason = should_rsi9_long_add(rb1.latest(), list(rb1.history), status.open_position)
                     if status.pending_exit:
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=PENDING_EXIT")
@@ -3945,7 +3969,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     elif status.live_state != "OPEN":
                         status.pending_add = False
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason=LIVE_STATE_{status.live_state}_PENDING_CLEARED")
-                    elif force_close_time_reached:
+                    elif force_close_handled_above:
                         status.pending_add = False
                     else:
                         current_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else int(pos_add.filled_qty)
@@ -3979,7 +4003,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 storage.log("WARN", "RSI9_LONG_ADD_FAIL", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} message={add_res.message}")
 
                 if status.pending_entry_side and status.open_position is None:
-                    if force_close_time_reached:
+                    if force_close_handled_above:
                         status.pending_entry_side = None
                         status.pending_entry_ts = None
                     else:
@@ -4130,6 +4154,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 )
                                                 status.open_position = candidate_pos
                                                 status.live_state = "OPEN"
+                                                if status.rsi20_long_watch_active:
+                                                    clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
                                                 if candidate_pos.filled_qty >= int(config.get("order_qty", 2)):
                                                     storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
                                                 else:
@@ -4168,6 +4194,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             else:
                                 status.open_position = candidate_pos
                                 status.live_state = "OPEN"
+                                if status.rsi20_long_watch_active:
+                                    clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
                                 status.last_entry_ts_by_side[side] = f.ts
                                 status.pending_entry_side = None
                                 mfe_ticks = 0.0
