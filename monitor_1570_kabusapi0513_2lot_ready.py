@@ -2454,6 +2454,30 @@ def wait_for_position_qty(
     return False
 
 
+def wait_for_managed_position_qty(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    pos: PositionState,
+    target_qty: int,
+    timeout_sec: int | float,
+    comparator: str = "eq",
+    storage: Optional[Storage] = None,
+    reason: str = "MANAGED_POSITION_QTY_WAIT",
+) -> bool:
+    start = time.time()
+    while True:
+        positions = fetch_positions(client, config, storage, reason=reason)
+        managed_positions = managed_positions_for(pos, positions)
+        leaves_qty, _, _ = position_quantities(managed_positions)
+        if comparator == "ge" and leaves_qty >= target_qty:
+            return True
+        if comparator == "eq" and leaves_qty == target_qty:
+            return True
+        if time.time() - start >= timeout_sec:
+            return False
+        time.sleep(0.5)
+
+
 def get_matching_position_quantities(
     positions: list[dict[str, Any]],
     side: str,
@@ -2808,6 +2832,7 @@ def wait_for_position_unlocked_or_flat(
     side: str,
     margin_trade_type: Optional[int] = None,
     timeout_sec: float = 5.0,
+    managed_execution_ids: Optional[list[str]] = None,
 ) -> tuple[bool, bool, int, int, int, list[dict[str, Any]]]:
     start = time.time()
     last_positions: list[dict[str, Any]] = []
@@ -2816,11 +2841,16 @@ def wait_for_position_unlocked_or_flat(
     last_available = 0
     while time.time() - start <= timeout_sec:
         last_positions = fetch_positions(client, config)
-        last_leaves, last_hold, last_available = get_matching_position_quantities(
-            last_positions,
-            side,
-            margin_trade_type=margin_trade_type,
-        )
+        if managed_execution_ids:
+            managed_set = {str(x) for x in managed_execution_ids if str(x)}
+            scoped_positions = [p for p in last_positions if position_execution_id(p) in managed_set]
+            last_leaves, last_hold, last_available = position_quantities(scoped_positions)
+        else:
+            last_leaves, last_hold, last_available = get_matching_position_quantities(
+                last_positions,
+                side,
+                margin_trade_type=margin_trade_type,
+            )
         if last_leaves <= 0:
             return True, True, last_leaves, last_hold, last_available, last_positions
         if last_hold <= 0 and last_available > 0:
@@ -3009,6 +3039,7 @@ def cancel_pending_take_profit_order(
         pos.side,
         margin_trade_type=pos.margin_trade_type,
         timeout_sec=float(config.get("take_profit_cancel_verify_sec", 5.0)),
+        managed_execution_ids=pos.managed_execution_ids,
     )
     if any_fail:
         storage.log_structured("WARN", "TAKE_PROFIT_CANCEL_PARTIAL_FAILED", {**context, "leaves_qty": leaves, "positions_json": positions})
@@ -3079,9 +3110,14 @@ def verify_position_after_entry_cancel(
     storage: Storage,
     context: dict[str, Any],
     order_id: str,
+    before_positions: Optional[list[dict[str, Any]]] = None,
 ) -> bool:
     positions = fetch_positions(client, config, storage, reason="ENTRY_CANCEL_VERIFY")
-    total_qty, matching_qty = summarize_positions(positions, expected_side=side, expected_margin_trade_type=margin_trade_type_for_side(config, side))
+    margin_trade_type = margin_trade_type_for_side(config, side)
+    total_qty, matching_qty = summarize_positions(positions, expected_side=side, expected_margin_trade_type=margin_trade_type)
+    new_positions = new_managed_positions_from_diff(positions, before_positions, side, margin_trade_type) if before_positions is not None else []
+    new_qty = sum(position_leaves_qty(p) for p in new_positions)
+    ok = new_qty >= max(target_qty, 1) if before_positions is not None else matching_qty >= max(target_qty, 1)
     storage.log_structured(
         "INFO",
         "ENTRY_POSITION_AFTER_CANCEL",
@@ -3091,10 +3127,13 @@ def verify_position_after_entry_cancel(
             "target_qty": target_qty,
             "total_leaves_qty": total_qty,
             "matching_leaves_qty": matching_qty,
+            "new_matching_leaves_qty": new_qty,
+            "before_positions_summary": positions_summary_for_log(before_positions or []),
+            "new_positions_summary": positions_summary_for_log(new_positions),
             "raw_positions_json": positions,
         },
     )
-    return matching_qty >= max(target_qty, 1)
+    return ok
 
 
 def execute_live_entry(
@@ -3125,6 +3164,7 @@ def execute_live_entry(
     }
 
     last = LiveOrderResult(False, "ENTRY_UNKNOWN_ERROR")
+    entry_before_positions = fetch_positions(client, config, storage, reason="ENTRY_BEFORE_POSITIONS")
     for attempt in range(retries + 1):
         limit_price = None
         front_order_type = None
@@ -3187,16 +3227,18 @@ def execute_live_entry(
             cres = client.cancel_order(order_id, config["order_password"])
             storage.log_structured("WARN", "CANCEL_ORDER_RESPONSE", {**context, "order_id": order_id, "raw_response_json": cres})
             if bool(entry_exec.get("verify_position_after_cancel", True)) and verify_position_after_entry_cancel(
-                client, config, side, target_qty, storage, context, order_id
+                client, config, side, target_qty, storage, context, order_id, before_positions=entry_before_positions
             ):
                 return LiveOrderResult(True, order_id, order_id=order_id)
         except Exception as e:
             ep = api_error_payload(e)
             storage.log_structured("WARN", "CANCEL_ORDER_FAIL", {**context, "order_id": order_id, **ep}, mirror_message=f"ENTRY_CANCEL_FAIL order_id={order_id} Code={ep.get('api_code')} Message={ep.get('api_message')}")
-            if str(ep.get("api_code") or "") == "43" and wait_for_position_qty(client, config, side, target_qty=max(target_qty, 1), timeout_sec=timeout_sec, comparator="ge", margin_trade_type=margin_trade_type_for_side(config, side)):
+            if str(ep.get("api_code") or "") == "43" and verify_position_after_entry_cancel(
+                client, config, side, target_qty, storage, context, order_id, before_positions=entry_before_positions
+            ):
                 return LiveOrderResult(True, order_id, order_id=order_id)
             if bool(entry_exec.get("verify_position_after_cancel", True)) and verify_position_after_entry_cancel(
-                client, config, side, target_qty, storage, context, order_id
+                client, config, side, target_qty, storage, context, order_id, before_positions=entry_before_positions
             ):
                 return LiveOrderResult(True, order_id, order_id=order_id)
     return last
@@ -3421,7 +3463,7 @@ def execute_live_exit(
         if not order_ids:
             continue
         combined_order_id = ",".join(order_ids)
-        if wait_for_position_qty(client, config, side, target_qty=0, timeout_sec=timeout_sec, comparator="eq", margin_trade_type=pos.margin_trade_type):
+        if wait_for_managed_position_qty(client, config, pos, target_qty=0, timeout_sec=timeout_sec, comparator="eq", storage=storage, reason="EXIT_WAIT_MANAGED_FLAT"):
             return LiveOrderResult(True, combined_order_id, order_id=combined_order_id)
         last = LiveOrderResult(False, f"EXIT_NOT_FILLED_TIMEOUT order_id={combined_order_id}", order_id=combined_order_id, recoverable=True)
         for order_id in order_ids:
@@ -3435,15 +3477,13 @@ def execute_live_exit(
                 code = str(ep.get("api_code") or "")
                 storage.log_structured("WARN", "CANCEL_ORDER_FAIL", {**context, "order_id": order_id, **ep}, mirror_message=f"EXIT_CANCEL_FAIL order_id={order_id} Code={code} Message={ep.get('api_message')}")
                 if code == "43":
-                    if wait_for_position_qty(client, config, side, target_qty=0, timeout_sec=timeout_sec, comparator="eq", margin_trade_type=pos.margin_trade_type):
+                    if wait_for_managed_position_qty(client, config, pos, target_qty=0, timeout_sec=timeout_sec, comparator="eq", storage=storage, reason="EXIT_CANCEL_WAIT_MANAGED_FLAT"):
                         return LiveOrderResult(True, order_id, order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""))
                     last = LiveOrderResult(False, f"EXIT_CANCEL_ALREADY_FILLED_VERIFY_POSITION order_id={order_id}", order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""), recoverable=True)
                     break
-        remaining_leaves_qty, _, _ = get_matching_position_quantities(
-            fetch_positions(client, config, storage, reason="EXIT_REPRICE_REMAINING_QTY"),
-            side,
-            margin_trade_type=pos.margin_trade_type,
-        )
+        remaining_positions = fetch_positions(client, config, storage, reason="EXIT_REPRICE_REMAINING_QTY")
+        remaining_managed_positions = managed_positions_for(pos, remaining_positions) if pos.managed_execution_ids else remaining_positions
+        remaining_leaves_qty, _, _ = position_quantities(remaining_managed_positions)
         storage.log_structured(
             "INFO",
             "EXIT_REPRICE_LOOP",
@@ -4306,7 +4346,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             if pos.exit_fill_price is None:
                                 pos.exit_fill_price = take_profit_limit_price(pos)
                             pnl_ticks = take_profit_filled_ticks(pos)
-                        elif config["live_mode"] and pos.take_profit_order_id and wait_for_position_qty(client, config, pos.side, target_qty=0, timeout_sec=0, comparator="eq", margin_trade_type=pos.margin_trade_type):
+                        elif config["live_mode"] and pos.take_profit_order_id and wait_for_managed_position_qty(client, config, pos, target_qty=0, timeout_sec=0, comparator="eq", storage=storage, reason="TP_WAIT_MANAGED_FILLED"):
                             pos.exit_fill_price = take_profit_limit_price(pos)
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
                             live_tp_already_filled = True
