@@ -129,6 +129,13 @@ RSI9_SHORT_TP = 40.0
 RSI9_SHORT_SL = 0.0
 RSI9_LONG_ADD_ENTRY = 10.0
 RSI20_LONG_WATCH_MINUTES = 10
+RSI17_DROP_MA75_GAP_THRESHOLD = 0.008
+RSI17_DROP_ENTRY_RULES = {
+    "long_b_drop_ma75_up",
+    "long_b_drop_ma75_up_all_ma_below_allowed",
+    "short_b_drop_ma75_down",
+    "short_b_drop_from_rsi70_ma75_up",
+}
 
 
 def now_jst() -> datetime:
@@ -1599,6 +1606,66 @@ def ma75_slope_2m(history: list[Bar]) -> Optional[float]:
     return current - two_min_ago
 
 
+def ma75_gap_ratio(current_price: Optional[float], ma75: Optional[float]) -> Optional[float]:
+    if current_price is None or ma75 is None:
+        return None
+    try:
+        price = float(current_price)
+        ma = float(ma75)
+    except Exception:
+        return None
+    if price <= 0 or ma <= 0:
+        return None
+    return max(price, ma) / min(price, ma) - 1.0
+
+
+def log_ma75_gap_block(
+    storage: Optional[Storage],
+    event_type: str,
+    ts: datetime,
+    side: str,
+    rsi_now: Optional[float],
+    rsi_prev: Optional[float],
+    rsi_prev2: Optional[float],
+    current_price: Optional[float],
+    ma75: Optional[float],
+    gap_ratio: Optional[float],
+    original_entry_rule: str,
+    blocked_reason: str,
+) -> None:
+    payload = {
+        "ts": ts.isoformat(),
+        "side": side,
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "rsi_prev2": rsi_prev2,
+        "current_price": current_price,
+        "ma75": ma75,
+        "ma75_gap_ratio": gap_ratio,
+        "ma75_gap_pct": (gap_ratio * 100.0) if gap_ratio is not None else None,
+        "threshold": RSI17_DROP_MA75_GAP_THRESHOLD,
+        "original_entry_rule": original_entry_rule,
+        "blocked_reason": blocked_reason,
+    }
+    if storage is not None:
+        storage.log_structured("WARN", event_type, payload)
+    else:
+        print(f"[WARN] {event_type} {payload}", flush=True)
+
+
+def rsi17_drop_ma75_gap_block_reason(
+    current_price: Optional[float],
+    ma75: Optional[float],
+    original_entry_rule: str,
+) -> tuple[Optional[str], Optional[float]]:
+    gap_ratio = ma75_gap_ratio(current_price, ma75)
+    if gap_ratio is None:
+        return "ma75_gap_check_unavailable_blocked", None
+    if gap_ratio >= RSI17_DROP_MA75_GAP_THRESHOLD:
+        return f"{original_entry_rule}_gap_blocked", gap_ratio
+    return None, gap_ratio
+
+
 def should_rsi9_long_add(bar1: Optional[Bar], history: list[Bar], open_pos: Optional[PositionState]) -> tuple[bool, str]:
     if bar1 is None or open_pos is None:
         return False, "NO_BAR_OR_POSITION"
@@ -1781,6 +1848,28 @@ def build_rsi9_prediction(
                     signal, side = "NO_ACTION", "NEUTRAL"
                     entry_rule = "drop17_ma75_flat_or_unknown"
                     print(f"[INFO] DROP17_MA75_SLOPE_SKIP rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                if entry_rule in RSI17_DROP_ENTRY_RULES:
+                    original_entry_rule = entry_rule
+                    original_side = side
+                    blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, original_entry_rule)
+                    if blocked_reason is not None:
+                        event_type = "ENTRY_BLOCKED_MA75_GAP_UNAVAILABLE" if gap_ratio is None else "RSI17_DROP_MA75_GAP_BLOCKED"
+                        log_ma75_gap_block(
+                            storage,
+                            event_type,
+                            bar1.ts,
+                            original_side,
+                            rsi_now,
+                            rsi_prev,
+                            rsi_prev2,
+                            bar1.close,
+                            bar1.ma75,
+                            gap_ratio,
+                            original_entry_rule,
+                            blocked_reason,
+                        )
+                        signal, side = "NO_ACTION", "NEUTRAL"
+                        entry_rule = blocked_reason
             elif False and short_ma and rsi_now >= RSI9_SHORT_ENTRY and rsi_prev >= RSI9_SHORT_ENTRY:
                 signal, side = "SHORT_CANDIDATE", "SHORT"
                 entry_rule = "short_frozen"
@@ -4065,6 +4154,30 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         side = status.pending_entry_side
                         enter_ok, _ = can_enter(side, f.ts, status)
                         if enter_ok:
+                            if p.reason_3 in RSI17_DROP_ENTRY_RULES:
+                                latest_bar_for_gap = rb1.latest()
+                                send_price = snap.price if snap.price is not None else f.price
+                                send_ma75 = latest_bar_for_gap.ma75 if latest_bar_for_gap is not None else None
+                                blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(send_price, send_ma75, p.reason_3)
+                                if blocked_reason is not None:
+                                    event_type = "ENTRY_BLOCKED_MA75_GAP_UNAVAILABLE" if gap_ratio is None else "ENTRY_BLOCKED_MA75_GAP_AT_SEND"
+                                    log_ma75_gap_block(
+                                        storage,
+                                        event_type,
+                                        f.ts,
+                                        side,
+                                        current_rsi,
+                                        None,
+                                        None,
+                                        send_price,
+                                        send_ma75,
+                                        gap_ratio,
+                                        p.reason_3,
+                                        blocked_reason,
+                                    )
+                                    status.pending_entry_side = None
+                                    status.pending_entry_ts = None
+                                    continue
                             candidate_pos = create_position(p, f, config, side_override=side)
                             if candidate_pos.side != side:
                                 storage.log_structured(
