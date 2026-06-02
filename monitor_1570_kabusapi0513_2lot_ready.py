@@ -565,6 +565,7 @@ class MonitorStatus:
     force_close_state: str = ""
     failed_close_signature: str = ""
     failed_close_signature_ts: Optional[datetime] = None
+    last_manual_position_check_ts: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -3810,6 +3811,57 @@ def _split_order_ids(raw: Optional[str]) -> list[str]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
 
 
+def manual_position_clear_resume_check(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    ts: datetime,
+) -> None:
+    if not config.get("live_mode"):
+        return
+    if status.live_state != "MANUAL_POSITION_CHECK_REQUIRED" or status.open_position is not None:
+        return
+    interval_sec = max(float(config.get("manual_position_check_interval_sec", 5.0)), 1.0)
+    if status.last_manual_position_check_ts is not None:
+        if (ts - status.last_manual_position_check_ts).total_seconds() < interval_sec:
+            return
+    status.last_manual_position_check_ts = ts
+    try:
+        positions = fetch_positions(client, config, storage, reason="MANUAL_POSITION_CLEAR_CHECK")
+        total_qty, matching_qty = summarize_positions(positions)
+        payload = {
+            "ts": ts.isoformat(),
+            "total_qty": total_qty,
+            "matching_qty": matching_qty,
+            "positions_summary": positions_summary_for_log(positions),
+            "raw_positions_json": positions,
+            "live_state": status.live_state,
+        }
+        if total_qty <= 0:
+            status.live_state = "FLAT"
+            status.recovery_until = None
+            status.pending_entry_side = None
+            status.pending_entry_ts = None
+            status.pending_add = False
+            status.pending_exit = False
+            storage.log_structured(
+                "INFO",
+                "MANUAL_POSITION_CLEARED_RESUME_AUTO_TRADE",
+                {**payload, "after_state": {"live_state": status.live_state}},
+                mirror_message="manual/API positions are flat; auto trading resumed",
+            )
+        else:
+            storage.log_structured("INFO", "MANUAL_POSITION_STILL_OPEN", payload)
+    except Exception as e:
+        storage.log_structured(
+            "WARN",
+            "MANUAL_POSITION_CLEAR_CHECK_ERROR",
+            {"ts": ts.isoformat(), "live_state": status.live_state, **api_error_payload(e)},
+            mirror_message=str(e),
+        )
+
+
 def midday_order_cleanup(
     client: KabuApiClient,
     config: dict[str, Any],
@@ -4024,6 +4076,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     )
                 time.sleep(config["poll_interval_sec"])
                 continue
+
+            manual_position_clear_resume_check(client, config, storage, status, now_)
 
             bar1_new = rb1.update(snap)
             if bar1_new:
