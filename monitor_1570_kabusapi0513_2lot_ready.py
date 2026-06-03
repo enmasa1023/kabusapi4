@@ -524,6 +524,19 @@ class LiveOrderResult:
 
 
 @dataclass
+class EntryPositionVerifyResult:
+    position: Optional[PositionState] = None
+    verified_flat: bool = False
+    verify_error: bool = False
+    reason: str = ""
+    positions_count: int = 0
+    positions_summary: list[dict[str, Any]] = field(default_factory=list)
+    raw_positions: list[dict[str, Any]] = field(default_factory=list)
+    matching_qty: int = 0
+    total_qty: int = 0
+
+
+@dataclass
 class ReconcileResult:
     ok_for_entry: bool
     live_state: str
@@ -2904,7 +2917,7 @@ def verify_entry_position_after_order(
     status: MonitorStatus,
     ts: datetime,
     before_positions: Optional[list[dict[str, Any]]] = None,
-) -> Optional[PositionState]:
+) -> EntryPositionVerifyResult:
     expected_margin = template_pos.margin_trade_type
     expected_qty = int(config.get("order_qty", 2))
     retry_max = ENTRY_POSITION_VERIFY_RETRY_MAX
@@ -2987,7 +3000,17 @@ def verify_entry_position_after_order(
                 "actual_position": positions_summary_for_log([actual])[0] if actual else None,
                 "internal_position": position_state_payload(actual_pos),
             })
-            return actual_pos
+            return EntryPositionVerifyResult(
+                position=actual_pos,
+                verified_flat=False,
+                verify_error=False,
+                reason="MATCHED_POSITION",
+                positions_count=len(positions),
+                positions_summary=positions_summary,
+                raw_positions=positions,
+                matching_qty=actual_pos.filled_qty,
+                total_qty=sum(position_leaves_qty(p) for p in positions),
+            )
 
         last_reason = "NO_MATCHING_POSITION"
         if attempt < retry_max:
@@ -3001,14 +3024,31 @@ def verify_entry_position_after_order(
             time.sleep(retry_interval_sec)
 
     failed_summary = positions_summary_for_log(last_positions)
-    storage.log_structured("ERROR", "ENTRY_POSITION_VERIFY_FAILED", {
+    total_qty, matching_qty = summarize_positions(last_positions, expected_side, expected_margin)
+    verified_flat = not last_error_payload and total_qty <= 0 and matching_qty <= 0
+    final_reason = "VERIFIED_FLAT" if verified_flat else last_reason
+    storage.log_structured("ERROR" if last_error_payload else "WARN", "ENTRY_POSITION_VERIFY_FAILED", {
         **base_payload,
-        "reason": last_reason,
+        "reason": final_reason,
+        "verified_flat": verified_flat,
+        "verify_error": bool(last_error_payload),
         "positions_count": len(last_positions),
         "positions_summary": failed_summary,
+        "total_qty": total_qty,
+        "matching_qty": matching_qty,
         **last_error_payload,
     })
-    return None
+    return EntryPositionVerifyResult(
+        position=None,
+        verified_flat=verified_flat,
+        verify_error=bool(last_error_payload),
+        reason=final_reason,
+        positions_count=len(last_positions),
+        positions_summary=failed_summary,
+        raw_positions=last_positions,
+        matching_qty=matching_qty,
+        total_qty=total_qty,
+    )
 
 def wait_for_position_unlocked_or_flat(
     client: KabuApiClient,
@@ -3881,6 +3921,7 @@ def mark_entry_not_filled_resume_flat(
     ts: datetime,
     order_id: str,
     pred: PredictionSnapshot,
+    verify_result: Optional[EntryPositionVerifyResult] = None,
 ) -> None:
     cooldown_sec = max(int(config.get("entry_not_filled_cooldown_sec", 30)), 0)
     cooldown_until = ts + timedelta(seconds=cooldown_sec) if cooldown_sec else None
@@ -3916,8 +3957,127 @@ def mark_entry_not_filled_resume_flat(
             "pred_reason_3": pred.reason_3,
             "after_state": after_state,
             "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+            "verified_flat": verify_result.verified_flat if verify_result else True,
+            "verify_reason": verify_result.reason if verify_result else "VERIFIED_FLAT",
+            "positions_count": verify_result.positions_count if verify_result else 0,
+            "positions_summary": verify_result.positions_summary if verify_result else [],
         },
     )
+
+
+def mark_entry_verify_uncertain_keep_recovering(
+    status: MonitorStatus,
+    storage: Storage,
+    side: str,
+    ts: datetime,
+    order_id: str,
+    pred: PredictionSnapshot,
+    verify_result: EntryPositionVerifyResult,
+) -> None:
+    status.open_position = None
+    status.live_state = "RECOVERING"
+    status.recovery_until = ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+    status.pending_entry_side = None
+    status.pending_entry_ts = None
+    status.pending_add = False
+    status.pending_exit = False
+    payload = {
+        "ts": ts.isoformat(),
+        "order_id": order_id,
+        "side": side,
+        "actual_qty": verify_result.matching_qty,
+        "total_qty": verify_result.total_qty,
+        "verified_flat": verify_result.verified_flat,
+        "verify_error": verify_result.verify_error,
+        "verify_reason": verify_result.reason,
+        "positions_count": verify_result.positions_count,
+        "positions_summary": verify_result.positions_summary,
+        "pred_signal": pred.signal,
+        "pred_reason_1": pred.reason_1,
+        "pred_reason_2": pred.reason_2,
+        "pred_reason_3": pred.reason_3,
+        "after_state": {
+            "live_state": status.live_state,
+            "recovery_until": status.recovery_until.isoformat() if status.recovery_until else None,
+            "pending_entry_side": status.pending_entry_side,
+            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+            "pending_add": status.pending_add,
+            "pending_exit": status.pending_exit,
+        },
+    }
+    storage.log_structured(
+        "WARN",
+        "ENTRY_VERIFY_UNCERTAIN_KEEP_RECOVERING",
+        payload,
+        mirror_message=f"side={side} reason={verify_result.reason}; keep RECOVERING",
+    )
+
+
+
+def handle_entry_not_filled_without_internal_position(
+    status: MonitorStatus,
+    storage: Storage,
+    config: dict[str, Any],
+    side: str,
+    ts: datetime,
+    order_id: str,
+    pred: PredictionSnapshot,
+    verify_result: EntryPositionVerifyResult,
+) -> None:
+    base_payload = {
+        "ts": ts.isoformat(),
+        "order_id": order_id,
+        "expected_side": side,
+        "expected_qty": int(config.get("order_qty", 2)),
+        "actual_qty": verify_result.matching_qty,
+        "total_qty": verify_result.total_qty,
+        "verified_flat": verify_result.verified_flat,
+        "verify_error": verify_result.verify_error,
+        "verify_reason": verify_result.reason,
+        "positions_count": verify_result.positions_count,
+        "positions_summary": verify_result.positions_summary,
+        "pred_signal": pred.signal,
+        "pred_reason_1": pred.reason_1,
+        "pred_reason_2": pred.reason_2,
+        "pred_reason_3": pred.reason_3,
+    }
+    if verify_result.verified_flat:
+        mark_entry_not_filled_resume_flat(status, storage, config, side, ts, order_id, pred, verify_result)
+        storage.log_structured(
+            "WARN",
+            "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
+            {
+                **base_payload,
+                "actual_qty": 0,
+                "after_state": {
+                    "live_state": status.live_state,
+                    "recovery_until": status.recovery_until,
+                    "pending_entry_side": status.pending_entry_side,
+                    "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                    "pending_add": status.pending_add,
+                    "pending_exit": status.pending_exit,
+                },
+            },
+        )
+        storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
+    else:
+        mark_entry_verify_uncertain_keep_recovering(status, storage, side, ts, order_id, pred, verify_result)
+        storage.log_structured(
+            "WARN",
+            "ENTRY_NOT_FILLED_VERIFY_UNCERTAIN",
+            {
+                **base_payload,
+                "after_state": {
+                    "live_state": status.live_state,
+                    "recovery_until": status.recovery_until.isoformat() if status.recovery_until else None,
+                    "pending_entry_side": status.pending_entry_side,
+                    "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                    "pending_add": status.pending_add,
+                    "pending_exit": status.pending_exit,
+                },
+            },
+        )
+
 
 
 def manual_position_clear_resume_check(
@@ -4442,7 +4602,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     else:
                                         status.live_state = "ENTRY_SENT"
                                         result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=snap)
-                                        verified_pos = verify_entry_position_after_order(
+                                        verify_result = verify_entry_position_after_order(
                                             client,
                                             config,
                                             storage,
@@ -4454,6 +4614,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             f.ts,
                                             before_positions=rec.positions,
                                         )
+                                        verified_pos = verify_result.position
                                         if not result.ok:
                                             if verified_pos is not None and verified_pos.filled_qty > 0:
                                                 candidate_pos = verified_pos
@@ -4465,31 +4626,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 status.last_entry_ts_by_side[side] = f.ts
                                                 storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
                                             else:
-                                                mark_entry_not_filled_resume_flat(status, storage, config, side, f.ts, result.order_id or "", p)
-                                                storage.log_structured(
-                                                    "WARN",
-                                                    "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
-                                                    {
-                                                        "ts": f.ts.isoformat(),
-                                                        "order_id": result.order_id,
-                                                        "expected_side": side,
-                                                        "expected_qty": int(config.get("order_qty", 2)),
-                                                        "actual_qty": 0,
-                                                        "pred_signal": p.signal,
-                                                        "pred_reason_1": p.reason_1,
-                                                        "pred_reason_2": p.reason_2,
-                                                        "pred_reason_3": p.reason_3,
-                                                        "after_state": {
-                                                            "live_state": status.live_state,
-                                                            "recovery_until": status.recovery_until,
-                                                            "pending_entry_side": status.pending_entry_side,
-                                                            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
-                                                            "pending_add": status.pending_add,
-                                                            "pending_exit": status.pending_exit,
-                                                        },
-                                                    },
+                                                handle_entry_not_filled_without_internal_position(
+                                                    status, storage, config, side, f.ts, result.order_id or "", p, verify_result
                                                 )
-                                                storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
                                             status.last_error_code = result.api_code
                                             status.last_error_message = result.message
                                             storage.log("ERROR", "LIVE_ENTRY_FAIL", result.message)
@@ -4502,31 +4641,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         else:
                                             storage.log("INFO", "LIVE_ENTRY_OK", f"{side} order_id={result.order_id}")
                                             if verified_pos is None or verified_pos.filled_qty <= 0:
-                                                mark_entry_not_filled_resume_flat(status, storage, config, side, f.ts, result.order_id or "", p)
-                                                storage.log_structured(
-                                                    "WARN",
-                                                    "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
-                                                    {
-                                                        "ts": f.ts.isoformat(),
-                                                        "order_id": result.order_id,
-                                                        "expected_side": side,
-                                                        "expected_qty": int(config.get("order_qty", 2)),
-                                                        "actual_qty": 0,
-                                                        "pred_signal": p.signal,
-                                                        "pred_reason_1": p.reason_1,
-                                                        "pred_reason_2": p.reason_2,
-                                                        "pred_reason_3": p.reason_3,
-                                                        "after_state": {
-                                                            "live_state": status.live_state,
-                                                            "recovery_until": status.recovery_until,
-                                                            "pending_entry_side": status.pending_entry_side,
-                                                            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
-                                                            "pending_add": status.pending_add,
-                                                            "pending_exit": status.pending_exit,
-                                                        },
-                                                    },
+                                                handle_entry_not_filled_without_internal_position(
+                                                    status, storage, config, side, f.ts, result.order_id or "", p, verify_result
                                                 )
-                                                storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
                                             else:
                                                 candidate_pos = verified_pos
                                                 storage.insert_execution_fill_price(
