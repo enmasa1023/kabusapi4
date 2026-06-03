@@ -566,6 +566,7 @@ class MonitorStatus:
     failed_close_signature: str = ""
     failed_close_signature_ts: Optional[datetime] = None
     last_manual_position_check_ts: Optional[datetime] = None
+    last_recovery_flat_check_ts: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         if self.last_entry_ts_by_side is None:
@@ -3811,6 +3812,53 @@ def _split_order_ids(raw: Optional[str]) -> list[str]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
 
 
+def mark_entry_not_filled_resume_flat(
+    status: MonitorStatus,
+    storage: Storage,
+    config: dict[str, Any],
+    side: str,
+    ts: datetime,
+    order_id: str,
+    pred: PredictionSnapshot,
+) -> None:
+    cooldown_sec = max(int(config.get("entry_not_filled_cooldown_sec", 30)), 0)
+    cooldown_until = ts + timedelta(seconds=cooldown_sec) if cooldown_sec else None
+    status.open_position = None
+    status.live_state = "FLAT"
+    status.recovery_until = None
+    status.pending_entry_side = None
+    status.pending_entry_ts = None
+    status.pending_add = False
+    status.pending_exit = False
+    if cooldown_until is not None:
+        status.reentry_block_until_by_side[side] = cooldown_until
+    after_state = {
+        "live_state": status.live_state,
+        "recovery_until": status.recovery_until,
+        "pending_entry_side": status.pending_entry_side,
+        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+        "pending_add": status.pending_add,
+        "pending_exit": status.pending_exit,
+    }
+    storage.log_structured(
+        "WARN",
+        "ENTRY_NOT_FILLED_RESUME_FLAT",
+        {
+            "ts": ts.isoformat(),
+            "order_id": order_id,
+            "side": side,
+            "expected_qty": int(config.get("order_qty", 2)),
+            "actual_qty": 0,
+            "pred_signal": pred.signal,
+            "pred_reason_1": pred.reason_1,
+            "pred_reason_2": pred.reason_2,
+            "pred_reason_3": pred.reason_3,
+            "after_state": after_state,
+            "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+        },
+    )
+
+
 def manual_position_clear_resume_check(
     client: KabuApiClient,
     config: dict[str, Any],
@@ -3857,6 +3905,59 @@ def manual_position_clear_resume_check(
         storage.log_structured(
             "WARN",
             "MANUAL_POSITION_CLEAR_CHECK_ERROR",
+            {"ts": ts.isoformat(), "live_state": status.live_state, **api_error_payload(e)},
+            mirror_message=str(e),
+        )
+
+
+def recovery_flat_resume_check(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    ts: datetime,
+) -> None:
+    if not config.get("live_mode"):
+        return
+    if status.live_state != "RECOVERING" or status.open_position is not None:
+        return
+    if status.recovery_until is not None and ts < status.recovery_until:
+        return
+    interval_sec = max(float(config.get("recovery_flat_check_interval_sec", 5.0)), 1.0)
+    if status.last_recovery_flat_check_ts is not None:
+        if (ts - status.last_recovery_flat_check_ts).total_seconds() < interval_sec:
+            return
+    status.last_recovery_flat_check_ts = ts
+    try:
+        positions = fetch_positions(client, config, storage, reason="RECOVERY_FLAT_RESUME_CHECK")
+        total_qty, matching_qty = summarize_positions(positions)
+        payload = {
+            "ts": ts.isoformat(),
+            "total_qty": total_qty,
+            "matching_qty": matching_qty,
+            "positions_summary": positions_summary_for_log(positions),
+            "raw_positions_json": positions,
+            "live_state": status.live_state,
+        }
+        if total_qty <= 0:
+            status.live_state = "FLAT"
+            status.recovery_until = None
+            status.pending_entry_side = None
+            status.pending_entry_ts = None
+            status.pending_add = False
+            status.pending_exit = False
+            storage.log_structured(
+                "INFO",
+                "RECOVERY_FLAT_CONFIRMED_RESUME_AUTO_TRADE",
+                {**payload, "after_state": {"live_state": status.live_state, "recovery_until": status.recovery_until}},
+                mirror_message="recovery state cleared after confirming flat positions",
+            )
+        else:
+            storage.log_structured("WARN", "RECOVERY_FLAT_POSITION_EXISTS", payload)
+    except Exception as e:
+        storage.log_structured(
+            "WARN",
+            "RECOVERY_FLAT_CHECK_ERROR",
             {"ts": ts.isoformat(), "live_state": status.live_state, **api_error_payload(e)},
             mirror_message=str(e),
         )
@@ -4078,6 +4179,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 continue
 
             manual_position_clear_resume_check(client, config, storage, status, now_)
+            recovery_flat_resume_check(client, config, storage, status, now_)
 
             bar1_new = rb1.update(snap)
             if bar1_new:
@@ -4302,12 +4404,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 status.last_entry_ts_by_side[side] = f.ts
                                                 storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
                                             else:
-                                                status.open_position = None
-                                                status.live_state = "RECOVERING"
-                                                status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                                status.pending_entry_side = None
-                                                status.pending_entry_ts = None
-                                                status.pending_add = False
+                                                mark_entry_not_filled_resume_flat(status, storage, config, side, f.ts, result.order_id or "", p)
                                                 storage.log_structured(
                                                     "WARN",
                                                     "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
@@ -4321,9 +4418,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                         "pred_reason_1": p.reason_1,
                                                         "pred_reason_2": p.reason_2,
                                                         "pred_reason_3": p.reason_3,
-                                                        "live_state": status.live_state,
-                                                        "pending_entry_side": status.pending_entry_side,
-                                                        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                        "after_state": {
+                                                            "live_state": status.live_state,
+                                                            "recovery_until": status.recovery_until,
+                                                            "pending_entry_side": status.pending_entry_side,
+                                                            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                            "pending_add": status.pending_add,
+                                                            "pending_exit": status.pending_exit,
+                                                        },
                                                     },
                                                 )
                                                 storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
@@ -4339,12 +4441,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         else:
                                             storage.log("INFO", "LIVE_ENTRY_OK", f"{side} order_id={result.order_id}")
                                             if verified_pos is None or verified_pos.filled_qty <= 0:
-                                                status.open_position = None
-                                                status.live_state = "RECOVERING"
-                                                status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                                status.pending_entry_side = None
-                                                status.pending_entry_ts = None
-                                                status.pending_add = False
+                                                mark_entry_not_filled_resume_flat(status, storage, config, side, f.ts, result.order_id or "", p)
                                                 storage.log_structured(
                                                     "WARN",
                                                     "ENTRY_NOT_FILLED_NO_INTERNAL_POSITION",
@@ -4358,9 +4455,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                         "pred_reason_1": p.reason_1,
                                                         "pred_reason_2": p.reason_2,
                                                         "pred_reason_3": p.reason_3,
-                                                        "live_state": status.live_state,
-                                                        "pending_entry_side": status.pending_entry_side,
-                                                        "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                        "after_state": {
+                                                            "live_state": status.live_state,
+                                                            "recovery_until": status.recovery_until,
+                                                            "pending_entry_side": status.pending_entry_side,
+                                                            "pending_entry_ts": status.pending_entry_ts.isoformat() if status.pending_entry_ts else None,
+                                                            "pending_add": status.pending_add,
+                                                            "pending_exit": status.pending_exit,
+                                                        },
                                                     },
                                                 )
                                                 storage.log("WARN", "ENTRY_NOT_FILLED", f"side={side} filled_qty=0")
