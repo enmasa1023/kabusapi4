@@ -490,6 +490,15 @@ class PositionState:
     rsi10_add_done: bool = False
     managed_execution_ids: list[str] = field(default_factory=list)
     managed_close_positions: list[dict[str, Any]] = field(default_factory=list)
+    trailing_active: bool = False
+    trailing_trigger_ticks: int = 10
+    trailing_floor_ticks: int = 5
+    trailing_width_ticks: int = 20
+    trailing_high: Optional[float] = None
+    trailing_low: Optional[float] = None
+    trailing_stop_price: Optional[float] = None
+    ma5_breach_count: int = 0
+    trailing_started_at: Optional[datetime] = None
 
 
 @dataclass
@@ -654,6 +663,15 @@ def position_state_payload(pos: Optional[PositionState]) -> dict[str, Any]:
         "take_profit_order_id": pos.take_profit_order_id,
         "managed_execution_ids": list(pos.managed_execution_ids or []),
         "managed_close_positions": list(pos.managed_close_positions or []),
+        "trailing_active": pos.trailing_active,
+        "trailing_trigger_ticks": pos.trailing_trigger_ticks,
+        "trailing_floor_ticks": pos.trailing_floor_ticks,
+        "trailing_width_ticks": pos.trailing_width_ticks,
+        "trailing_high": pos.trailing_high,
+        "trailing_low": pos.trailing_low,
+        "trailing_stop_price": pos.trailing_stop_price,
+        "ma5_breach_count": pos.ma5_breach_count,
+        "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
     }
 
 
@@ -2004,77 +2022,116 @@ def create_position(
     )
 
 
-def should_exit(pos: PositionState, f: FeatureSnapshot, pred: PredictionSnapshot) -> tuple[bool, str, float]:
-    elapsed = (f.ts - pos.entry_ts).total_seconds()
-    if pos.strategy == "RSI9":
-        rsi = None
-        if pred.reason_2.startswith("rsi9="):
-            try:
-                rsi = float(pred.reason_2.split("=", 1)[1])
-            except Exception:
-                rsi = None
-        if rsi is not None:
-            if pos.rsi_special_entry:
-                return False, "HOLD", 0.0
-            if pos.side == "LONG":
-                # RSI9 LONG exits are managed by the staged +10tick -> +5tick
-                # special take-profit limit flow, not by RSI50 threshold exits.
-                return False, "HOLD", 0.0
-            else:
-                if rsi <= RSI9_SHORT_TP:
-                    return True, "TAKE_PROFIT", 0.0
-        # RSI9 is TP-only by design: disable all generic market-stop/time-stop exits.
-        return False, "HOLD", 0.0
+def current_pnl_ticks(pos: PositionState, current_price: float) -> float:
+    pnl_ticks = price_to_ticks(current_price - pos.entry_price, pos.entry_price)
+    return -pnl_ticks if pos.side == "SHORT" else pnl_ticks
 
-    pnl_ticks = price_to_ticks(f.price - pos.entry_price, pos.entry_price)
-    if pos.side == "SHORT":
-        pnl_ticks = -pnl_ticks
 
+def _trailing_payload(pos: PositionState, f: FeatureSnapshot, pnl_ticks: float) -> dict[str, Any]:
+    return {
+        "ts": f.ts.isoformat(),
+        "side": pos.side,
+        "strategy": pos.strategy,
+        "entry_price": pos.entry_price,
+        "current_price": f.price,
+        "pnl_ticks": pnl_ticks,
+        "trailing_trigger_ticks": pos.trailing_trigger_ticks,
+        "trailing_floor_ticks": pos.trailing_floor_ticks,
+        "trailing_width_ticks": pos.trailing_width_ticks,
+        "trailing_high": pos.trailing_high,
+        "trailing_low": pos.trailing_low,
+        "trailing_stop_price": pos.trailing_stop_price,
+        "ma5_breach_count": pos.ma5_breach_count,
+        "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
+    }
+
+
+def update_trailing_exit(
+    pos: PositionState,
+    f: FeatureSnapshot,
+    bar1_new: Optional[Bar] = None,
+    storage: Optional[Storage] = None,
+) -> tuple[bool, str, float]:
+    pnl_ticks = current_pnl_ticks(pos, f.price)
     if pnl_ticks <= -pos.stop_ticks:
         return True, "STOP_LOSS", pnl_ticks
-    if pnl_ticks >= pos.take_ticks:
-        return True, "TAKE_PROFIT", pnl_ticks
 
-    if elapsed < pos.min_hold_sec:
-        if (
-            pos.side == "LONG"
-            and pnl_ticks <= -pos.stop_ticks
-            and f.price < f.vwap
-            and f.obi_l1 < -0.18
-            and pred.p_down_1m > 0.67
-        ):
-            return True, "EDGE_BREAK_HARD", pnl_ticks
-        if (
-            pos.side == "SHORT"
-            and pnl_ticks <= -pos.stop_ticks
-            and f.price > f.vwap
-            and f.obi_l1 > 0.18
-            and pred.p_up_1m > 0.67
-        ):
-            return True, "EDGE_BREAK_HARD", pnl_ticks
-        return False, "MIN_HOLD", pnl_ticks
+    tick_size = tick_size_for_1570(pos.entry_price)
+    if not pos.trailing_active:
+        if pnl_ticks < pos.trailing_trigger_ticks:
+            return False, "HOLD", pnl_ticks
+        pos.trailing_active = True
+        pos.trailing_started_at = f.ts
+        pos.ma5_breach_count = 0
+        if pos.side == "LONG":
+            pos.trailing_high = f.price
+            floor_price = pos.entry_price + pos.trailing_floor_ticks * tick_size
+            pos.trailing_stop_price = max(floor_price, pos.trailing_high - pos.trailing_width_ticks * tick_size)
+        else:
+            pos.trailing_low = f.price
+            floor_price = pos.entry_price - pos.trailing_floor_ticks * tick_size
+            pos.trailing_stop_price = min(floor_price, pos.trailing_low + pos.trailing_width_ticks * tick_size)
+        if storage is not None:
+            storage.log_structured("INFO", "TRAILING_STARTED", _trailing_payload(pos, f, pnl_ticks))
 
+    prev_high = pos.trailing_high
+    prev_low = pos.trailing_low
+    prev_stop = pos.trailing_stop_price
     if pos.side == "LONG":
-        if (
-            pnl_ticks >= 1
-            and pred.p_up_1m < PROB_EXIT_EDGE - 0.02
-            and f.price < f.vwap
-            and f.obi_l1 < -0.03
-        ):
-            return True, "EDGE_DECAY", pnl_ticks
+        pos.trailing_high = max(pos.trailing_high if pos.trailing_high is not None else f.price, f.price)
+        floor_price = pos.entry_price + pos.trailing_floor_ticks * tick_size
+        pos.trailing_stop_price = max(floor_price, pos.trailing_high - pos.trailing_width_ticks * tick_size)
     else:
-        if (
-            pnl_ticks >= 1
-            and pred.p_down_1m < PROB_EXIT_EDGE - 0.02
-            and f.price > f.vwap
-            and f.obi_l1 > 0.03
-        ):
-            return True, "EDGE_DECAY", pnl_ticks
+        pos.trailing_low = min(pos.trailing_low if pos.trailing_low is not None else f.price, f.price)
+        floor_price = pos.entry_price - pos.trailing_floor_ticks * tick_size
+        pos.trailing_stop_price = min(floor_price, pos.trailing_low + pos.trailing_width_ticks * tick_size)
 
-    if elapsed >= pos.max_hold_sec:
-        return True, "TIME_STOP", pnl_ticks
+    if bar1_new is not None and bar1_new.ma5 is not None:
+        if pos.side == "LONG":
+            breached = bar1_new.close < bar1_new.ma5
+        else:
+            breached = bar1_new.close > bar1_new.ma5
+        pos.ma5_breach_count = pos.ma5_breach_count + 1 if breached else 0
+
+    if storage is not None and (prev_high != pos.trailing_high or prev_low != pos.trailing_low or prev_stop != pos.trailing_stop_price):
+        storage.log_structured("INFO", "TRAILING_UPDATED", _trailing_payload(pos, f, pnl_ticks))
+
+    stop_hit = False
+    stop_reason = ""
+    if pos.trailing_stop_price is not None:
+        if pos.side == "LONG" and f.price <= pos.trailing_stop_price:
+            stop_hit = True
+            stop_reason = "TRAILING_STOP_LONG"
+        elif pos.side == "SHORT" and f.price >= pos.trailing_stop_price:
+            stop_hit = True
+            stop_reason = "TRAILING_STOP_SHORT"
+    if stop_hit:
+        if storage is not None:
+            storage.log_structured("INFO", "TRAILING_EXIT_SIGNAL", {**_trailing_payload(pos, f, pnl_ticks), "reason": stop_reason, "exit_price": f.price})
+        return True, "TRAILING_STOP", pnl_ticks
+
+    if pos.ma5_breach_count >= 2:
+        reason = "MA5_2BREACH_LONG" if pos.side == "LONG" else "MA5_2BREACH_SHORT"
+        if storage is not None:
+            storage.log_structured("INFO", "TRAILING_EXIT_SIGNAL", {**_trailing_payload(pos, f, pnl_ticks), "reason": reason, "exit_price": f.price})
+        return True, "MA5_2BREACH_TRAILING", pnl_ticks
 
     return False, "HOLD", pnl_ticks
+
+
+def should_exit(
+    pos: PositionState,
+    f: FeatureSnapshot,
+    pred: PredictionSnapshot,
+    storage: Optional[Storage] = None,
+    bar1_new: Optional[Bar] = None,
+) -> tuple[bool, str, float]:
+    # Profit exits for STRAT_1M/STRAT_3M/RSI9 (including RSI17 special entries)
+    # are managed by +10tick activation, +5tick floor, and 20tick trailing.
+    # This intentionally replaces fixed +10tick / +5tick staged take-profit orders
+    # while preserving the existing stop_ticks stop-loss and external force-close flow.
+    return update_trailing_exit(pos, f, bar1_new=bar1_new, storage=storage)
+
 
 
 def _recent_trades(
@@ -2198,7 +2255,6 @@ def _read_rows_if_exists(con: sqlite3.Connection, table: str, order_by: str) -> 
     if not exists:
         return []
     return _read_rows(con, f"SELECT * FROM {table} ORDER BY {order_by}")
-
 
 def _value_counts(rows: list[dict[str, Any]], column: str) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -2719,6 +2775,15 @@ def create_position_from_actual_position(
         rsi10_add_done=template_pos.rsi10_add_done,
         managed_execution_ids=[execution_id] if execution_id else [],
         managed_close_positions=managed_close_positions,
+        trailing_active=template_pos.trailing_active,
+        trailing_trigger_ticks=template_pos.trailing_trigger_ticks,
+        trailing_floor_ticks=template_pos.trailing_floor_ticks,
+        trailing_width_ticks=template_pos.trailing_width_ticks,
+        trailing_high=template_pos.trailing_high,
+        trailing_low=template_pos.trailing_low,
+        trailing_stop_price=template_pos.trailing_stop_price,
+        ma5_breach_count=template_pos.ma5_breach_count,
+        trailing_started_at=template_pos.trailing_started_at,
     )
 
 
@@ -3144,54 +3209,22 @@ def place_take_profit_limit_order(
     pred: PredictionSnapshot,
     status: MonitorStatus,
 ) -> LiveOrderResult:
+    _ = client
     context = order_context(config, pos.side, pos, pred, status)
-    positions = fetch_positions(client, config, storage, reason="TAKE_PROFIT_BUILD_CLOSE_POSITIONS")
-    if not pos.managed_execution_ids and not bool(config.get("allow_unmanaged_force_close", False)):
-        storage.log_structured("ERROR", "MANAGED_POSITION_IDS_MISSING", {**context, "positions_summary": positions_summary_for_log(positions), "internal_position": position_state_payload(pos)})
-        return LiveOrderResult(False, "MANAGED_POSITION_IDS_MISSING", recoverable=True)
-    close_position_groups = close_position_groups_for_side(
-        positions,
-        pos.side,
-        margin_trade_type=pos.margin_trade_type,
-        available_only=True,
-        default_exchange=exit_exchange(config),
-        managed_execution_ids=pos.managed_execution_ids,
-        storage=storage,
+    storage.log_structured(
+        "INFO",
+        "TAKE_PROFIT_LIMIT_DISABLED_TRAILING_EXIT",
+        {
+            **context,
+            "reason": "trailing_exit_replaces_fixed_take_profit",
+            "trailing_trigger_ticks": pos.trailing_trigger_ticks,
+            "trailing_floor_ticks": pos.trailing_floor_ticks,
+            "trailing_width_ticks": pos.trailing_width_ticks,
+            "internal_position": position_state_payload(pos),
+        },
     )
-    if not close_position_groups:
-        managed_positions = managed_positions_for(pos, positions) if pos.managed_execution_ids else positions
-        leaves_qty, hold_qty, available_qty = position_quantities(managed_positions)
-        storage.log_structured("WARN", "TAKE_PROFIT_NO_AVAILABLE_POSITION", {**context, "leaves_qty": leaves_qty, "hold_qty": hold_qty, "available_qty": available_qty, "positions_summary": positions_summary_for_log(positions), "managed_execution_ids": list(pos.managed_execution_ids or [])})
-        return LiveOrderResult(False, "TAKE_PROFIT_NO_AVAILABLE_POSITION", recoverable=True)
-    limit_price = take_profit_limit_price(pos)
-    order_ids: list[str] = []
-    for position_exchange, close_positions, total_qty in close_position_groups:
-        if total_qty <= 0 or not close_positions:
-            continue
-        payload = build_exit_order_payload(
-            config,
-            pos.side,
-            close_positions=close_positions,
-            qty=total_qty,
-            front_order_type=20,
-            price=limit_price,
-            margin_trade_type=pos.margin_trade_type,
-            exchange=position_exchange,
-        )
-        storage.log_structured("INFO", "TAKE_PROFIT_ORDER_SENT", {**context, "position_exchange": position_exchange, "request_json": payload, "limit_price": limit_price})
-        try:
-            res = client.send_order(payload)
-        except Exception as e:
-            ep = api_error_payload(e)
-            return LiveOrderResult(False, f"TAKE_PROFIT_SEND_ERROR Code={ep.get('api_code')} Message={ep.get('api_message')}: {ep.get('raw_error')}", api_code=str(ep.get('api_code') or ''), api_message=str(ep.get('api_message') or ''), recoverable=True)
-        order_id = str(res.get("OrderId") or res.get("OrderID") or "")
-        if order_id:
-            order_ids.append(order_id)
-    if not order_ids:
-        return LiveOrderResult(False, "TAKE_PROFIT_ORDER_ID_MISSING", recoverable=True)
-    pos.take_profit_order_ids = order_ids
-    pos.take_profit_order_id = order_ids[0]
-    return LiveOrderResult(True, ",".join(order_ids), order_id=",".join(order_ids))
+    return LiveOrderResult(False, "TAKE_PROFIT_LIMIT_DISABLED_TRAILING_EXIT", recoverable=False)
+
 
 def verify_position_after_entry_cancel(
     client: KabuApiClient,
@@ -4484,30 +4517,23 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                     storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
                                                 else:
                                                     storage.log("WARN", "PARTIAL_ENTRY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty} remaining_qty={candidate_pos.remaining_qty}")
-                                                take_profit_cfg = config.get("take_profit_execution", {})
-                                                if candidate_pos.strategy == "RSI9":
-                                                    event_type = "RSI9_SPECIAL_TP_MANAGED_SEPARATELY" if candidate_pos.rsi_special_entry else "RSI9_MARKET_EXIT_MANAGED_BY_RSI_THRESHOLD"
-                                                    storage.log_structured(
-                                                        "INFO",
-                                                        event_type,
-                                                        {
-                                                            "side": candidate_pos.side,
-                                                            "strategy": candidate_pos.strategy,
-                                                            "rsi_special_entry": candidate_pos.rsi_special_entry,
-                                                            "entry_rule": p.reason_3,
-                                                            "signal_reason": p.reason_1,
-                                                            "entry_price": candidate_pos.entry_price,
-                                                            "order_id": result.order_id,
-                                                        },
-                                                        mirror_message=f"side={candidate_pos.side} strategy=RSI9 rsi_special_entry={candidate_pos.rsi_special_entry}",
-                                                    )
-                                                elif not isinstance(take_profit_cfg, dict) or bool(take_profit_cfg.get("enabled", True)):
-                                                    tp_result = place_take_profit_limit_order(client, config, storage, candidate_pos, p, status)
-                                                    if tp_result.ok:
-                                                        candidate_pos.take_profit_order_id = tp_result.order_id
-                                                        storage.log("INFO", "TAKE_PROFIT_LIMIT_OK", f"{side} order_id={tp_result.order_id} price={take_profit_limit_price(candidate_pos):.1f}")
-                                                    else:
-                                                        storage.log("WARN", "TAKE_PROFIT_LIMIT_FAIL", tp_result.message)
+                                                storage.log_structured(
+                                                    "INFO",
+                                                    "TRAILING_EXIT_MANAGED_NO_TP_LIMIT",
+                                                    {
+                                                        "side": candidate_pos.side,
+                                                        "strategy": candidate_pos.strategy,
+                                                        "rsi_special_entry": candidate_pos.rsi_special_entry,
+                                                        "entry_rule": p.reason_3,
+                                                        "signal_reason": p.reason_1,
+                                                        "entry_price": candidate_pos.entry_price,
+                                                        "order_id": result.order_id,
+                                                        "trailing_trigger_ticks": candidate_pos.trailing_trigger_ticks,
+                                                        "trailing_floor_ticks": candidate_pos.trailing_floor_ticks,
+                                                        "trailing_width_ticks": candidate_pos.trailing_width_ticks,
+                                                    },
+                                                    mirror_message=f"side={candidate_pos.side} strategy={candidate_pos.strategy} trailing_exit_managed=True",
+                                                )
                                                 status.last_entry_reject_key = ""
                                                 status.last_entry_ts_by_side[side] = f.ts
                                                 status.pending_entry_side = None
@@ -4548,81 +4574,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         mae_ticks = min(mae_ticks, cur_pnl_ticks)
                         live_tp_already_filled = False
 
-                        if pos.strategy == "RSI9" and pos.rsi_special_entry and config["live_mode"] and pos.entry_fill_price is not None:
-                            elapsed_special = (f.ts - (pos.rsi_special_tp_order_ts or pos.entry_ts)).total_seconds() if pos.rsi_special_tp_order_ts else 0
-                            target_ticks = 10 if pos.rsi_special_tp_stage == 0 else 5
-                            if pos.take_profit_order_id is None:
-                                pos.take_ticks = target_ticks
-                                tp_res = place_take_profit_limit_order(client, config, storage, pos, p, status)
-                                if tp_res.ok:
-                                    pos.take_profit_order_id = tp_res.order_id
-                                    pos.rsi_special_tp_order_ts = f.ts
-                                else:
-                                    status.live_state = "RECOVERING"
-                                    status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                    storage.log_structured(
-                                        "ERROR",
-                                        "RSI9_SPECIAL_TP_ORDER_FAILED",
-                                        {
-                                            "ts": f.ts.isoformat(),
-                                            "side": pos.side,
-                                            "strategy": pos.strategy,
-                                            "rsi_special_entry": pos.rsi_special_entry,
-                                            "entry_rule": p.reason_3,
-                                            "order_result": asdict(tp_res),
-                                            "internal_position": position_state_payload(pos),
-                                        },
-                                        mirror_message=tp_res.message,
-                                    )
-                                    continue
-                            elif pos.rsi_special_tp_stage == 0 and elapsed_special >= 300:
-                                context = order_context(config, pos.side, pos, p, status)
-                                cancel_ok, filled = cancel_pending_take_profit_order(client, config, storage, pos, context)
-                                if filled:
-                                    live_tp_already_filled = True
-                                    ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
-                                elif cancel_ok:
-                                    pos.rsi_special_tp_stage = 1
-                                    pos.take_ticks = 5
-                                    tp_res2 = place_take_profit_limit_order(client, config, storage, pos, p, status)
-                                    if tp_res2.ok:
-                                        pos.take_profit_order_id = tp_res2.order_id
-                                        pos.rsi_special_tp_order_ts = f.ts
-                                    else:
-                                        status.live_state = "RECOVERING"
-                                        status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                        storage.log_structured(
-                                            "ERROR",
-                                            "RSI9_SPECIAL_TP_REPLACE_FAILED",
-                                            {
-                                                "ts": f.ts.isoformat(),
-                                                "side": pos.side,
-                                                "strategy": pos.strategy,
-                                                "rsi_special_entry": pos.rsi_special_entry,
-                                                "entry_rule": p.reason_3,
-                                                "order_result": asdict(tp_res2),
-                                                "internal_position": position_state_payload(pos),
-                                            },
-                                            mirror_message=tp_res2.message,
-                                        )
-                                        continue
-                                else:
-                                    status.live_state = "RECOVERING"
-                                    status.recovery_until = f.ts + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
-                                    storage.log_structured(
-                                        "ERROR",
-                                        "RSI9_SPECIAL_TP_CANCEL_FAILED",
-                                        {
-                                            "ts": f.ts.isoformat(),
-                                            "side": pos.side,
-                                            "strategy": pos.strategy,
-                                            "rsi_special_entry": pos.rsi_special_entry,
-                                            "entry_rule": p.reason_3,
-                                            "internal_position": position_state_payload(pos),
-                                        },
-                                        mirror_message=f"cancel failed order_id={pos.take_profit_order_id}",
-                                    )
-                                    continue
+                        # RSI9 special entries now use the same trailing exit manager as paper mode.
+                        # Do not place +10tick/+5tick staged TP limit orders; any existing TP
+                        # order is only observed/cancelled by the generic exit path below.
 
                         if live_tp_already_filled:
                             ex = True
@@ -4635,7 +4589,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
                             live_tp_already_filled = True
                         else:
-                            ex, ex_reason, pnl_ticks = should_exit(pos, f, p)
+                            ex, ex_reason, pnl_ticks = should_exit(pos, f, p, storage=storage, bar1_new=bar1_new)
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
                             if pos.strategy == "RSI9":
