@@ -89,6 +89,7 @@ MAX_HOLD_SEC_1M = 300
 MAX_HOLD_SEC_3M = 300
 STOP_TICKS_1M = 10
 STOP_TICKS_3M = 10
+HARD_STOP_TICKS = 15
 TAKE_TICKS_1M = 10
 TAKE_TICKS_3M = 10
 PROB_UPPER_1M = 0.58
@@ -499,6 +500,7 @@ class PositionState:
     trailing_stop_price: Optional[float] = None
     ma5_breach_count: int = 0
     trailing_started_at: Optional[datetime] = None
+    hard_stop_ticks: int = HARD_STOP_TICKS
 
 
 @dataclass
@@ -672,6 +674,7 @@ def position_state_payload(pos: Optional[PositionState]) -> dict[str, Any]:
         "trailing_stop_price": pos.trailing_stop_price,
         "ma5_breach_count": pos.ma5_breach_count,
         "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
+        "hard_stop_ticks": pos.hard_stop_ticks,
     }
 
 
@@ -2019,6 +2022,7 @@ def create_position(
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
+        hard_stop_ticks=int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
     )
 
 
@@ -2053,8 +2057,31 @@ def update_trailing_exit(
     storage: Optional[Storage] = None,
 ) -> tuple[bool, str, float]:
     pnl_ticks = current_pnl_ticks(pos, f.price)
-    if pnl_ticks <= -pos.stop_ticks:
-        return True, "STOP_LOSS", pnl_ticks
+    # HARD_STOP_LOSS is intentionally the first ordinary exit check.  It is
+    # strategy-independent and supersedes legacy stop_ticks values (some of
+    # which are 10 ticks) so positions are not stopped before the explicit
+    # -15tick rule requested for this monitor.
+    if pnl_ticks <= -pos.hard_stop_ticks:
+        if storage is not None:
+            storage.log_structured(
+                "WARN",
+                "HARD_STOP_LOSS_SIGNAL",
+                {
+                    "ts": f.ts.isoformat(),
+                    "side": pos.side,
+                    "strategy": pos.strategy,
+                    "entry_price": pos.entry_price,
+                    "current_price": f.price,
+                    "pnl_ticks": pnl_ticks,
+                    "hard_stop_ticks": pos.hard_stop_ticks,
+                    "trailing_active": pos.trailing_active,
+                    "trailing_high": pos.trailing_high,
+                    "trailing_low": pos.trailing_low,
+                    "trailing_stop_price": pos.trailing_stop_price,
+                    "exit_reason": "HARD_STOP_LOSS",
+                },
+            )
+        return True, "HARD_STOP_LOSS", pnl_ticks
 
     tick_size = tick_size_for_1570(pos.entry_price)
     if not pos.trailing_active:
@@ -2784,6 +2811,7 @@ def create_position_from_actual_position(
         trailing_stop_price=template_pos.trailing_stop_price,
         ma5_breach_count=template_pos.ma5_breach_count,
         trailing_started_at=template_pos.trailing_started_at,
+        hard_stop_ticks=template_pos.hard_stop_ticks,
     )
 
 
