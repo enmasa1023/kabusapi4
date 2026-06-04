@@ -500,6 +500,10 @@ class PositionState:
     trailing_stop_price: Optional[float] = None
     ma5_breach_count: int = 0
     trailing_started_at: Optional[datetime] = None
+    trailing_ma5_bar_bucket: Optional[datetime] = None
+    trailing_ma5_bar_open: Optional[float] = None
+    trailing_ma5_reference: Optional[float] = None
+    trailing_ma5_open_relation: str = ""
     hard_stop_ticks: int = HARD_STOP_TICKS
 
 
@@ -687,6 +691,10 @@ def position_state_payload(pos: Optional[PositionState]) -> dict[str, Any]:
         "trailing_stop_price": pos.trailing_stop_price,
         "ma5_breach_count": pos.ma5_breach_count,
         "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
+        "trailing_ma5_bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
+        "trailing_ma5_bar_open": pos.trailing_ma5_bar_open,
+        "trailing_ma5_reference": pos.trailing_ma5_reference,
+        "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
         "hard_stop_ticks": pos.hard_stop_ticks,
     }
 
@@ -2045,6 +2053,12 @@ def current_pnl_ticks(pos: PositionState, current_price: float) -> float:
 
 
 def _trailing_payload(pos: PositionState, f: FeatureSnapshot, pnl_ticks: float) -> dict[str, Any]:
+    """Common payload for trailing/MA5-exit diagnostics.
+
+    trailing_high/trailing_low/trailing_stop_price are retained only for
+    backwards-compatible position payloads; MA5-based trailing exits do not use
+    those fields for decisions.
+    """
     return {
         "ts": f.ts.isoformat(),
         "side": pos.side,
@@ -2060,7 +2074,79 @@ def _trailing_payload(pos: PositionState, f: FeatureSnapshot, pnl_ticks: float) 
         "trailing_stop_price": pos.trailing_stop_price,
         "ma5_breach_count": pos.ma5_breach_count,
         "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
+        "trailing_ma5_bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
+        "trailing_ma5_bar_open": pos.trailing_ma5_bar_open,
+        "trailing_ma5_reference": pos.trailing_ma5_reference,
+        "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
     }
+
+
+def _ma5_trailing_relation(side: str, bar_open: float, confirmed_ma5: float) -> str:
+    if side == "LONG":
+        return "LONG_ABOVE_MA5" if bar_open > confirmed_ma5 else "LONG_BELOW_OR_EQUAL_MA5"
+    return "SHORT_BELOW_MA5" if bar_open < confirmed_ma5 else "SHORT_ABOVE_OR_EQUAL_MA5"
+
+
+def _set_ma5_trailing_context(
+    pos: PositionState,
+    f: FeatureSnapshot,
+    current_bar_bucket: datetime,
+    current_bar_open: float,
+    confirmed_ma5: float,
+    pnl_ticks: float,
+    storage: Optional[Storage],
+) -> None:
+    relation = _ma5_trailing_relation(pos.side, current_bar_open, confirmed_ma5)
+    pos.trailing_ma5_bar_bucket = current_bar_bucket
+    pos.trailing_ma5_bar_open = current_bar_open
+    pos.trailing_ma5_reference = confirmed_ma5
+    pos.trailing_ma5_open_relation = relation
+    if storage is not None:
+        storage.log_structured(
+            "INFO",
+            "MA5_TRAILING_BAR_CONTEXT",
+            {
+                "ts": f.ts.isoformat(),
+                "side": pos.side,
+                "strategy": pos.strategy,
+                "bar_bucket": current_bar_bucket.isoformat(),
+                "bar_open": current_bar_open,
+                "confirmed_ma5": confirmed_ma5,
+                "relation": relation,
+                "trailing_active": pos.trailing_active,
+                "pnl_ticks": pnl_ticks,
+            },
+        )
+
+
+def _log_ma5_trailing_exit(
+    storage: Optional[Storage],
+    pos: PositionState,
+    f: FeatureSnapshot,
+    pnl_ticks: float,
+    exit_reason: str,
+    confirmed_bar_close: Optional[float] = None,
+) -> None:
+    if storage is None:
+        return
+    storage.log_structured(
+        "INFO",
+        "MA5_TRAILING_EXIT_SIGNAL",
+        {
+            "ts": f.ts.isoformat(),
+            "side": pos.side,
+            "strategy": pos.strategy,
+            "exit_reason": exit_reason,
+            "entry_price": pos.entry_price,
+            "current_price": f.price,
+            "current_bar_open": pos.trailing_ma5_bar_open,
+            "confirmed_bar_close": confirmed_bar_close,
+            "confirmed_ma5": pos.trailing_ma5_reference,
+            "pnl_ticks": pnl_ticks,
+            "bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
+            "relation": pos.trailing_ma5_open_relation,
+        },
+    )
 
 
 def update_trailing_exit(
@@ -2068,6 +2154,9 @@ def update_trailing_exit(
     f: FeatureSnapshot,
     bar1_new: Optional[Bar] = None,
     storage: Optional[Storage] = None,
+    current_bar_bucket: Optional[datetime] = None,
+    current_bar_open: Optional[float] = None,
+    confirmed_bar1: Optional[Bar] = None,
 ) -> tuple[bool, str, float]:
     pnl_ticks = current_pnl_ticks(pos, f.price)
     # HARD_STOP_LOSS is intentionally the first ordinary exit check.  It is
@@ -2096,65 +2185,70 @@ def update_trailing_exit(
             )
         return True, "HARD_STOP_LOSS", pnl_ticks
 
-    tick_size = tick_size_for_1570(pos.entry_price)
     if not pos.trailing_active:
         if pnl_ticks < pos.trailing_trigger_ticks:
             return False, "HOLD", pnl_ticks
         pos.trailing_active = True
         pos.trailing_started_at = f.ts
+        # The old price-trailing fields are intentionally cleared and not used
+        # for exit decisions.  trailing_active now means MA5-based trailing
+        # exit management has started after +10 ticks.
+        pos.trailing_high = None
+        pos.trailing_low = None
+        pos.trailing_stop_price = None
         pos.ma5_breach_count = 0
-        if pos.side == "LONG":
-            pos.trailing_high = f.price
-            floor_price = pos.entry_price + pos.trailing_floor_ticks * tick_size
-            pos.trailing_stop_price = max(floor_price, pos.trailing_high - pos.trailing_width_ticks * tick_size)
-        else:
-            pos.trailing_low = f.price
-            floor_price = pos.entry_price - pos.trailing_floor_ticks * tick_size
-            pos.trailing_stop_price = min(floor_price, pos.trailing_low + pos.trailing_width_ticks * tick_size)
+        pos.trailing_ma5_bar_bucket = None
+        pos.trailing_ma5_bar_open = None
+        pos.trailing_ma5_reference = None
+        pos.trailing_ma5_open_relation = ""
         if storage is not None:
-            storage.log_structured("INFO", "TRAILING_STARTED", _trailing_payload(pos, f, pnl_ticks))
+            storage.log_structured(
+                "INFO",
+                "TRAILING_STARTED",
+                {
+                    **_trailing_payload(pos, f, pnl_ticks),
+                    "exit_mode": "MA5_BASED_TRAILING",
+                },
+            )
 
-    prev_high = pos.trailing_high
-    prev_low = pos.trailing_low
-    prev_stop = pos.trailing_stop_price
-    if pos.side == "LONG":
-        pos.trailing_high = max(pos.trailing_high if pos.trailing_high is not None else f.price, f.price)
-        floor_price = pos.entry_price + pos.trailing_floor_ticks * tick_size
-        pos.trailing_stop_price = max(floor_price, pos.trailing_high - pos.trailing_width_ticks * tick_size)
-    else:
-        pos.trailing_low = min(pos.trailing_low if pos.trailing_low is not None else f.price, f.price)
-        floor_price = pos.entry_price - pos.trailing_floor_ticks * tick_size
-        pos.trailing_stop_price = min(floor_price, pos.trailing_low + pos.trailing_width_ticks * tick_size)
+    # First evaluate close-confirmation for the 1m bucket that just finalized,
+    # using the MA5/reference captured when that bucket started.  This avoids
+    # mixing the newly-started bucket with the closed bucket.
+    if (
+        bar1_new is not None
+        and pos.trailing_ma5_bar_bucket is not None
+        and bar1_new.ts == pos.trailing_ma5_bar_bucket
+        and pos.trailing_ma5_reference is not None
+    ):
+        relation = pos.trailing_ma5_open_relation
+        confirmed_ma5 = pos.trailing_ma5_reference
+        if pos.side == "LONG" and relation == "LONG_BELOW_OR_EQUAL_MA5" and bar1_new.close < confirmed_ma5:
+            _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_CLOSE_BELOW_TRAILING", confirmed_bar_close=bar1_new.close)
+            return True, "MA5_CLOSE_BELOW_TRAILING", pnl_ticks
+        if pos.side == "SHORT" and relation == "SHORT_ABOVE_OR_EQUAL_MA5" and bar1_new.close > confirmed_ma5:
+            _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_CLOSE_ABOVE_TRAILING", confirmed_bar_close=bar1_new.close)
+            return True, "MA5_CLOSE_ABOVE_TRAILING", pnl_ticks
 
-    if bar1_new is not None and bar1_new.ma5 is not None:
-        if pos.side == "LONG":
-            breached = bar1_new.close < bar1_new.ma5
-        else:
-            breached = bar1_new.close > bar1_new.ma5
-        pos.ma5_breach_count = pos.ma5_breach_count + 1 if breached else 0
+    confirmed_ma5 = confirmed_bar1.ma5 if confirmed_bar1 is not None else None
+    if (
+        current_bar_bucket is not None
+        and current_bar_open is not None
+        and confirmed_ma5 is not None
+        and pos.trailing_ma5_bar_bucket != current_bar_bucket
+    ):
+        _set_ma5_trailing_context(pos, f, current_bar_bucket, current_bar_open, confirmed_ma5, pnl_ticks, storage)
 
-    if storage is not None and (prev_high != pos.trailing_high or prev_low != pos.trailing_low or prev_stop != pos.trailing_stop_price):
-        storage.log_structured("INFO", "TRAILING_UPDATED", _trailing_payload(pos, f, pnl_ticks))
+    if pos.trailing_ma5_reference is None or pos.trailing_ma5_bar_open is None:
+        return False, "HOLD", pnl_ticks
 
-    stop_hit = False
-    stop_reason = ""
-    if pos.trailing_stop_price is not None:
-        if pos.side == "LONG" and f.price <= pos.trailing_stop_price:
-            stop_hit = True
-            stop_reason = "TRAILING_STOP_LONG"
-        elif pos.side == "SHORT" and f.price >= pos.trailing_stop_price:
-            stop_hit = True
-            stop_reason = "TRAILING_STOP_SHORT"
-    if stop_hit:
-        if storage is not None:
-            storage.log_structured("INFO", "TRAILING_EXIT_SIGNAL", {**_trailing_payload(pos, f, pnl_ticks), "reason": stop_reason, "exit_price": f.price})
-        return True, "TRAILING_STOP", pnl_ticks
-
-    if pos.ma5_breach_count >= 2:
-        reason = "MA5_2BREACH_LONG" if pos.side == "LONG" else "MA5_2BREACH_SHORT"
-        if storage is not None:
-            storage.log_structured("INFO", "TRAILING_EXIT_SIGNAL", {**_trailing_payload(pos, f, pnl_ticks), "reason": reason, "exit_price": f.price})
-        return True, "MA5_2BREACH_TRAILING", pnl_ticks
+    relation = pos.trailing_ma5_open_relation
+    confirmed_ma5 = pos.trailing_ma5_reference
+    if pos.side == "LONG" and relation == "LONG_ABOVE_MA5" and f.price <= confirmed_ma5:
+        _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_INTRABAR_CROSS_TRAILING")
+        return True, "MA5_INTRABAR_CROSS_TRAILING", pnl_ticks
+    if pos.side == "SHORT" and relation == "SHORT_BELOW_MA5" and f.price >= confirmed_ma5:
+        _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_INTRABAR_CROSS_TRAILING")
+        return True, "MA5_INTRABAR_CROSS_TRAILING", pnl_ticks
 
     return False, "HOLD", pnl_ticks
 
@@ -2165,12 +2259,24 @@ def should_exit(
     pred: PredictionSnapshot,
     storage: Optional[Storage] = None,
     bar1_new: Optional[Bar] = None,
+    current_bar_bucket: Optional[datetime] = None,
+    current_bar_open: Optional[float] = None,
+    confirmed_bar1: Optional[Bar] = None,
 ) -> tuple[bool, str, float]:
     # Profit exits for STRAT_1M/STRAT_3M/RSI9 (including RSI17 special entries)
-    # are managed by +10tick activation, +5tick floor, and 20tick trailing.
+    # are managed by +10tick activation followed by confirmed-1m-MA5 exit rules.
     # This intentionally replaces fixed +10tick / +5tick staged take-profit orders
-    # while preserving the existing stop_ticks stop-loss and external force-close flow.
-    return update_trailing_exit(pos, f, bar1_new=bar1_new, storage=storage)
+    # and the former highest/lowest-price 20tick trailing stop while preserving
+    # HARD_STOP_LOSS and the external force-close flow.
+    return update_trailing_exit(
+        pos,
+        f,
+        bar1_new=bar1_new,
+        storage=storage,
+        current_bar_bucket=current_bar_bucket,
+        current_bar_open=current_bar_open,
+        confirmed_bar1=confirmed_bar1,
+    )
 
 
 
@@ -2824,6 +2930,10 @@ def create_position_from_actual_position(
         trailing_stop_price=template_pos.trailing_stop_price,
         ma5_breach_count=template_pos.ma5_breach_count,
         trailing_started_at=template_pos.trailing_started_at,
+        trailing_ma5_bar_bucket=template_pos.trailing_ma5_bar_bucket,
+        trailing_ma5_bar_open=template_pos.trailing_ma5_bar_open,
+        trailing_ma5_reference=template_pos.trailing_ma5_reference,
+        trailing_ma5_open_relation=template_pos.trailing_ma5_open_relation,
         hard_stop_ticks=template_pos.hard_stop_ticks,
     )
 
@@ -4405,6 +4515,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             bar1_new = rb1.update(snap)
             if bar1_new:
                 storage.insert_bar("bars_1m", bar1_new)
+            current_bar_bucket_1m = rb1.current_bucket
+            current_bar_open_1m = rb1.rows[0].price if rb1.rows and rb1.rows[0].price is not None else None
+            confirmed_bar1 = rb1.latest()
             bar3_new = rb3.update(snap)
             if bar3_new:
                 storage.insert_bar("bars_3m", bar3_new)
@@ -4734,7 +4847,16 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             ex, ex_reason, pnl_ticks = True, "TAKE_PROFIT_LIMIT_FILLED", take_profit_filled_ticks(pos)
                             live_tp_already_filled = True
                         else:
-                            ex, ex_reason, pnl_ticks = should_exit(pos, f, p, storage=storage, bar1_new=bar1_new)
+                            ex, ex_reason, pnl_ticks = should_exit(
+                                pos,
+                                f,
+                                p,
+                                storage=storage,
+                                bar1_new=bar1_new,
+                                current_bar_bucket=current_bar_bucket_1m,
+                                current_bar_open=current_bar_open_1m,
+                                confirmed_bar1=confirmed_bar1,
+                            )
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
                             if pos.strategy == "RSI9":
