@@ -5468,6 +5468,22 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 if feature_candidates:
                     if feature_enabled and p.signal == "NO_ACTION":
                         p = feature_candidates[0]
+                        storage.log_structured(
+                            "INFO",
+                            "FEATURE_ENTRY_TRIGGERED",
+                            {
+                                "ts": f.ts.isoformat(),
+                                "signal": p.signal,
+                                "reason_1": p.reason_1,
+                                "reason_2": p.reason_2,
+                                "reason_3": p.reason_3,
+                                "metrics": metrics,
+                                "feature_entries_enabled": feature_enabled,
+                                "entry_cutoff_reached": entry_cutoff_reached,
+                                "allow_new_entry": allow_new_entry,
+                                "live_state": status.live_state,
+                            },
+                        )
                     elif bool(analysis_cfg.get("log_feature_candidates_when_disabled", True)):
                         for fp in feature_candidates:
                             storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})

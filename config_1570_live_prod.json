@@ -96,17 +96,17 @@
     "allow_same_bar_trigger": false
   },
   "feature_entries": {
-    "enabled": false,
+    "enabled": true,
     "long_vwap_volume_momentum": true,
     "short_vwap_extended_fail": true
   },
   "big_trend_start_score": {
-    "enabled": false,
+    "enabled": true,
     "long_threshold": 8,
     "short_threshold": 9
   },
   "hold_score_extension": {
-    "enabled": false,
+    "enabled": true,
     "long_only": true,
     "score_threshold": 8,
     "release_threshold": 6,
