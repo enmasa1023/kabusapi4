@@ -114,7 +114,7 @@
   },
   "analysis_signals": {
     "log_feature_candidates_when_disabled": true,
-    "log_big_trend_score_when_disabled": true,
+    "log_big_trend_score_when_disabled": false,
     "log_hold_score_when_disabled": true
   }
 }

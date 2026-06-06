@@ -2284,40 +2284,6 @@ def build_rsi9_prediction(
         if status is not None:
             if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                 pass
-            elif status.rsi70_drop_long_watch_active:
-                same_bar = status.rsi70_drop_long_watch_started_bar_ts == bar1.ts
-                can_trigger_same_bar = rsi70_allow_same_bar_trigger or not same_bar
-                ma5_recovered = bar1.ma5 is not None and bar1.close >= bar1.ma5
-                trigger_rule = ""
-                if allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_rsi_turn", True)) and rsi_now > rsi_prev:
-                    trigger_rule = "long_watch_from_rsi70_drop_ma75_up_rsi_turn"
-                elif allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_ma5_recover", True)) and ma5_recovered:
-                    trigger_rule = "long_watch_from_rsi70_drop_ma75_up_ma5_recover"
-                if trigger_rule:
-                    blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, trigger_rule)
-                    if blocked_reason is not None:
-                        clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "MA75_GAP_RECHECK_BLOCKED")
-                    else:
-                        signal, side = "LONG_CANDIDATE", "LONG"
-                        entry_rule = trigger_rule
-                        if storage is not None:
-                            storage.log_structured(
-                                "INFO",
-                                "RSI70_DROP_LONG_WATCH_TRIGGERED",
-                                {
-                                    "ts": bar1.ts.isoformat(),
-                                    "rsi_now": rsi_now,
-                                    "rsi_prev": rsi_prev,
-                                    "watch_started_at": status.rsi70_drop_long_watch_started_at.isoformat() if status.rsi70_drop_long_watch_started_at else None,
-                                    "watch_expires_at": status.rsi70_drop_long_watch_expires_at.isoformat() if status.rsi70_drop_long_watch_expires_at else None,
-                                    "reason_3": trigger_rule,
-                                    "ma5_recovered": ma5_recovered,
-                                    "allow_same_bar_trigger": rsi70_allow_same_bar_trigger,
-                                },
-                            )
-                        clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, trigger_rule)
-                elif not allow_new_entry and storage is not None:
-                    storage.log_structured("INFO", "RSI70_DROP_LONG_WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED", {"ts": bar1.ts.isoformat(), "rsi_now": rsi_now, "rsi_prev": rsi_prev})
             elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
                 if allow_new_entry:
                     signal, side = "LONG_CANDIDATE", "LONG"
@@ -3099,35 +3065,50 @@ def position_quantities(positions: list[dict[str, Any]]) -> tuple[int, int, int]
     return leaves_qty, hold_qty, available_qty
 
 
+def _detail_has_execution_marker(detail: dict[str, Any]) -> bool:
+    if detail.get("ExecutionPrice") is not None or detail.get("ContractPrice") is not None:
+        return True
+    marker_keys = ("ExecutionID", "ExecutionDay", "ContractDay", "ContractQty", "ExecutionQty")
+    if any(detail.get(k) not in (None, "") for k in marker_keys):
+        return True
+    text = " ".join(str(detail.get(k) or "") for k in ("State", "StateName", "RecType", "Type", "Description"))
+    return "約定" in text or "Contract" in text or "Execution" in text
+
+
 def _extract_fill_price_from_order_rows(rows: list[dict[str, Any]], order_id: str) -> tuple[Optional[float], str, Any]:
     matched = [r for r in rows if not order_id or str(r.get("ID") or r.get("OrderId") or r.get("OrderID") or "") == str(order_id)]
     if not matched:
         matched = rows
     weighted_value = 0.0
     weighted_qty = 0.0
-    fallback_prices: list[float] = []
+    explicit_prices: list[float] = []
+    order_limit_price_seen = False
     for row in matched:
         details = row.get("Details") or row.get("details") or []
         if isinstance(details, list):
             for detail in details:
                 if not isinstance(detail, dict):
                     continue
-                price = _safe_float(detail.get("Price") or detail.get("ExecutionPrice") or detail.get("ContractPrice"))
-                qty = _safe_float(detail.get("Qty") or detail.get("ExecutionQty") or detail.get("ContractQty"))
-                if price is not None:
-                    fallback_prices.append(price)
-                if price is not None and qty is not None and qty > 0:
+                price = _safe_float(detail.get("ExecutionPrice") or detail.get("ContractPrice"))
+                if price is None and _detail_has_execution_marker(detail):
+                    price = _safe_float(detail.get("Price"))
+                qty = _safe_float(detail.get("ExecutionQty") or detail.get("ContractQty") or detail.get("Qty"))
+                if price is not None and price > 0:
+                    explicit_prices.append(price)
+                if price is not None and price > 0 and qty is not None and qty > 0:
                     weighted_value += price * qty
                     weighted_qty += qty
-        for key in ("AvgPrice", "ExecutionPrice", "ContractPrice", "Price"):
+        for key in ("AvgPrice", "ExecutionPrice", "ContractPrice"):
             price = _safe_float(row.get(key))
             if price is not None and price > 0:
-                fallback_prices.append(price)
+                explicit_prices.append(price)
+        if _safe_float(row.get("Price")) is not None:
+            order_limit_price_seen = True
     if weighted_qty > 0:
         return weighted_value / weighted_qty, "ORDER_DETAIL", matched
-    if fallback_prices:
-        return fallback_prices[-1], "ORDER_DETAIL", matched
-    return None, "", matched
+    if explicit_prices:
+        return explicit_prices[-1], "ORDER_DETAIL", matched
+    return None, "ORDER_LIMIT_PRICE_FALLBACK" if order_limit_price_seen else "UNAVAILABLE", matched
 
 
 def resolve_actual_fill_price(
@@ -3178,12 +3159,12 @@ def resolve_actual_fill_price(
                     "signal_price": signal_price,
                     "limit_price": limit_price,
                     "actual_fill_price": None,
-                    "fill_source": "UNAVAILABLE",
+                    "fill_source": source or "UNAVAILABLE",
                     "raw_order_detail_json": rows,
                     "error": "NO_EXECUTION_PRICE_IN_ORDER_DETAIL",
                 },
             )
-        return None, "UNAVAILABLE"
+        return None, source or "UNAVAILABLE"
     except Exception as e:
         if storage is not None:
             storage.log_structured(
@@ -4164,6 +4145,67 @@ def close_position_groups_for_side(
     return groups
 
 
+
+
+def close_position_groups_from_managed_state(
+    pos: PositionState,
+    config: dict[str, Any],
+    default_exchange: Optional[int] = None,
+) -> tuple[Optional[list[tuple[int, list[dict[str, Any]], int]]], str]:
+    """Build ClosePositions from bot-managed cached execution ids without a /positions round trip.
+
+    This fast path is intentionally conservative: if we cannot determine per-HoldID
+    quantity from managed_close_positions (or unambiguously from filled_qty for a
+    single managed id), callers must fall back to a fresh positions fetch.
+    """
+    managed_ids = [str(x) for x in (pos.managed_execution_ids or []) if str(x)]
+    if not managed_ids:
+        return None, "MANAGED_EXECUTION_IDS_MISSING"
+    exchange = int(default_exchange if default_exchange is not None else exit_exchange(config))
+    qty_by_hold_id: dict[str, int] = {}
+    exchange_by_hold_id: dict[str, int] = {}
+    for row in pos.managed_close_positions or []:
+        if not isinstance(row, dict):
+            continue
+        hold_id = str(row.get("ExecutionID") or row.get("HoldID") or "")
+        if not hold_id or hold_id not in managed_ids:
+            continue
+        raw_qty = row.get("AvailableQty")
+        if raw_qty is None:
+            raw_qty = row.get("LeavesQty")
+        if raw_qty is None:
+            raw_qty = row.get("Qty")
+        qty = _to_int(raw_qty, 0)
+        if qty <= 0:
+            continue
+        qty_by_hold_id[hold_id] = max(qty_by_hold_id.get(hold_id, 0), qty)
+        row_exchange = _to_int(row.get("Exchange"), exchange)
+        exchange_by_hold_id[hold_id] = row_exchange if row_exchange > 0 else exchange
+
+    missing_ids = [hold_id for hold_id in managed_ids if qty_by_hold_id.get(hold_id, 0) <= 0]
+    if missing_ids:
+        if len(managed_ids) == 1 and pos.filled_qty > 0:
+            hold_id = managed_ids[0]
+            qty_by_hold_id[hold_id] = int(pos.filled_qty)
+            exchange_by_hold_id[hold_id] = exchange_by_hold_id.get(hold_id, exchange)
+            missing_ids = []
+        else:
+            return None, f"MANAGED_QTY_UNKNOWN:{','.join(missing_ids)}"
+
+    qty_by_exchange: dict[int, dict[str, int]] = {}
+    for hold_id, qty in qty_by_hold_id.items():
+        if qty <= 0:
+            continue
+        qty_by_exchange.setdefault(exchange_by_hold_id.get(hold_id, exchange), {})[hold_id] = qty
+    groups: list[tuple[int, list[dict[str, Any]], int]] = []
+    for position_exchange in sorted(qty_by_exchange):
+        qty_map = qty_by_exchange[position_exchange]
+        close_positions = [{"HoldID": hold_id, "Qty": qty} for hold_id, qty in qty_map.items()]
+        groups.append((position_exchange, close_positions, sum(qty_map.values())))
+    if not groups:
+        return None, "NO_MANAGED_CLOSE_QTY"
+    return groups, "MANAGED_STATE"
+
 def close_positions_for_side(
     positions: list[dict[str, Any]],
     side: str,
@@ -4206,8 +4248,47 @@ def execute_live_exit(
     decision_ts = exit_signal_ts or now_jst()
     last = LiveOrderResult(False, "EXIT_UNKNOWN_ERROR", recoverable=True)
 
-    fast_exit_available = bool(pos.managed_execution_ids and pos.managed_close_positions)
-    if not fast_exit_available:
+    fast_path_groups: Optional[list[tuple[int, list[dict[str, Any]], int]]] = None
+    fast_path_reason = ""
+    fast_exit_available = bool(
+        pos.managed_execution_ids
+        and pos.filled_qty > 0
+        and status.live_state == "OPEN"
+        and pos.exit_order_id is None
+        and not status.pending_exit
+        and not force_market_order
+    )
+    if fast_exit_available:
+        fast_path_groups, fast_path_reason = close_position_groups_from_managed_state(pos, config, default_exchange=exit_exchange(config))
+        if fast_path_groups:
+            storage.log_structured(
+                "INFO",
+                "EXIT_FAST_PATH_CLOSE_POSITIONS_USED",
+                {
+                    **context,
+                    "decision_ts": decision_ts.isoformat(),
+                    "managed_execution_ids": list(pos.managed_execution_ids or []),
+                    "managed_close_positions": pos.managed_close_positions,
+                    "close_position_groups": fast_path_groups,
+                    "total_qty": sum(group_total_qty for _, _, group_total_qty in fast_path_groups),
+                    "fast_path_reason": fast_path_reason,
+                },
+            )
+        else:
+            storage.log_structured(
+                "WARN",
+                "EXIT_FAST_PATH_FALLBACK_TO_POSITIONS_FETCH",
+                {
+                    **context,
+                    "decision_ts": decision_ts.isoformat(),
+                    "managed_execution_ids": list(pos.managed_execution_ids or []),
+                    "managed_close_positions": pos.managed_close_positions,
+                    "filled_qty": pos.filled_qty,
+                    "fallback_reason": fast_path_reason,
+                },
+            )
+
+    if fast_path_groups is None:
         if not verify_position_before_exit(
             client,
             config,
@@ -4224,33 +4305,43 @@ def execute_live_exit(
         storage.log_structured("INFO", "EXIT_POSITION_VERIFY_FAST_PATH", {**context, "decision_ts": decision_ts.isoformat(), "reason": "managed_execution_ids_available", "managed_execution_ids": list(pos.managed_execution_ids or [])})
 
     for attempt in range(retries + 1):
-        positions = fetch_positions(client, config, storage, reason="EXIT_BUILD_CLOSE_POSITIONS")
-        if force_market_order:
-            storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_POSITIONS_SNAPSHOT", {**context, "positions_summary": positions_summary_for_log(positions), "managed_execution_ids": list(pos.managed_execution_ids or [])})
-        if not pos.managed_execution_ids and not bool(config.get("allow_unmanaged_force_close", False)):
-            storage.log_structured("ERROR", "MANAGED_POSITION_IDS_MISSING", {**context, "positions_summary": positions_summary_for_log(positions), "internal_position": position_state_payload(pos)})
-            return LiveOrderResult(False, "MANAGED_POSITION_IDS_MISSING", recoverable=True)
-        close_position_groups = close_position_groups_for_side(
-            positions,
-            side,
-            margin_trade_type=pos.margin_trade_type,
-            available_only=True,
-            default_exchange=exit_exchange(config),
-            managed_execution_ids=pos.managed_execution_ids,
-            storage=storage,
-        )
-        total_qty = sum(group_total_qty for _, _, group_total_qty in close_position_groups)
-        if force_market_order:
-            storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_AVAILABLE_CLOSE_POSITIONS", {**context, "close_position_groups": close_position_groups, "total_qty": total_qty})
-        managed_positions = managed_positions_for(pos, positions) if pos.managed_execution_ids else positions
-        leaves_qty, hold_qty, available_qty = position_quantities(managed_positions)
-        if not positions:
-            return LiveOrderResult(False, "NO_POSITIONS_FOR_EXIT", recoverable=True)
-        if leaves_qty <= 0:
-            storage.log_structured("INFO", "POSITION_ALREADY_CLOSED", {**context, "managed_execution_ids": list(pos.managed_execution_ids or []), "positions_summary": positions_summary_for_log(positions)})
-            status.open_position = None
-            status.live_state = "FLAT"
-            return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
+        positions: list[dict[str, Any]] = []
+        if fast_path_groups is not None and attempt == 0:
+            close_position_groups = fast_path_groups
+            total_qty = sum(group_total_qty for _, _, group_total_qty in close_position_groups)
+            leaves_qty = total_qty
+            hold_qty = 0
+            available_qty = total_qty
+        else:
+            if fast_path_groups is not None and attempt > 0:
+                storage.log_structured("WARN", "EXIT_FAST_PATH_FALLBACK_TO_POSITIONS_FETCH", {**context, "decision_ts": decision_ts.isoformat(), "attempt": attempt + 1, "fallback_reason": "REPRICE_AFTER_FAST_PATH_TIMEOUT"})
+            positions = fetch_positions(client, config, storage, reason="EXIT_BUILD_CLOSE_POSITIONS")
+            if force_market_order:
+                storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_POSITIONS_SNAPSHOT", {**context, "positions_summary": positions_summary_for_log(positions), "managed_execution_ids": list(pos.managed_execution_ids or [])})
+            if not pos.managed_execution_ids and not bool(config.get("allow_unmanaged_force_close", False)):
+                storage.log_structured("ERROR", "MANAGED_POSITION_IDS_MISSING", {**context, "positions_summary": positions_summary_for_log(positions), "internal_position": position_state_payload(pos)})
+                return LiveOrderResult(False, "MANAGED_POSITION_IDS_MISSING", recoverable=True)
+            close_position_groups = close_position_groups_for_side(
+                positions,
+                side,
+                margin_trade_type=pos.margin_trade_type,
+                available_only=True,
+                default_exchange=exit_exchange(config),
+                managed_execution_ids=pos.managed_execution_ids,
+                storage=storage,
+            )
+            total_qty = sum(group_total_qty for _, _, group_total_qty in close_position_groups)
+            if force_market_order:
+                storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_AVAILABLE_CLOSE_POSITIONS", {**context, "close_position_groups": close_position_groups, "total_qty": total_qty})
+            managed_positions = managed_positions_for(pos, positions) if pos.managed_execution_ids else positions
+            leaves_qty, hold_qty, available_qty = position_quantities(managed_positions)
+            if not positions:
+                return LiveOrderResult(False, "NO_POSITIONS_FOR_EXIT", recoverable=True)
+            if leaves_qty <= 0:
+                storage.log_structured("INFO", "POSITION_ALREADY_CLOSED", {**context, "managed_execution_ids": list(pos.managed_execution_ids or []), "positions_summary": positions_summary_for_log(positions)})
+                status.open_position = None
+                status.live_state = "FLAT"
+                return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
         if total_qty <= 0 or not close_position_groups:
             storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_WAIT_UNLOCK", {**context, "leaves_qty": leaves_qty, "hold_qty": hold_qty, "available_qty": available_qty, "positions_summary": positions_summary_for_log(positions)})
             return LiveOrderResult(
@@ -5230,10 +5321,12 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     elif bool(analysis_cfg.get("log_feature_candidates_when_disabled", True)):
                         for fp in feature_candidates:
                             storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})
-                if bool(config.get("big_trend_start_score", {}).get("enabled", False)) or bool(analysis_cfg.get("log_big_trend_score_when_disabled", True)):
+                big_trend_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score", {}), dict) else {}
+                log_big_trend_score = bool(big_trend_cfg.get("enabled", False)) or bool(analysis_cfg.get("log_big_trend_score_when_disabled", False))
+                if log_big_trend_score and bar1_new is not None:
                     for score_side in ("LONG", "SHORT"):
                         score, components = big_trend_start_score(score_side, f, metrics)
-                        storage.log_structured("INFO", "BIG_TREND_START_SCORE_CALCULATED", {"ts": f.ts.isoformat(), "side": score_side, "score": score, "components": components, **metrics})
+                        storage.log_structured("INFO", "BIG_TREND_START_SCORE_CALCULATED", {"ts": f.ts.isoformat(), "side": score_side, "score": score, "components": components, "log_reason": "enabled" if bool(big_trend_cfg.get("enabled", False)) else "disabled_log_1m_only", **metrics})
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
@@ -5610,6 +5703,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             exit_confirmed = True
                             result: Optional[LiveOrderResult] = None
                             exit_fill_source = "SIGNAL_PRICE_FALLBACK"
+                            exit_actual_fill_price: Optional[float] = None
                             exit_signal_ts = f.ts
                             exit_signal_price = f.price
                             ma5_exit_context = {
@@ -5666,7 +5760,6 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.exit_fill_price,
                                     )
                                 elif exit_confirmed:
-                                    status.live_state = "EXIT_SENT"
                                     result = execute_live_exit(
                                         client,
                                         config,
@@ -5713,8 +5806,13 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             )
                                     else:
                                         pos.exit_order_id = result.order_id
-                                        pos.exit_fill_price = result.actual_fill_price if result.actual_fill_price is not None else f.price
-                                        exit_fill_source = result.fill_source if result.actual_fill_price is not None else "SIGNAL_PRICE_FALLBACK"
+                                        exit_actual_fill_price = result.actual_fill_price
+                                        if result.actual_fill_price is not None:
+                                            pos.exit_fill_price = result.actual_fill_price
+                                            exit_fill_source = result.fill_source or "ORDER_DETAIL"
+                                        else:
+                                            pos.exit_fill_price = f.price
+                                            exit_fill_source = "SIGNAL_PRICE_FALLBACK" if result.fill_source in {"UNAVAILABLE", "ORDER_LIMIT_PRICE_FALLBACK", "ORDER_ID_MISSING", ""} else f"{result.fill_source}_FALLBACK"
                                         status.exit_fail_count = 0
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
                                         rem_qty = get_open_position_qty(client, config, pos.side, margin_trade_type=pos.margin_trade_type)
@@ -5734,7 +5832,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             pos.side,
                                             pos.strategy,
                                             ex_reason,
-                                            pos.exit_fill_price,
+                                            exit_actual_fill_price,
                                         )
                                         storage.log_structured(
                                             "INFO",
@@ -5743,7 +5841,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 "order_id": result.order_id,
                                                 "exit_signal_price": exit_signal_price,
                                                 "exit_order_limit_price": result.limit_price,
-                                                "exit_actual_fill_price": result.actual_fill_price,
+                                                "exit_actual_fill_price": exit_actual_fill_price,
                                                 "exit_fill_source": exit_fill_source,
                                                 "exit_signal_ts": exit_signal_ts.isoformat(),
                                                 "exit_order_send_ts": result.order_send_ts.isoformat() if result.order_send_ts else None,
@@ -5776,7 +5874,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     mae_ticks=mae_ticks,
                                     exit_signal_price=exit_signal_price,
                                     exit_order_limit_price=result.limit_price if result is not None else None,
-                                    exit_actual_fill_price=pos.exit_fill_price if config["live_mode"] else None,
+                                    exit_actual_fill_price=exit_actual_fill_price if config["live_mode"] else None,
                                     exit_fill_source=exit_fill_source,
                                     exit_signal_ts=exit_signal_ts.isoformat(),
                                     exit_order_send_ts=result.order_send_ts.isoformat() if result is not None and result.order_send_ts else None,
