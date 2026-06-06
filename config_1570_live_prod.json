@@ -7,8 +7,8 @@
   "order_exchange": 9,
   "exit_order_exchange": 1,
   "margin_entry_exchange": 9,
-  "order_qty": 1,
-  "entry_min_fill_qty": 1,
+  "order_qty": 2,
+  "entry_min_fill_qty": 2,
   "account_type": 4,
   "margin_trade_type": 3,
   "margin_trade_type_long": 3,
@@ -85,5 +85,36 @@
   "take_profit_execution": {
     "enabled": true,
     "fallback_market_after_signal_sec": 180.0
+  },
+  "force_close_after": "15:20:00",
+  "new_entry_cutoff_time": "14:50:00",
+  "rsi70_drop_long_watch": {
+    "enabled": true,
+    "watch_minutes": 10,
+    "trigger_on_rsi_turn": true,
+    "trigger_on_ma5_recover": true,
+    "allow_same_bar_trigger": false
+  },
+  "feature_entries": {
+    "enabled": true,
+    "long_vwap_volume_momentum": true,
+    "short_vwap_extended_fail": true
+  },
+  "big_trend_start_score": {
+    "enabled": true,
+    "long_threshold": 8,
+    "short_threshold": 9
+  },
+  "hold_score_extension": {
+    "enabled": true,
+    "long_only": true,
+    "score_threshold": 8,
+    "release_threshold": 6,
+    "max_ma5_exit_skip_count": 1
+  },
+  "analysis_signals": {
+    "log_feature_candidates_when_disabled": true,
+    "log_big_trend_score_when_disabled": false,
+    "log_hold_score_when_disabled": true
   }
 }
