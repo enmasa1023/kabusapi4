@@ -3366,6 +3366,29 @@ def average_price_from_positions(
     return float(sum(prices) / len(prices))
 
 
+def weighted_average_price_from_positions(
+    positions: list[dict[str, Any]],
+    side: str,
+    margin_trade_type: Optional[int] = None,
+) -> Optional[float]:
+    weighted_value = 0.0
+    total_qty = 0
+    for p in positions:
+        if not position_matches(p, side=side, margin_trade_type=margin_trade_type):
+            continue
+        qty = position_leaves_qty(p)
+        if qty <= 0:
+            continue
+        px = actual_position_price(p, 0.0)
+        if px <= 0:
+            continue
+        weighted_value += px * qty
+        total_qty += qty
+    if total_qty <= 0:
+        return None
+    return weighted_value / total_qty
+
+
 def side_from_api_position(position: dict[str, Any]) -> str:
     return "LONG" if str(position.get("Side")) == "2" else "SHORT"
 
@@ -3432,6 +3455,130 @@ def find_matching_actual_position(
         return None
     return max(candidates, key=position_leaves_qty)
 
+
+
+
+def enter_recovery_after_add_rebuild_failure(
+    storage: Storage,
+    status: MonitorStatus,
+    pos: PositionState,
+    ts: datetime,
+    reason: str,
+    payload: dict[str, Any],
+) -> None:
+    status.live_state = "RECOVERING"
+    status.recovery_until = now_jst() + timedelta(seconds=RECOVERY_COOLDOWN_SEC)
+    status.pending_add = False
+    storage.log_structured(
+        "ERROR",
+        "RSI9_LONG_ADD_MANAGED_STATE_REBUILD_FAILED",
+        {
+            "ts": ts.isoformat(),
+            "reason": reason,
+            "recovery_until": status.recovery_until.isoformat() if status.recovery_until else None,
+            "internal_position": position_state_payload(pos),
+            **payload,
+        },
+        mirror_message=f"reason={reason}",
+    )
+
+
+def rebuild_rsi9_long_add_managed_state(
+    client: KabuApiClient,
+    config: dict[str, Any],
+    storage: Storage,
+    status: MonitorStatus,
+    pos: PositionState,
+    before_positions: list[dict[str, Any]],
+    expected_total_qty: int,
+    ts: datetime,
+) -> bool:
+    before_managed_execution_ids = [str(x) for x in (pos.managed_execution_ids or []) if str(x)]
+    before_managed_set = set(before_managed_execution_ids)
+    old_filled_qty = int(pos.filled_qty)
+    old_entry_price = pos.entry_fill_price if pos.entry_fill_price is not None else pos.entry_price
+    try:
+        after_positions = fetch_positions(client, config, storage, reason="POST_ADD_REBUILD_MANAGED_POSITIONS")
+    except Exception as e:
+        enter_recovery_after_add_rebuild_failure(
+            storage,
+            status,
+            pos,
+            ts,
+            "POSITIONS_FETCH_FAILED",
+            {"before_managed_execution_ids": before_managed_execution_ids, **api_error_payload(e)},
+        )
+        return False
+
+    matching_positions = [
+        p for p in after_positions
+        if position_matches(p, side="LONG", margin_trade_type=pos.margin_trade_type)
+        and position_leaves_qty(p) > 0
+        and position_execution_id(p)
+    ]
+    added_positions = new_managed_positions_from_diff(after_positions, before_positions, "LONG", pos.margin_trade_type)
+    added_execution_ids = sorted({position_execution_id(p) for p in added_positions if position_execution_id(p) and position_execution_id(p) not in before_managed_set})
+    after_managed_execution_ids = sorted(before_managed_set | set(added_execution_ids))
+    managed_positions = [p for p in matching_positions if position_execution_id(p) in set(after_managed_execution_ids)]
+    managed_close_positions = positions_summary_for_log(managed_positions)
+    managed_qty_sum = sum(position_leaves_qty(p) for p in managed_positions)
+    new_entry_price = weighted_average_price_from_positions(managed_positions, "LONG", margin_trade_type=pos.margin_trade_type)
+    failure_reason = ""
+    if not added_execution_ids:
+        failure_reason = "ADDED_EXECUTION_IDS_NOT_DETECTED"
+    elif not managed_close_positions:
+        failure_reason = "MANAGED_CLOSE_POSITIONS_EMPTY"
+    elif managed_qty_sum != int(expected_total_qty):
+        failure_reason = "MANAGED_QTY_SUM_MISMATCH"
+    elif new_entry_price is None:
+        failure_reason = "MANAGED_WEIGHTED_ENTRY_PRICE_UNAVAILABLE"
+    if failure_reason:
+        enter_recovery_after_add_rebuild_failure(
+            storage,
+            status,
+            pos,
+            ts,
+            failure_reason,
+            {
+                "before_managed_execution_ids": before_managed_execution_ids,
+                "after_managed_execution_ids": after_managed_execution_ids,
+                "added_execution_ids": added_execution_ids,
+                "managed_close_positions": managed_close_positions,
+                "managed_qty_sum": managed_qty_sum,
+                "expected_total_qty": int(expected_total_qty),
+                "old_filled_qty": old_filled_qty,
+                "old_entry_price": old_entry_price,
+                "raw_positions_json": after_positions,
+            },
+        )
+        return False
+
+    pos.managed_execution_ids = after_managed_execution_ids
+    pos.managed_close_positions = managed_close_positions
+    pos.filled_qty = int(managed_qty_sum)
+    pos.order_qty = int(managed_qty_sum)
+    pos.remaining_qty = 0
+    pos.entry_price = float(new_entry_price)
+    pos.entry_fill_price = float(new_entry_price)
+    storage.log_structured(
+        "INFO",
+        "RSI9_LONG_ADD_MANAGED_STATE_REBUILT",
+        {
+            "ts": ts.isoformat(),
+            "before_managed_execution_ids": before_managed_execution_ids,
+            "after_managed_execution_ids": after_managed_execution_ids,
+            "added_execution_ids": added_execution_ids,
+            "managed_close_positions": managed_close_positions,
+            "managed_qty_sum": managed_qty_sum,
+            "expected_total_qty": int(expected_total_qty),
+            "old_filled_qty": old_filled_qty,
+            "new_filled_qty": pos.filled_qty,
+            "old_entry_price": old_entry_price,
+            "new_entry_price": pos.entry_price,
+            "raw_positions_json": after_positions,
+        },
+    )
+    return True
 
 def create_position_from_actual_position(
     api_pos: dict[str, Any],
@@ -4204,6 +4351,9 @@ def close_position_groups_from_managed_state(
         groups.append((position_exchange, close_positions, sum(qty_map.values())))
     if not groups:
         return None, "NO_MANAGED_CLOSE_QTY"
+    total_group_qty = sum(group_total_qty for _, _, group_total_qty in groups)
+    if pos.filled_qty > 0 and total_group_qty != int(pos.filled_qty):
+        return None, "FAST_PATH_QTY_MISMATCH"
     return groups, "MANAGED_STATE"
 
 def close_positions_for_side(
@@ -5387,24 +5537,56 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         else:
                             add_qty = int(config.get("order_qty", 2))
                             target_total_qty = int(current_qty + add_qty)
-                            add_pred = PredictionSnapshot(ts=f.ts, regime="RSI9", p_up_1m=0.5,p_down_1m=0.5,p_up_3m=0.5,p_down_3m=0.5, signal="LONG_CANDIDATE", rsi9_value=current_rsi, reason_1="RSI9_ADD", reason_2=f"rsi9={current_rsi if current_rsi is not None else 0:.2f}", reason_3="rsi10_add")
-                            add_res = execute_live_entry(client, config, "LONG", storage, pos_add, add_pred, status, latest_snapshot=snap, target_total_qty_override=target_total_qty, qty_override=add_qty)
+                            add_before_positions: list[dict[str, Any]] = []
+                            add_before_positions_ok = True
+                            if config.get("live_mode"):
+                                try:
+                                    add_before_positions = fetch_positions(client, config, storage, reason="PRE_ADD_REBUILD_MANAGED_POSITIONS")
+                                except Exception as e:
+                                    add_before_positions_ok = False
+                                    status.pending_add = False
+                                    enter_recovery_after_add_rebuild_failure(
+                                        storage,
+                                        status,
+                                        pos_add,
+                                        f.ts,
+                                        "PRE_ADD_POSITIONS_FETCH_FAILED",
+                                        {
+                                            "before_managed_execution_ids": list(pos_add.managed_execution_ids or []),
+                                            "current_qty": current_qty,
+                                            "add_qty": add_qty,
+                                            "target_total_qty": target_total_qty,
+                                            **api_error_payload(e),
+                                        },
+                                    )
+                            if not add_before_positions_ok:
+                                add_res = LiveOrderResult(False, "PRE_ADD_POSITIONS_FETCH_FAILED", recoverable=True)
+                            else:
+                                add_pred = PredictionSnapshot(ts=f.ts, regime="RSI9", p_up_1m=0.5,p_down_1m=0.5,p_up_3m=0.5,p_down_3m=0.5, signal="LONG_CANDIDATE", rsi9_value=current_rsi, reason_1="RSI9_ADD", reason_2=f"rsi9={current_rsi if current_rsi is not None else 0:.2f}", reason_3="rsi10_add")
+                                add_res = execute_live_entry(client, config, "LONG", storage, pos_add, add_pred, status, latest_snapshot=snap, target_total_qty_override=target_total_qty, qty_override=add_qty)
                             if add_res.ok:
                                 status.pending_add = False
                                 pos_add.rsi10_add_done = True
-                                new_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else target_total_qty
-                                pos_add.filled_qty = int(new_qty)
-                                pos_add.order_qty = int(new_qty)
-                                pos_add.remaining_qty = 0
-                                try:
-                                    entry_positions = fetch_positions(client, config, storage, reason="POST_ADD_FILL_PRICE")
-                                    avg = average_price_from_positions(entry_positions, "LONG", margin_trade_type=pos_add.margin_trade_type)
-                                    if avg is not None:
-                                        pos_add.entry_fill_price = avg
-                                        pos_add.entry_price = avg
-                                except Exception:
-                                    pass
-                                storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
+                                if config.get("live_mode"):
+                                    rebuild_ok = rebuild_rsi9_long_add_managed_state(
+                                        client,
+                                        config,
+                                        storage,
+                                        status,
+                                        pos_add,
+                                        add_before_positions,
+                                        target_total_qty,
+                                        f.ts,
+                                    )
+                                    if not rebuild_ok:
+                                        storage.log("ERROR", "RSI9_LONG_ADD_FAIL", f"reason=MANAGED_STATE_REBUILD_FAILED existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
+                                    else:
+                                        storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} managed_qty={pos_add.filled_qty}")
+                                else:
+                                    pos_add.filled_qty = int(target_total_qty)
+                                    pos_add.order_qty = int(target_total_qty)
+                                    pos_add.remaining_qty = 0
+                                    storage.log("INFO", "RSI9_LONG_ADD_OK", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty}")
                             else:
                                 status.pending_add = False
                                 storage.log("WARN", "RSI9_LONG_ADD_FAIL", f"existing_qty={current_qty} add_qty={add_qty} target_total_qty={target_total_qty} message={add_res.message}")
