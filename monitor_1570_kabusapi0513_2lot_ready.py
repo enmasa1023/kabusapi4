@@ -56,6 +56,7 @@ TRADE_WINDOWS = [
 ]
 STOP_AFTER = "15:30:00"
 FORCE_CLOSE_AFTER = "15:20:00"
+NEW_ENTRY_CUTOFF_TIME = "14:50:00"
 MIDDAY_ORDER_CANCEL_START = "11:29:00"
 MIDDAY_ORDER_CANCEL_END = "11:30:30"
 
@@ -192,6 +193,34 @@ def jst_date_compact(dt: Optional[datetime] = None) -> str:
 
 def time_in_windows(t: str, windows: list[tuple[str, str]]) -> bool:
     return any(s <= t <= e for s, e in windows)
+
+
+def new_entry_cutoff_reached(config: dict[str, Any], ts_or_tstr: datetime | str) -> bool:
+    cutoff = str(config.get("new_entry_cutoff_time", NEW_ENTRY_CUTOFF_TIME))
+    tstr = ts_or_tstr.strftime("%H:%M:%S") if isinstance(ts_or_tstr, datetime) else str(ts_or_tstr)
+    return tstr >= cutoff
+
+
+def log_new_entry_cutoff_block(
+    storage: Optional[Storage],
+    config: dict[str, Any],
+    ts: datetime,
+    signal: str,
+    reason_3: str,
+    side: str,
+) -> None:
+    if storage is not None:
+        storage.log_structured(
+            "WARN",
+            "NEW_ENTRY_BLOCKED_BY_CUTOFF_TIME",
+            {
+                "ts": ts.isoformat(),
+                "cutoff_time": str(config.get("new_entry_cutoff_time", NEW_ENTRY_CUTOFF_TIME)),
+                "signal": signal,
+                "reason_3": reason_3,
+                "side": side,
+            },
+        )
 
 
 def tick_size_for_1570(price: float) -> float:
@@ -382,6 +411,14 @@ class KabuApiClient:
         res = _http_json("GET", url, token=self.token)
         return res if isinstance(res, list) else []
 
+    def get_orders(self, order_id: str = "", product: int = 2) -> list[dict[str, Any]]:
+        params = [f"product={product}"]
+        if order_id:
+            params.append(f"id={order_id}")
+        url = f"{self.base_url}/orders?{'&'.join(params)}"
+        res = _http_json("GET", url, token=self.token)
+        return res if isinstance(res, list) else []
+
 
 @dataclass
 class TickSnapshot:
@@ -504,6 +541,9 @@ class PositionState:
     trailing_ma5_bar_open: Optional[float] = None
     trailing_ma5_reference: Optional[float] = None
     trailing_ma5_open_relation: str = ""
+    ma5_exit_skip_count: int = 0
+    last_ma5_exit_deferred_ts: Optional[datetime] = None
+    last_hold_score: Optional[float] = None
     hard_stop_ticks: int = HARD_STOP_TICKS
 
 
@@ -525,6 +565,11 @@ class LiveOrderResult:
     api_code: str = ""
     api_message: str = ""
     recoverable: bool = False
+    limit_price: Optional[float] = None
+    order_send_ts: Optional[datetime] = None
+    order_response_ts: Optional[datetime] = None
+    actual_fill_price: Optional[float] = None
+    fill_source: str = ""
 
 
 @dataclass
@@ -590,6 +635,13 @@ class MonitorStatus:
     rsi20_long_watch_started_at: Optional[datetime] = None
     rsi20_long_watch_expires_at: Optional[datetime] = None
     rsi20_long_watch_started_rsi: Optional[float] = None
+    rsi70_drop_long_watch_active: bool = False
+    rsi70_drop_long_watch_started_at: Optional[datetime] = None
+    rsi70_drop_long_watch_expires_at: Optional[datetime] = None
+    rsi70_drop_long_watch_started_rsi: Optional[float] = None
+    rsi70_drop_long_watch_started_price: Optional[float] = None
+    rsi70_drop_long_watch_reason: str = ""
+    rsi70_drop_long_watch_started_bar_ts: Optional[datetime] = None
     force_close_state: str = ""
     failed_close_signature: str = ""
     failed_close_signature_ts: Optional[datetime] = None
@@ -695,6 +747,9 @@ def position_state_payload(pos: Optional[PositionState]) -> dict[str, Any]:
         "trailing_ma5_bar_open": pos.trailing_ma5_bar_open,
         "trailing_ma5_reference": pos.trailing_ma5_reference,
         "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
+        "ma5_exit_skip_count": pos.ma5_exit_skip_count,
+        "last_ma5_exit_deferred_ts": pos.last_ma5_exit_deferred_ts.isoformat() if pos.last_ma5_exit_deferred_ts else None,
+        "last_hold_score": pos.last_hold_score,
         "hard_stop_ticks": pos.hard_stop_ticks,
     }
 
@@ -777,7 +832,16 @@ class Storage:
               entry_ts TEXT, exit_ts TEXT, entry_side TEXT, strategy TEXT,
               entry_price REAL, exit_price REAL,
               pnl_ticks REAL, holding_sec REAL, exit_reason TEXT,
-              mfe_ticks REAL, mae_ticks REAL
+              mfe_ticks REAL, mae_ticks REAL,
+              exit_signal_price REAL,
+              exit_order_limit_price REAL,
+              exit_actual_fill_price REAL,
+              exit_fill_source TEXT,
+              exit_signal_ts TEXT,
+              exit_order_send_ts TEXT,
+              exit_order_response_ts TEXT,
+              exit_decision_to_send_ms REAL,
+              exit_order_id TEXT
             )""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS gate_decisions(
@@ -797,6 +861,7 @@ class Storage:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_facts_order_id_ts ON execution_facts(order_id, ts)")
             self._ensure_prediction_rsi9_column(cur)
             self._ensure_execution_fill_price_column(cur)
+            self._ensure_paper_trade_exit_detail_columns(cur)
             con.commit()
 
     def _ensure_bar_ma13_column(self, cur: sqlite3.Cursor, table: str) -> None:
@@ -813,6 +878,23 @@ class Storage:
         cols = [r[1] for r in cur.execute("PRAGMA table_info(execution_facts)").fetchall()]
         if "fill_price" not in cols:
             cur.execute("ALTER TABLE execution_facts ADD COLUMN fill_price REAL")
+
+    def _ensure_paper_trade_exit_detail_columns(self, cur: sqlite3.Cursor) -> None:
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(paper_trades)").fetchall()]
+        wanted = {
+            "exit_signal_price": "REAL",
+            "exit_order_limit_price": "REAL",
+            "exit_actual_fill_price": "REAL",
+            "exit_fill_source": "TEXT",
+            "exit_signal_ts": "TEXT",
+            "exit_order_send_ts": "TEXT",
+            "exit_order_response_ts": "TEXT",
+            "exit_decision_to_send_ms": "REAL",
+            "exit_order_id": "TEXT",
+        }
+        for name, typ in wanted.items():
+            if name not in cols:
+                cur.execute(f"ALTER TABLE paper_trades ADD COLUMN {name} {typ}")
 
     def log(self, level: str, event_type: str, message: str) -> None:
         with self._connect() as con:
@@ -1028,8 +1110,11 @@ class Storage:
     def insert_trade(self, **kwargs: Any) -> None:
         with self._connect() as con:
             con.execute(
-                """INSERT INTO paper_trades(entry_ts,exit_ts,entry_side,strategy,entry_price,exit_price,pnl_ticks,holding_sec,exit_reason,mfe_ticks,mae_ticks)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO paper_trades(
+                     entry_ts,exit_ts,entry_side,strategy,entry_price,exit_price,pnl_ticks,holding_sec,exit_reason,mfe_ticks,mae_ticks,
+                     exit_signal_price,exit_order_limit_price,exit_actual_fill_price,exit_fill_source,exit_signal_ts,
+                     exit_order_send_ts,exit_order_response_ts,exit_decision_to_send_ms,exit_order_id
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     kwargs.get("entry_ts"),
                     kwargs.get("exit_ts"),
@@ -1042,6 +1127,15 @@ class Storage:
                     kwargs.get("exit_reason"),
                     kwargs.get("mfe_ticks"),
                     kwargs.get("mae_ticks"),
+                    kwargs.get("exit_signal_price"),
+                    kwargs.get("exit_order_limit_price"),
+                    kwargs.get("exit_actual_fill_price"),
+                    kwargs.get("exit_fill_source"),
+                    kwargs.get("exit_signal_ts"),
+                    kwargs.get("exit_order_send_ts"),
+                    kwargs.get("exit_order_response_ts"),
+                    kwargs.get("exit_decision_to_send_ms"),
+                    kwargs.get("exit_order_id"),
                 ),
             )
             con.commit()
@@ -1353,6 +1447,106 @@ def build_features(
         trade_intensity_30s=trade_intensity_30s,
         regime=regime,
     )
+
+
+def extended_feature_metrics(f: FeatureSnapshot, history: list[Bar]) -> dict[str, Any]:
+    tick_size = tick_size_for_1570(f.price)
+    ret1_ticks = price_to_ticks(history[-1].close - history[-2].close, f.price) if len(history) >= 2 else None
+    ret5_ticks = price_to_ticks(history[-1].close - history[-6].close, f.price) if len(history) >= 6 else None
+    avg20_volume = None
+    volume_ratio_20 = None
+    if len(history) >= 21:
+        vols = [b.volume for b in history[-21:-1]]
+        avg20_volume = sum(vols) / max(len(vols), 1)
+        if avg20_volume > 0:
+            volume_ratio_20 = history[-1].volume / avg20_volume
+    last20 = history[-20:] if len(history) >= 20 else []
+    last30 = history[-30:] if len(history) >= 30 else []
+    range20_ticks = price_to_ticks(max(b.high for b in last20) - min(b.low for b in last20), f.price) if last20 else None
+    range30_ticks = price_to_ticks(max(b.high for b in last30) - min(b.low for b in last30), f.price) if last30 else None
+    ma75_slope_3m_ticks = None
+    if len(history) >= 4 and history[-1].ma75 is not None and history[-4].ma75 is not None:
+        ma75_slope_3m_ticks = price_to_ticks(history[-1].ma75 - history[-4].ma75, f.price)
+    directional_vwap_gap_bps_long = f.vwap_gap_bps
+    directional_vwap_gap_bps_short = -f.vwap_gap_bps
+    abs_vwap_gap_bps = abs(f.vwap_gap_bps)
+    range_pos_30 = None
+    if last30:
+        low30 = min(b.low for b in last30)
+        high30 = max(b.high for b in last30)
+        if high30 > low30:
+            range_pos_30 = (f.price - low30) / (high30 - low30)
+    return {
+        "ret1_ticks": ret1_ticks,
+        "ret5_ticks": ret5_ticks,
+        "volume_ratio_20": volume_ratio_20,
+        "avg20_volume": avg20_volume,
+        "range20_ticks": range20_ticks,
+        "range30_ticks": range30_ticks,
+        "ma75_slope_3m_ticks": ma75_slope_3m_ticks,
+        "directional_vwap_gap_bps_long": directional_vwap_gap_bps_long,
+        "directional_vwap_gap_bps_short": directional_vwap_gap_bps_short,
+        "abs_vwap_gap_bps": abs_vwap_gap_bps,
+        "directional_range_position_30m_long": range_pos_30,
+        "directional_range_position_30m_short": (1.0 - range_pos_30) if range_pos_30 is not None else None,
+        "tick_size": tick_size,
+    }
+
+
+def big_trend_start_score(side: str, f: FeatureSnapshot, metrics: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    sign = 1 if side == "LONG" else -1
+    directional_slope = (metrics.get("ma75_slope_3m_ticks") or 0.0) * sign
+    abs_gap = metrics.get("abs_vwap_gap_bps") or 0.0
+    directional_gap = metrics.get("directional_vwap_gap_bps_long") if side == "LONG" else metrics.get("directional_vwap_gap_bps_short")
+    directional_range_pos = metrics.get("directional_range_position_30m_long") if side == "LONG" else metrics.get("directional_range_position_30m_short")
+    components: dict[str, Any] = {}
+    score = 0
+    if directional_slope >= 2:
+        score += 3; components["ma75_slope_ge_2"] = 3
+    if directional_slope >= 5:
+        score += 2; components["ma75_slope_ge_5"] = 2
+    if (metrics.get("range30_ticks") or 0) >= 70:
+        score += 2; components["range30_ge_70"] = 2
+    if (metrics.get("range20_ticks") or 0) >= 60:
+        score += 1; components["range20_ge_60"] = 1
+    if 20 <= abs_gap <= 160:
+        score += 2; components["abs_vwap_gap_20_160"] = 2
+    if directional_gap is not None and directional_gap <= 80:
+        score += 2; components["directional_vwap_gap_le_80"] = 2
+    if directional_range_pos is not None and directional_range_pos >= 0.6:
+        score += 1; components["directional_range_position_ge_0_6"] = 1
+    if abs_gap > 180:
+        score -= 2; components["abs_vwap_gap_gt_180"] = -2
+    if (metrics.get("range30_ticks") or 0) < 50:
+        score -= 2; components["range30_lt_50"] = -2
+    if f.spread_ticks > 2:
+        score -= 1; components["spread_gt_2"] = -1
+    return score, components
+
+
+def hold_score_for_position(pos: PositionState, f: FeatureSnapshot, metrics: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    components: dict[str, Any] = {}
+    score = 0
+    abs_gap = metrics.get("abs_vwap_gap_bps") or 0.0
+    if abs_gap <= 10:
+        score += 2; components["abs_vwap_gap_le_10"] = 2
+    if (metrics.get("range20_ticks") or 0) >= 36:
+        score += 2; components["range20_ge_36"] = 2
+    range_pos = metrics.get("directional_range_position_30m_long") if pos.side == "LONG" else metrics.get("directional_range_position_30m_short")
+    if range_pos is not None and range_pos >= 0.6:
+        score += 2; components["directional_range_position_ge_0_6"] = 2
+    if (metrics.get("volume_ratio_20") or 0) >= 0.8:
+        score += 1; components["volume_ratio_ge_0_8"] = 1
+    if f.obi_l3 >= -0.2:
+        score += 1; components["obi_l3_ge_minus_0_2"] = 1
+    directional_gap = metrics.get("directional_vwap_gap_bps_long") if pos.side == "LONG" else metrics.get("directional_vwap_gap_bps_short")
+    if directional_gap is not None and directional_gap > 160:
+        score -= 3; components["directional_vwap_gap_gt_160"] = -3
+    if (metrics.get("range20_ticks") or 0) < 28:
+        score -= 2; components["range20_lt_28"] = -2
+    if f.spread_ticks > 2:
+        score -= 1; components["spread_gt_2"] = -1
+    return score, components
 
 
 def can_trade_now(ts: datetime, f: FeatureSnapshot) -> tuple[bool, str]:
@@ -1794,6 +1988,82 @@ def start_rsi20_long_watch(
         print(f"[INFO] RSI20_LONG_WATCH_START {payload}", flush=True)
 
 
+def clear_rsi70_drop_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    event: str,
+    ts: datetime,
+    rsi_now: Optional[float],
+    rsi_prev: Optional[float],
+    reason: str,
+) -> None:
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "watch_started_at": status.rsi70_drop_long_watch_started_at.isoformat() if status.rsi70_drop_long_watch_started_at else None,
+        "watch_expires_at": status.rsi70_drop_long_watch_expires_at.isoformat() if status.rsi70_drop_long_watch_expires_at else None,
+        "started_rsi": status.rsi70_drop_long_watch_started_rsi,
+        "started_price": status.rsi70_drop_long_watch_started_price,
+        "watch_reason": status.rsi70_drop_long_watch_reason,
+        "reason": reason,
+    }
+    if storage is not None:
+        storage.log_structured("INFO", event, payload)
+    else:
+        print(f"[INFO] {event} {payload}", flush=True)
+    status.rsi70_drop_long_watch_active = False
+    status.rsi70_drop_long_watch_started_at = None
+    status.rsi70_drop_long_watch_expires_at = None
+    status.rsi70_drop_long_watch_started_rsi = None
+    status.rsi70_drop_long_watch_started_price = None
+    status.rsi70_drop_long_watch_reason = ""
+    status.rsi70_drop_long_watch_started_bar_ts = None
+
+
+def start_rsi70_drop_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    ts: datetime,
+    rsi_now: float,
+    rsi_prev: float,
+    rsi_prev2: float,
+    current_price: float,
+    ma75: Optional[float],
+    ma75_slope_2m_value: Optional[float],
+    ma75_gap_ratio_value: Optional[float],
+    watch_minutes: int = 10,
+    original_reason: str = "short_b_drop_from_rsi70_ma75_up",
+) -> None:
+    status.rsi70_drop_long_watch_active = True
+    status.rsi70_drop_long_watch_started_at = ts
+    status.rsi70_drop_long_watch_expires_at = ts + timedelta(minutes=watch_minutes)
+    status.rsi70_drop_long_watch_started_rsi = rsi_now
+    status.rsi70_drop_long_watch_started_price = current_price
+    status.rsi70_drop_long_watch_reason = original_reason
+    status.rsi70_drop_long_watch_started_bar_ts = ts
+    payload = {
+        "ts": ts.isoformat(),
+        "rsi_now": rsi_now,
+        "rsi_prev": rsi_prev,
+        "rsi_prev2": rsi_prev2,
+        "rsi_drop_2m": rsi_prev2 - rsi_now,
+        "ma75": ma75,
+        "ma75_slope_2m": ma75_slope_2m_value,
+        "current_price": current_price,
+        "ma75_gap_ratio": ma75_gap_ratio_value,
+        "original_reason": original_reason,
+        "new_action": "LONG_WATCH",
+        "watch_started_at": status.rsi70_drop_long_watch_started_at.isoformat(),
+        "watch_expires_at": status.rsi70_drop_long_watch_expires_at.isoformat(),
+    }
+    if storage is not None:
+        storage.log_structured("INFO", "RSI70_DROP_LONG_WATCH_START", payload)
+        storage.log_structured("INFO", "RSI70_DROP_MA75_UP_LONG_WATCH_START", payload)
+    else:
+        print(f"[INFO] RSI70_DROP_LONG_WATCH_START {payload}", flush=True)
+
+
 def build_rsi9_prediction(
     bar1: Optional[Bar],
     history: list[Bar],
@@ -1801,6 +2071,8 @@ def build_rsi9_prediction(
     status: Optional[MonitorStatus] = None,
     storage: Optional[Storage] = None,
     allow_new_entry: bool = True,
+    rsi70_watch_config: Optional[dict[str, Any]] = None,
+    new_entry_cutoff_reached: bool = False,
 ) -> Optional[PredictionSnapshot]:
     if bar1 is None:
         return None
@@ -1855,11 +2127,61 @@ def build_rsi9_prediction(
             else:
                 print(f"[INFO] WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED {payload}", flush=True)
 
-    if open_pos is None and not in_no_entry:
+    rsi70_cfg = rsi70_watch_config if isinstance(rsi70_watch_config, dict) else {}
+    rsi70_watch_enabled = bool(rsi70_cfg.get("enabled", True))
+    rsi70_allow_same_bar_trigger = bool(rsi70_cfg.get("allow_same_bar_trigger", False))
+
+    if status is not None and status.rsi70_drop_long_watch_active:
+        if open_pos is not None:
+            clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "POSITION_OPEN")
+        elif status.rsi70_drop_long_watch_expires_at and bar1.ts > status.rsi70_drop_long_watch_expires_at:
+            clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_EXPIRED", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
+        elif new_entry_cutoff_reached:
+            clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "NEW_ENTRY_CUTOFF")
+        elif status.live_state in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
+            clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, f"LIVE_STATE_{status.live_state}")
+        elif status.entry_global_block_until and bar1.ts < status.entry_global_block_until:
+            clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "ENTRY_GLOBAL_BLOCK")
+
+    if open_pos is None and not in_no_entry and not new_entry_cutoff_reached:
         rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
         ma_ok = (bar1.ma5 is not None and bar1.ma25 is not None and bar1.ma75 is not None)
         long_a_start = rsi_now <= RSI9_LONG_ENTRY and rsi_prev <= RSI9_LONG_ENTRY
-        if ma_ok and allow_new_entry:
+        if status is not None and status.rsi70_drop_long_watch_active:
+            same_bar = status.rsi70_drop_long_watch_started_bar_ts == bar1.ts
+            can_trigger_same_bar = rsi70_allow_same_bar_trigger or not same_bar
+            ma5_recovered = bar1.ma5 is not None and bar1.close >= bar1.ma5
+            trigger_rule = ""
+            if allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_rsi_turn", True)) and rsi_now > rsi_prev:
+                trigger_rule = "long_watch_from_rsi70_drop_ma75_up_rsi_turn"
+            elif allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_ma5_recover", True)) and ma5_recovered:
+                trigger_rule = "long_watch_from_rsi70_drop_ma75_up_ma5_recover"
+            if trigger_rule:
+                blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, trigger_rule)
+                if blocked_reason is not None:
+                    clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "MA75_GAP_RECHECK_BLOCKED")
+                else:
+                    signal, side = "LONG_CANDIDATE", "LONG"
+                    entry_rule = trigger_rule
+                    if storage is not None:
+                        storage.log_structured(
+                            "INFO",
+                            "RSI70_DROP_LONG_WATCH_TRIGGERED",
+                            {
+                                "ts": bar1.ts.isoformat(),
+                                "rsi_now": rsi_now,
+                                "rsi_prev": rsi_prev,
+                                "watch_started_at": status.rsi70_drop_long_watch_started_at.isoformat() if status.rsi70_drop_long_watch_started_at else None,
+                                "watch_expires_at": status.rsi70_drop_long_watch_expires_at.isoformat() if status.rsi70_drop_long_watch_expires_at else None,
+                                "reason_3": trigger_rule,
+                                "ma5_recovered": ma5_recovered,
+                                "allow_same_bar_trigger": rsi70_allow_same_bar_trigger,
+                            },
+                        )
+                    clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, trigger_rule)
+            elif not allow_new_entry and storage is not None:
+                storage.log_structured("INFO", "RSI70_DROP_LONG_WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED", {"ts": bar1.ts.isoformat(), "rsi_now": rsi_now, "rsi_prev": rsi_prev})
+        if signal == "NO_ACTION" and ma_ok and allow_new_entry:
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
             if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
@@ -1868,9 +2190,50 @@ def build_rsi9_prediction(
                 ma75_2m_ago = history[-3].ma75 if len(history) >= 3 else None
                 if slope2m is not None and slope2m > 0:
                     if rsi_prev2 >= RSI9_SHORT_ENTRY:
-                        signal, side = "SHORT_CANDIDATE", "SHORT"
-                        entry_rule = "short_b_drop_from_rsi70_ma75_up"
-                        print(f"[INFO] DROP17_RSI70_MA75_UP_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} signal=SHORT_CANDIDATE reason_3=short_b_drop_from_rsi70_ma75_up", flush=True)
+                        original_reason = "short_b_drop_from_rsi70_ma75_up"
+                        blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, original_reason)
+                        if blocked_reason is not None:
+                            event_type = "ENTRY_BLOCKED_MA75_GAP_UNAVAILABLE" if gap_ratio is None else "RSI17_DROP_MA75_GAP_BLOCKED"
+                            log_ma75_gap_block(storage, event_type, bar1.ts, "SHORT", rsi_now, rsi_prev, rsi_prev2, bar1.close, bar1.ma75, gap_ratio, original_reason, blocked_reason)
+                            signal, side = "NO_ACTION", "NEUTRAL"
+                            entry_rule = blocked_reason
+                        else:
+                            signal, side = "NO_ACTION", "NEUTRAL"
+                            entry_rule = "short_b_drop_from_rsi70_ma75_up_disabled_long_watch"
+                            if status is not None and rsi70_watch_enabled and allow_new_entry and not status.rsi70_drop_long_watch_active:
+                                start_rsi70_drop_long_watch(
+                                    status,
+                                    storage,
+                                    bar1.ts,
+                                    rsi_now,
+                                    rsi_prev,
+                                    rsi_prev2,
+                                    bar1.close,
+                                    bar1.ma75,
+                                    slope2m,
+                                    gap_ratio,
+                                    watch_minutes=int(rsi70_cfg.get("watch_minutes", 10)),
+                                    original_reason=original_reason,
+                                )
+                            elif storage is not None:
+                                storage.log_structured(
+                                    "INFO",
+                                    "RSI70_DROP_SHORT_DISABLED_LONG_WATCH_START",
+                                    {
+                                        "ts": bar1.ts.isoformat(),
+                                        "rsi_now": rsi_now,
+                                        "rsi_prev": rsi_prev,
+                                        "rsi_prev2": rsi_prev2,
+                                        "rsi_drop_2m": rsi_prev2 - rsi_now,
+                                        "ma75": bar1.ma75,
+                                        "ma75_slope_2m": slope2m,
+                                        "current_price": bar1.close,
+                                        "ma75_gap_ratio": gap_ratio,
+                                        "original_reason": original_reason,
+                                        "new_action": "LONG_WATCH",
+                                        "watch_start_skipped_reason": "WATCH_ALREADY_ACTIVE_OR_ENTRY_NOT_ALLOWED",
+                                    },
+                                )
                     else:
                         signal, side = "LONG_CANDIDATE", "LONG"
                         entry_rule = "long_b_drop_ma75_up_all_ma_below_allowed" if all_ma_below else "long_b_drop_ma75_up"
@@ -1892,7 +2255,7 @@ def build_rsi9_prediction(
                     signal, side = "NO_ACTION", "NEUTRAL"
                     entry_rule = "drop17_ma75_flat_or_unknown"
                     print(f"[INFO] DROP17_MA75_SLOPE_SKIP rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
-                if entry_rule in RSI17_DROP_ENTRY_RULES:
+                if entry_rule in RSI17_DROP_ENTRY_RULES and entry_rule != "short_b_drop_from_rsi70_ma75_up":
                     original_entry_rule = entry_rule
                     original_side = side
                     blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, original_entry_rule)
@@ -1921,6 +2284,40 @@ def build_rsi9_prediction(
         if status is not None:
             if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                 pass
+            elif status.rsi70_drop_long_watch_active:
+                same_bar = status.rsi70_drop_long_watch_started_bar_ts == bar1.ts
+                can_trigger_same_bar = rsi70_allow_same_bar_trigger or not same_bar
+                ma5_recovered = bar1.ma5 is not None and bar1.close >= bar1.ma5
+                trigger_rule = ""
+                if allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_rsi_turn", True)) and rsi_now > rsi_prev:
+                    trigger_rule = "long_watch_from_rsi70_drop_ma75_up_rsi_turn"
+                elif allow_new_entry and can_trigger_same_bar and bool(rsi70_cfg.get("trigger_on_ma5_recover", True)) and ma5_recovered:
+                    trigger_rule = "long_watch_from_rsi70_drop_ma75_up_ma5_recover"
+                if trigger_rule:
+                    blocked_reason, gap_ratio = rsi17_drop_ma75_gap_block_reason(bar1.close, bar1.ma75, trigger_rule)
+                    if blocked_reason is not None:
+                        clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "MA75_GAP_RECHECK_BLOCKED")
+                    else:
+                        signal, side = "LONG_CANDIDATE", "LONG"
+                        entry_rule = trigger_rule
+                        if storage is not None:
+                            storage.log_structured(
+                                "INFO",
+                                "RSI70_DROP_LONG_WATCH_TRIGGERED",
+                                {
+                                    "ts": bar1.ts.isoformat(),
+                                    "rsi_now": rsi_now,
+                                    "rsi_prev": rsi_prev,
+                                    "watch_started_at": status.rsi70_drop_long_watch_started_at.isoformat() if status.rsi70_drop_long_watch_started_at else None,
+                                    "watch_expires_at": status.rsi70_drop_long_watch_expires_at.isoformat() if status.rsi70_drop_long_watch_expires_at else None,
+                                    "reason_3": trigger_rule,
+                                    "ma5_recovered": ma5_recovered,
+                                    "allow_same_bar_trigger": rsi70_allow_same_bar_trigger,
+                                },
+                            )
+                        clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, trigger_rule)
+                elif not allow_new_entry and storage is not None:
+                    storage.log_structured("INFO", "RSI70_DROP_LONG_WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED", {"ts": bar1.ts.isoformat(), "rsi_now": rsi_now, "rsi_prev": rsi_prev})
             elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
                 if allow_new_entry:
                     signal, side = "LONG_CANDIDATE", "LONG"
@@ -2138,15 +2535,73 @@ def _log_ma5_trailing_exit(
             "strategy": pos.strategy,
             "exit_reason": exit_reason,
             "entry_price": pos.entry_price,
+            "signal_price": f.price,
             "current_price": f.price,
+            "current_bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
             "current_bar_open": pos.trailing_ma5_bar_open,
             "confirmed_bar_close": confirmed_bar_close,
             "confirmed_ma5": pos.trailing_ma5_reference,
             "pnl_ticks": pnl_ticks,
             "bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
+            "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
             "relation": pos.trailing_ma5_open_relation,
+            "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
+            "exit_signal_ts": f.ts.isoformat(),
+            "reason_detail": {
+                "long_close_below": exit_reason == "MA5_CLOSE_BELOW_TRAILING" and pos.trailing_ma5_bar_open is not None and pos.trailing_ma5_reference is not None and pos.trailing_ma5_bar_open <= pos.trailing_ma5_reference and confirmed_bar_close is not None and confirmed_bar_close < pos.trailing_ma5_reference,
+                "short_close_above": exit_reason == "MA5_CLOSE_ABOVE_TRAILING" and pos.trailing_ma5_bar_open is not None and pos.trailing_ma5_reference is not None and pos.trailing_ma5_bar_open >= pos.trailing_ma5_reference and confirmed_bar_close is not None and confirmed_bar_close > pos.trailing_ma5_reference,
+                "intrabar_cross": exit_reason == "MA5_INTRABAR_CROSS_TRAILING",
+            },
         },
     )
+
+
+def should_defer_ma5_exit_by_hold_score(
+    pos: PositionState,
+    f: FeatureSnapshot,
+    pnl_ticks: float,
+    exit_reason_original: str,
+    hold_score_config: Optional[dict[str, Any]],
+    analysis_config: Optional[dict[str, Any]],
+    feature_metrics: Optional[dict[str, Any]],
+    storage: Optional[Storage],
+) -> bool:
+    cfg = hold_score_config if isinstance(hold_score_config, dict) else {}
+    analysis = analysis_config if isinstance(analysis_config, dict) else {}
+    if not cfg and not analysis.get("log_hold_score_when_disabled", True):
+        return False
+    metrics = feature_metrics or {}
+    score, components = hold_score_for_position(pos, f, metrics)
+    pos.last_hold_score = float(score)
+    if storage is not None and (bool(cfg.get("enabled", False)) or bool(analysis.get("log_hold_score_when_disabled", True))):
+        storage.log_structured("INFO", "HOLD_SCORE_CALCULATED", {"ts": f.ts.isoformat(), "side": pos.side, "score": score, "components": components, "exit_reason_original": exit_reason_original, "enabled": bool(cfg.get("enabled", False))})
+    if not bool(cfg.get("enabled", False)):
+        return False
+    if bool(cfg.get("long_only", True)) and pos.side != "LONG":
+        return False
+    max_skip = int(cfg.get("max_ma5_exit_skip_count", 1))
+    threshold = float(cfg.get("score_threshold", 8))
+    if score >= threshold and pos.ma5_exit_skip_count < max_skip:
+        pos.ma5_exit_skip_count += 1
+        pos.last_ma5_exit_deferred_ts = f.ts
+        if storage is not None:
+            storage.log_structured(
+                "INFO",
+                "MA5_EXIT_DEFERRED_BY_HOLD_SCORE",
+                {
+                    "ts": f.ts.isoformat(),
+                    "side": pos.side,
+                    "exit_reason_original": exit_reason_original,
+                    "hold_score": score,
+                    "components": components,
+                    "ma5_exit_skip_count": pos.ma5_exit_skip_count,
+                    "entry_price": pos.entry_price,
+                    "current_price": f.price,
+                    "pnl_ticks": pnl_ticks,
+                },
+            )
+        return True
+    return False
 
 
 def update_trailing_exit(
@@ -2157,6 +2612,9 @@ def update_trailing_exit(
     current_bar_bucket: Optional[datetime] = None,
     current_bar_open: Optional[float] = None,
     confirmed_bar1: Optional[Bar] = None,
+    hold_score_config: Optional[dict[str, Any]] = None,
+    analysis_config: Optional[dict[str, Any]] = None,
+    feature_metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str, float]:
     pnl_ticks = current_pnl_ticks(pos, f.price)
     # HARD_STOP_LOSS is intentionally the first ordinary exit check.  It is
@@ -2223,6 +2681,8 @@ def update_trailing_exit(
         relation = pos.trailing_ma5_open_relation
         confirmed_ma5 = pos.trailing_ma5_reference
         if pos.side == "LONG" and relation == "LONG_BELOW_OR_EQUAL_MA5" and bar1_new.close < confirmed_ma5:
+            if should_defer_ma5_exit_by_hold_score(pos, f, pnl_ticks, "MA5_CLOSE_BELOW_TRAILING", hold_score_config, analysis_config, feature_metrics, storage):
+                return False, "HOLD", pnl_ticks
             _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_CLOSE_BELOW_TRAILING", confirmed_bar_close=bar1_new.close)
             return True, "MA5_CLOSE_BELOW_TRAILING", pnl_ticks
         if pos.side == "SHORT" and relation == "SHORT_ABOVE_OR_EQUAL_MA5" and bar1_new.close > confirmed_ma5:
@@ -2244,6 +2704,8 @@ def update_trailing_exit(
     relation = pos.trailing_ma5_open_relation
     confirmed_ma5 = pos.trailing_ma5_reference
     if pos.side == "LONG" and relation == "LONG_ABOVE_MA5" and f.price <= confirmed_ma5:
+        if should_defer_ma5_exit_by_hold_score(pos, f, pnl_ticks, "MA5_INTRABAR_CROSS_TRAILING", hold_score_config, analysis_config, feature_metrics, storage):
+            return False, "HOLD", pnl_ticks
         _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_INTRABAR_CROSS_TRAILING")
         return True, "MA5_INTRABAR_CROSS_TRAILING", pnl_ticks
     if pos.side == "SHORT" and relation == "SHORT_BELOW_MA5" and f.price >= confirmed_ma5:
@@ -2262,6 +2724,9 @@ def should_exit(
     current_bar_bucket: Optional[datetime] = None,
     current_bar_open: Optional[float] = None,
     confirmed_bar1: Optional[Bar] = None,
+    hold_score_config: Optional[dict[str, Any]] = None,
+    analysis_config: Optional[dict[str, Any]] = None,
+    feature_metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str, float]:
     # Profit exits for STRAT_1M/STRAT_3M/RSI9 (including RSI17 special entries)
     # are managed by +10tick activation followed by confirmed-1m-MA5 exit rules.
@@ -2276,6 +2741,9 @@ def should_exit(
         current_bar_bucket=current_bar_bucket,
         current_bar_open=current_bar_open,
         confirmed_bar1=confirmed_bar1,
+        hold_score_config=hold_score_config,
+        analysis_config=analysis_config,
+        feature_metrics=feature_metrics,
     )
 
 
@@ -2631,6 +3099,110 @@ def position_quantities(positions: list[dict[str, Any]]) -> tuple[int, int, int]
     return leaves_qty, hold_qty, available_qty
 
 
+def _extract_fill_price_from_order_rows(rows: list[dict[str, Any]], order_id: str) -> tuple[Optional[float], str, Any]:
+    matched = [r for r in rows if not order_id or str(r.get("ID") or r.get("OrderId") or r.get("OrderID") or "") == str(order_id)]
+    if not matched:
+        matched = rows
+    weighted_value = 0.0
+    weighted_qty = 0.0
+    fallback_prices: list[float] = []
+    for row in matched:
+        details = row.get("Details") or row.get("details") or []
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                price = _safe_float(detail.get("Price") or detail.get("ExecutionPrice") or detail.get("ContractPrice"))
+                qty = _safe_float(detail.get("Qty") or detail.get("ExecutionQty") or detail.get("ContractQty"))
+                if price is not None:
+                    fallback_prices.append(price)
+                if price is not None and qty is not None and qty > 0:
+                    weighted_value += price * qty
+                    weighted_qty += qty
+        for key in ("AvgPrice", "ExecutionPrice", "ContractPrice", "Price"):
+            price = _safe_float(row.get(key))
+            if price is not None and price > 0:
+                fallback_prices.append(price)
+    if weighted_qty > 0:
+        return weighted_value / weighted_qty, "ORDER_DETAIL", matched
+    if fallback_prices:
+        return fallback_prices[-1], "ORDER_DETAIL", matched
+    return None, "", matched
+
+
+def resolve_actual_fill_price(
+    client: KabuApiClient,
+    storage: Optional[Storage],
+    order_id: str,
+    side: str,
+    qty: Optional[int] = None,
+    signal_price: Optional[float] = None,
+    limit_price: Optional[float] = None,
+) -> tuple[Optional[float], str]:
+    if not order_id:
+        return None, "ORDER_ID_MISSING"
+    try:
+        order_ids = [oid for oid in _split_order_ids(order_id) if oid]
+        rows: list[dict[str, Any]] = []
+        if len(order_ids) > 1:
+            for oid in order_ids:
+                rows.extend(client.get_orders(order_id=oid, product=2))
+        else:
+            rows = client.get_orders(order_id=order_ids[0] if order_ids else order_id, product=2)
+        actual_fill_price, source, raw_detail = _extract_fill_price_from_order_rows(rows, order_id)
+        if actual_fill_price is not None:
+            if storage is not None:
+                storage.log_structured(
+                    "INFO",
+                    "EXIT_ACTUAL_FILL_PRICE_RESOLVED",
+                    {
+                        "order_id": order_id,
+                        "side": side,
+                        "qty": qty,
+                        "signal_price": signal_price,
+                        "limit_price": limit_price,
+                        "actual_fill_price": actual_fill_price,
+                        "fill_source": source or "ORDER_DETAIL",
+                        "raw_order_detail_json": raw_detail,
+                    },
+                )
+            return actual_fill_price, source or "ORDER_DETAIL"
+        if storage is not None:
+            storage.log_structured(
+                "WARN",
+                "EXIT_ACTUAL_FILL_PRICE_UNAVAILABLE",
+                {
+                    "order_id": order_id,
+                    "side": side,
+                    "qty": qty,
+                    "signal_price": signal_price,
+                    "limit_price": limit_price,
+                    "actual_fill_price": None,
+                    "fill_source": "UNAVAILABLE",
+                    "raw_order_detail_json": rows,
+                    "error": "NO_EXECUTION_PRICE_IN_ORDER_DETAIL",
+                },
+            )
+        return None, "UNAVAILABLE"
+    except Exception as e:
+        if storage is not None:
+            storage.log_structured(
+                "WARN",
+                "EXIT_ACTUAL_FILL_PRICE_UNAVAILABLE",
+                {
+                    "order_id": order_id,
+                    "side": side,
+                    "qty": qty,
+                    "signal_price": signal_price,
+                    "limit_price": limit_price,
+                    "actual_fill_price": None,
+                    "fill_source": "UNAVAILABLE",
+                    "error": str(e),
+                },
+            )
+        return None, "UNAVAILABLE"
+
+
 def position_identity(position: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(position.get("ExecutionID") or ""),
@@ -2934,6 +3506,9 @@ def create_position_from_actual_position(
         trailing_ma5_bar_open=template_pos.trailing_ma5_bar_open,
         trailing_ma5_reference=template_pos.trailing_ma5_reference,
         trailing_ma5_open_relation=template_pos.trailing_ma5_open_relation,
+        ma5_exit_skip_count=template_pos.ma5_exit_skip_count,
+        last_ma5_exit_deferred_ts=template_pos.last_ma5_exit_deferred_ts,
+        last_hold_score=template_pos.last_hold_score,
         hard_stop_ticks=template_pos.hard_stop_ticks,
     )
 
@@ -3619,25 +4194,34 @@ def execute_live_exit(
     latest_snapshot: Optional[TickSnapshot] = None,
     force_marketable_limit: bool = False,
     force_market_order: bool = False,
+    exit_signal_ts: Optional[datetime] = None,
+    signal_price: Optional[float] = None,
+    pnl_ticks: Optional[float] = None,
+    ma5_exit_context: Optional[dict[str, Any]] = None,
 ) -> LiveOrderResult:
     exit_exec = config.get("exit_execution", {}) if isinstance(config.get("exit_execution", {}), dict) else {}
     retries = max(int(exit_exec.get("max_reprice_attempts", config.get("live_retry_max", LIVE_RETRY_MAX))), 0)
     timeout_sec = int(config.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC))
     context = order_context(config, side, pos, pred, status)
+    decision_ts = exit_signal_ts or now_jst()
     last = LiveOrderResult(False, "EXIT_UNKNOWN_ERROR", recoverable=True)
 
-    if not verify_position_before_exit(
-        client,
-        config,
-        storage,
-        status,
-        pos,
-        "FORCE_MARKET_ORDER" if force_market_order else "LIVE_EXIT",
-        now_jst(),
-    ):
-        if status.open_position is None and status.live_state == "FLAT":
-            return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
-        return LiveOrderResult(False, "POSITION_VERIFY_FAILED_BEFORE_EXIT", recoverable=True)
+    fast_exit_available = bool(pos.managed_execution_ids and pos.managed_close_positions)
+    if not fast_exit_available:
+        if not verify_position_before_exit(
+            client,
+            config,
+            storage,
+            status,
+            pos,
+            "FORCE_MARKET_ORDER" if force_market_order else "LIVE_EXIT",
+            now_jst(),
+        ):
+            if status.open_position is None and status.live_state == "FLAT":
+                return LiveOrderResult(True, "POSITION_ALREADY_CLOSED")
+            return LiveOrderResult(False, "POSITION_VERIFY_FAILED_BEFORE_EXIT", recoverable=True)
+    else:
+        storage.log_structured("INFO", "EXIT_POSITION_VERIFY_FAST_PATH", {**context, "decision_ts": decision_ts.isoformat(), "reason": "managed_execution_ids_available", "managed_execution_ids": list(pos.managed_execution_ids or [])})
 
     for attempt in range(retries + 1):
         positions = fetch_positions(client, config, storage, reason="EXIT_BUILD_CLOSE_POSITIONS")
@@ -3692,15 +4276,34 @@ def execute_live_exit(
                 front_order_type = 20
                 refreshed_snapshot = latest_snapshot
                 try:
+                    board_fetch_start_ts = now_jst()
                     raw_board = client.get_board(str(config.get("symbol", SYMBOL_DEFAULT)), int(config.get("exchange", EXCHANGE_DEFAULT)))
+                    board_fetch_ts = now_jst()
                     refreshed_snapshot = extract_snapshot(raw_board)
                     latest_snapshot = refreshed_snapshot
                 except Exception as e:
+                    board_fetch_ts = now_jst()
                     storage.log("WARN", "EXIT_BOARD_REFRESH_FAILED", f"attempt={attempt+1} side={side} strategy={pos.strategy} error={e}")
                 limit_price = marketable_exit_limit_price(pos, refreshed_snapshot)
                 exit_order_mode = "marketable_limit"
                 if limit_price is None or limit_price <= 0:
                     return LiveOrderResult(False, "MARKETABLE_EXIT_LIMIT_PRICE_UNAVAILABLE", recoverable=True)
+                storage.log_structured(
+                    "INFO",
+                    "EXIT_BOARD_SNAPSHOT_FOR_ORDER",
+                    {
+                        **context,
+                        "decision_ts": decision_ts.isoformat(),
+                        "board_fetch_ts": board_fetch_ts.isoformat(),
+                        "side": side,
+                        "best_bid": refreshed_snapshot.buy1_price if refreshed_snapshot else None,
+                        "best_ask": refreshed_snapshot.sell1_price if refreshed_snapshot else None,
+                        "current_price": refreshed_snapshot.price if refreshed_snapshot else None,
+                        "chosen_limit_price": limit_price,
+                        "limit_price_reason": exit_order_mode,
+                        "decision_to_board_ms": (board_fetch_ts - decision_ts).total_seconds() * 1000.0,
+                    },
+                )
             else:
                 front_order_type = None
                 limit_price = None
@@ -3731,8 +4334,11 @@ def execute_live_exit(
                 },
             )
             try:
+                order_send_ts = now_jst()
                 res = client.send_order(payload)
+                order_response_ts = now_jst()
             except Exception as e:
+                order_response_ts = now_jst()
                 ep = api_error_payload(e)
                 code = str(ep.get("api_code") or "")
                 storage.log_structured(
@@ -3755,6 +4361,24 @@ def execute_live_exit(
             order_id = str(res.get("OrderId") or res.get("OrderID") or "")
             storage.log_structured(
                 "INFO",
+                "EXIT_ORDER_SEND_TIMING",
+                {
+                    **context,
+                    "decision_ts": decision_ts.isoformat(),
+                    "order_send_ts": order_send_ts.isoformat(),
+                    "order_response_ts": order_response_ts.isoformat(),
+                    "decision_to_send_ms": (order_send_ts - decision_ts).total_seconds() * 1000.0,
+                    "send_to_response_ms": (order_response_ts - order_send_ts).total_seconds() * 1000.0,
+                    "decision_to_response_ms": (order_response_ts - decision_ts).total_seconds() * 1000.0,
+                    "order_id": order_id,
+                    "side": side,
+                    "exit_reason": ma5_exit_context.get("exit_reason") if isinstance(ma5_exit_context, dict) else None,
+                    "signal_price": signal_price,
+                    "limit_price": limit_price,
+                },
+            )
+            storage.log_structured(
+                "INFO",
                 "EXIT_ORDER_RESPONSE",
                 {**context, "attempt": attempt + 1, "position_exchange": position_exchange, "order_id": order_id, "raw_response_json": res},
             )
@@ -3762,11 +4386,13 @@ def execute_live_exit(
                 last = LiveOrderResult(False, f"EXIT_ORDER_ID_MISSING: {res}", recoverable=True)
                 break
             order_ids.append(order_id)
+            last = LiveOrderResult(False, "EXIT_ORDER_SENT", order_id=order_id, limit_price=limit_price, order_send_ts=order_send_ts, order_response_ts=order_response_ts, recoverable=True)
         if not order_ids:
             continue
         combined_order_id = ",".join(order_ids)
         if wait_for_managed_position_qty(client, config, pos, target_qty=0, timeout_sec=timeout_sec, comparator="eq", storage=storage, reason="EXIT_WAIT_MANAGED_FLAT"):
-            return LiveOrderResult(True, combined_order_id, order_id=combined_order_id)
+            fill_price, fill_source = resolve_actual_fill_price(client, storage, combined_order_id, side, qty=initial_leaves_qty, signal_price=signal_price, limit_price=last.limit_price)
+            return LiveOrderResult(True, combined_order_id, order_id=combined_order_id, limit_price=last.limit_price, order_send_ts=last.order_send_ts, order_response_ts=last.order_response_ts, actual_fill_price=fill_price, fill_source=fill_source)
         last = LiveOrderResult(False, f"EXIT_NOT_FILLED_TIMEOUT order_id={combined_order_id}", order_id=combined_order_id, recoverable=True)
         for order_id in order_ids:
             cancel_payload = {"OrderId": order_id}
@@ -3780,7 +4406,8 @@ def execute_live_exit(
                 storage.log_structured("WARN", "CANCEL_ORDER_FAIL", {**context, "order_id": order_id, **ep}, mirror_message=f"EXIT_CANCEL_FAIL order_id={order_id} Code={code} Message={ep.get('api_message')}")
                 if code == "43":
                     if wait_for_managed_position_qty(client, config, pos, target_qty=0, timeout_sec=timeout_sec, comparator="eq", storage=storage, reason="EXIT_CANCEL_WAIT_MANAGED_FLAT"):
-                        return LiveOrderResult(True, order_id, order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""))
+                        fill_price, fill_source = resolve_actual_fill_price(client, storage, order_id, side, qty=initial_leaves_qty, signal_price=signal_price, limit_price=last.limit_price)
+                        return LiveOrderResult(True, order_id, order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""), limit_price=last.limit_price, order_send_ts=last.order_send_ts, order_response_ts=last.order_response_ts, actual_fill_price=fill_price, fill_source=fill_source)
                     last = LiveOrderResult(False, f"EXIT_CANCEL_ALREADY_FILLED_VERIFY_POSITION order_id={order_id}", order_id=order_id, api_code=code, api_message=str(ep.get("api_message") or ""), recoverable=True)
                     break
         remaining_positions = fetch_positions(client, config, storage, reason="EXIT_REPRICE_REMAINING_QTY")
@@ -3792,7 +4419,8 @@ def execute_live_exit(
             {**context, "attempt": attempt + 1, "initial_leaves_qty": initial_leaves_qty, "remaining_leaves_qty": remaining_leaves_qty, "order_ids": order_ids},
         )
         if remaining_leaves_qty <= 0:
-            return LiveOrderResult(True, combined_order_id, order_id=combined_order_id)
+            fill_price, fill_source = resolve_actual_fill_price(client, storage, combined_order_id, side, qty=initial_leaves_qty, signal_price=signal_price, limit_price=last.limit_price)
+            return LiveOrderResult(True, combined_order_id, order_id=combined_order_id, limit_price=last.limit_price, order_send_ts=last.order_send_ts, order_response_ts=last.order_response_ts, actual_fill_price=fill_price, fill_source=fill_source)
     return last
 
 
@@ -4494,6 +5122,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 status.pending_add = False
                 if status.rsi20_long_watch_active:
                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", now_, None, None, "FORCE_CLOSE_TIME_REACHED")
+                if status.rsi70_drop_long_watch_active:
+                    clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", now_, None, None, "FORCE_CLOSE_TIME_REACHED")
                 if status.open_position is not None:
                     force_close_open_position(
                         client,
@@ -4548,9 +5178,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 storage.insert_feature(f)
                 # 15:20強制決済は上位ブロックで処理済み。ここでは新規停止フラグとして扱わない。
                 force_close_handled_above = False
+                entry_cutoff_reached = new_entry_cutoff_reached(config, tstr)
                 allow_new_entry = (
                     time_in_windows(tstr, TRADE_WINDOWS)
                     and not force_close_handled_above
+                    and not entry_cutoff_reached
                     and status.pending_entry_side is None
                     and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
                 )
@@ -4561,9 +5193,47 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     status=status,
                     storage=storage,
                     allow_new_entry=allow_new_entry,
+                    rsi70_watch_config=config.get("rsi70_drop_long_watch", {}),
+                    new_entry_cutoff_reached=entry_cutoff_reached,
                 )
                 if p is None:
                     continue
+                metrics = extended_feature_metrics(f, list(rb1.history))
+                analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals", {}), dict) else {}
+                feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries", {}), dict) else {}
+                feature_enabled = bool(feature_cfg.get("enabled", False))
+                feature_candidates: list[PredictionSnapshot] = []
+                if not entry_cutoff_reached and status.open_position is None and allow_new_entry:
+                    if bool(feature_cfg.get("long_vwap_volume_momentum", True)):
+                        if (
+                            metrics.get("abs_vwap_gap_bps") is not None
+                            and metrics.get("volume_ratio_20") is not None
+                            and metrics.get("ret5_ticks") is not None
+                            and metrics["abs_vwap_gap_bps"] < 20
+                            and metrics["volume_ratio_20"] >= 1.3
+                            and metrics["ret5_ticks"] >= 5
+                        ):
+                            feature_candidates.append(PredictionSnapshot(f.ts, "FEATURE_ENTRY", 0.5, 0.5, 0.5, 0.5, "LONG_CANDIDATE", p.rsi9_value, "FEATURE_ENTRY", f"ret5_ticks={metrics['ret5_ticks']:.2f}", "long_feature_vwap_volume_momentum"))
+                    if bool(feature_cfg.get("short_vwap_extended_fail", True)):
+                        if (
+                            metrics.get("abs_vwap_gap_bps") is not None
+                            and metrics.get("ret5_ticks") is not None
+                            and metrics.get("ret1_ticks") is not None
+                            and metrics["abs_vwap_gap_bps"] > 60
+                            and metrics["ret5_ticks"] >= 5
+                            and metrics["ret1_ticks"] <= -5
+                        ):
+                            feature_candidates.append(PredictionSnapshot(f.ts, "FEATURE_ENTRY", 0.5, 0.5, 0.5, 0.5, "SHORT_CANDIDATE", p.rsi9_value, "FEATURE_ENTRY", f"ret1_ticks={metrics['ret1_ticks']:.2f}", "short_feature_vwap_extended_fail"))
+                if feature_candidates:
+                    if feature_enabled and p.signal == "NO_ACTION":
+                        p = feature_candidates[0]
+                    elif bool(analysis_cfg.get("log_feature_candidates_when_disabled", True)):
+                        for fp in feature_candidates:
+                            storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})
+                if bool(config.get("big_trend_start_score", {}).get("enabled", False)) or bool(analysis_cfg.get("log_big_trend_score_when_disabled", True)):
+                    for score_side in ("LONG", "SHORT"):
+                        score, components = big_trend_start_score(score_side, f, metrics)
+                        storage.log_structured("INFO", "BIG_TREND_START_SCORE_CALCULATED", {"ts": f.ts.isoformat(), "side": score_side, "score": score, "components": components, **metrics})
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
@@ -4578,14 +5248,22 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 # RSI threshold hit on closed 1m bar -> execute on next 1m bar open (first tick)
                 if (not force_close_handled_above) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
                     if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
-                        status.pending_entry_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
-                        status.pending_entry_ts = f.ts
-                        storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
+                        pending_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
+                        if entry_cutoff_reached:
+                            log_new_entry_cutoff_block(storage, config, f.ts, effective_signal, p.reason_3, pending_side)
+                        else:
+                            status.pending_entry_side = pending_side
+                            status.pending_entry_ts = f.ts
+                            storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
 
                 if (not force_close_handled_above) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
                     add_ok, add_reason = should_rsi9_long_add(rb1.latest(), list(rb1.history), status.open_position)
                     if status.pending_exit:
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=PENDING_EXIT")
+                    elif add_ok and entry_cutoff_reached:
+                        status.pending_add = False
+                        log_new_entry_cutoff_block(storage, config, f.ts, "LONG_CANDIDATE", add_reason, "LONG")
+                        storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=NEW_ENTRY_CUTOFF")
                     elif add_ok and not status.pending_add:
                         status.pending_add = True
                         storage.log("INFO", "RSI9_LONG_ADD_PENDING", f"reason={add_reason}")
@@ -4603,8 +5281,10 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     elif status.live_state != "OPEN":
                         status.pending_add = False
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason=LIVE_STATE_{status.live_state}_PENDING_CLEARED")
-                    elif force_close_handled_above:
+                    elif force_close_handled_above or entry_cutoff_reached:
                         status.pending_add = False
+                        if entry_cutoff_reached:
+                            log_new_entry_cutoff_block(storage, config, f.ts, "LONG_CANDIDATE", "rsi10_add", "LONG")
                     else:
                         current_qty = get_open_position_qty(client, config, "LONG", margin_trade_type=pos_add.margin_trade_type) if config.get("live_mode") else int(pos_add.filled_qty)
                         if config.get("live_mode") and current_qty <= 0:
@@ -4638,6 +5318,11 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
 
                 if status.pending_entry_side and status.open_position is None:
                     if force_close_handled_above:
+                        status.pending_entry_side = None
+                        status.pending_entry_ts = None
+                    elif entry_cutoff_reached:
+                        side = status.pending_entry_side
+                        log_new_entry_cutoff_block(storage, config, f.ts, p.signal, p.reason_3, side or "")
                         status.pending_entry_side = None
                         status.pending_entry_ts = None
                     else:
@@ -4771,6 +5456,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 status.live_state = "OPEN"
                                                 if status.rsi20_long_watch_active:
                                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
+                                                if status.rsi70_drop_long_watch_active:
+                                                    clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
                                                 if candidate_pos.filled_qty >= int(config.get("order_qty", 2)):
                                                     storage.log("INFO", "ENTRY_FULLY_FILLED", f"side={side} filled_qty={candidate_pos.filled_qty}")
                                                 else:
@@ -4804,6 +5491,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 status.live_state = "OPEN"
                                 if status.rsi20_long_watch_active:
                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
+                                if status.rsi70_drop_long_watch_active:
+                                    clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
                                 status.last_entry_ts_by_side[side] = f.ts
                                 status.pending_entry_side = None
                                 mfe_ticks = 0.0
@@ -4856,6 +5545,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 current_bar_bucket=current_bar_bucket_1m,
                                 current_bar_open=current_bar_open_1m,
                                 confirmed_bar1=confirmed_bar1,
+                                hold_score_config=config.get("hold_score_extension", {}),
+                                analysis_config=analysis_cfg,
+                                feature_metrics=metrics,
                             )
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
@@ -4916,6 +5608,33 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
 
                         if ex:
                             exit_confirmed = True
+                            result: Optional[LiveOrderResult] = None
+                            exit_fill_source = "SIGNAL_PRICE_FALLBACK"
+                            exit_signal_ts = f.ts
+                            exit_signal_price = f.price
+                            ma5_exit_context = {
+                                "exit_reason": ex_reason,
+                                "current_bar_bucket": current_bar_bucket_1m.isoformat() if current_bar_bucket_1m else None,
+                                "current_bar_open": current_bar_open_1m,
+                                "confirmed_ma5": pos.trailing_ma5_reference,
+                                "confirmed_bar_close": bar1_new.close if bar1_new is not None else None,
+                                "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
+                            }
+                            storage.log_structured(
+                                "INFO",
+                                "EXIT_SIGNAL_DECISION",
+                                {
+                                    "decision_ts": exit_signal_ts.isoformat(),
+                                    "side": pos.side,
+                                    "strategy": pos.strategy,
+                                    "exit_reason": ex_reason,
+                                    "signal_price": exit_signal_price,
+                                    "pnl_ticks": pnl_ticks,
+                                    "entry_price": pos.entry_price,
+                                    "position_state": position_state_payload(pos),
+                                    "ma5_exit_context": ma5_exit_context,
+                                },
+                            )
                             if config["live_mode"]:
                                 if pos.take_profit_order_id and ex_reason not in {"TAKE_PROFIT", "TAKE_PROFIT_LIMIT_FILLED"}:
                                     context = order_context(config, pos.side, pos, p, status)
@@ -4959,6 +5678,10 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         latest_snapshot=snap,
                                         force_marketable_limit=(pos.strategy == "RSI9"),
                                         force_market_order=False,
+                                        exit_signal_ts=exit_signal_ts,
+                                        signal_price=exit_signal_price,
+                                        pnl_ticks=pnl_ticks,
+                                        ma5_exit_context=ma5_exit_context,
                                     )
                                     if not result.ok:
                                         exit_confirmed = False
@@ -4990,7 +5713,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             )
                                     else:
                                         pos.exit_order_id = result.order_id
-                                        pos.exit_fill_price = f.price
+                                        pos.exit_fill_price = result.actual_fill_price if result.actual_fill_price is not None else f.price
+                                        exit_fill_source = result.fill_source if result.actual_fill_price is not None else "SIGNAL_PRICE_FALLBACK"
                                         status.exit_fail_count = 0
                                         storage.log("INFO", "LIVE_EXIT_OK", f"{pos.side} order_id={result.order_id}")
                                         rem_qty = get_open_position_qty(client, config, pos.side, margin_trade_type=pos.margin_trade_type)
@@ -5012,6 +5736,23 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             ex_reason,
                                             pos.exit_fill_price,
                                         )
+                                        storage.log_structured(
+                                            "INFO",
+                                            "EXIT_FILL_DETAIL_RECORDED",
+                                            {
+                                                "order_id": result.order_id,
+                                                "exit_signal_price": exit_signal_price,
+                                                "exit_order_limit_price": result.limit_price,
+                                                "exit_actual_fill_price": result.actual_fill_price,
+                                                "exit_fill_source": exit_fill_source,
+                                                "exit_signal_ts": exit_signal_ts.isoformat(),
+                                                "exit_order_send_ts": result.order_send_ts.isoformat() if result.order_send_ts else None,
+                                                "exit_order_response_ts": result.order_response_ts.isoformat() if result.order_response_ts else None,
+                                            },
+                                        )
+                                else:
+                                    exit_fill_source = "PAPER_SIGNAL_PRICE"
+                                    pos.exit_fill_price = f.price
 
                             if exit_confirmed:
                                 holding_sec = (f.ts - pos.entry_ts).total_seconds()
@@ -5033,6 +5774,15 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     exit_reason=ex_reason,
                                     mfe_ticks=mfe_ticks,
                                     mae_ticks=mae_ticks,
+                                    exit_signal_price=exit_signal_price,
+                                    exit_order_limit_price=result.limit_price if result is not None else None,
+                                    exit_actual_fill_price=pos.exit_fill_price if config["live_mode"] else None,
+                                    exit_fill_source=exit_fill_source,
+                                    exit_signal_ts=exit_signal_ts.isoformat(),
+                                    exit_order_send_ts=result.order_send_ts.isoformat() if result is not None and result.order_send_ts else None,
+                                    exit_order_response_ts=result.order_response_ts.isoformat() if result is not None and result.order_response_ts else None,
+                                    exit_decision_to_send_ms=(result.order_send_ts - exit_signal_ts).total_seconds() * 1000.0 if result is not None and result.order_send_ts else None,
+                                    exit_order_id=result.order_id if result is not None else None,
                                 )
                                 closed_trades.append(
                                     ClosedTradeSummary(
@@ -5045,7 +5795,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     )
                                 )
                                 apply_light_loss_brake(adaptive, closed_trades, f, storage)
-                                if ex_reason in {"STOP_LOSS", "EDGE_BREAK_HARD"}:
+                                if ex_reason in {"STOP_LOSS", "EDGE_BREAK_HARD", "HARD_STOP_LOSS"}:
                                     status.reentry_block_until_by_side[pos.side] = f.ts + timedelta(
                                         seconds=REENTRY_AFTER_STOP_SEC
                                     )

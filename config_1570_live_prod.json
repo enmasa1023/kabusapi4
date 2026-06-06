@@ -86,5 +86,35 @@
     "enabled": true,
     "fallback_market_after_signal_sec": 180.0
   },
-  "force_close_after": "15:20:00"
+  "force_close_after": "15:20:00",
+  "new_entry_cutoff_time": "14:50:00",
+  "rsi70_drop_long_watch": {
+    "enabled": true,
+    "watch_minutes": 10,
+    "trigger_on_rsi_turn": true,
+    "trigger_on_ma5_recover": true,
+    "allow_same_bar_trigger": false
+  },
+  "feature_entries": {
+    "enabled": false,
+    "long_vwap_volume_momentum": true,
+    "short_vwap_extended_fail": true
+  },
+  "big_trend_start_score": {
+    "enabled": false,
+    "long_threshold": 8,
+    "short_threshold": 9
+  },
+  "hold_score_extension": {
+    "enabled": false,
+    "long_only": true,
+    "score_threshold": 8,
+    "release_threshold": 6,
+    "max_ma5_exit_skip_count": 1
+  },
+  "analysis_signals": {
+    "log_feature_candidates_when_disabled": true,
+    "log_big_trend_score_when_disabled": true,
+    "log_hold_score_when_disabled": true
+  }
 }
