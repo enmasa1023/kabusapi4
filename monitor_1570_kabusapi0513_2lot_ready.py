@@ -5488,11 +5488,101 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         for fp in feature_candidates:
                             storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})
                 big_trend_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score", {}), dict) else {}
-                log_big_trend_score = bool(big_trend_cfg.get("enabled", False)) or bool(analysis_cfg.get("log_big_trend_score_when_disabled", False))
+                big_trend_enabled = bool(big_trend_cfg.get("enabled", False))
+                log_big_trend_score = big_trend_enabled or bool(analysis_cfg.get("log_big_trend_score_when_disabled", False))
+                big_trend_score_rows: list[dict[str, Any]] = []
+                big_trend_used_for_entry = False
                 if log_big_trend_score and bar1_new is not None:
                     for score_side in ("LONG", "SHORT"):
                         score, components = big_trend_start_score(score_side, f, metrics)
-                        storage.log_structured("INFO", "BIG_TREND_START_SCORE_CALCULATED", {"ts": f.ts.isoformat(), "side": score_side, "score": score, "components": components, "log_reason": "enabled" if bool(big_trend_cfg.get("enabled", False)) else "disabled_log_1m_only", **metrics})
+                        threshold = int(big_trend_cfg.get("long_threshold", 8) if score_side == "LONG" else big_trend_cfg.get("short_threshold", 9))
+                        big_trend_score_rows.append({"side": score_side, "score": score, "threshold": threshold, "components": components})
+                    long_row = next((row for row in big_trend_score_rows if row["side"] == "LONG"), None)
+                    can_enter_ok, can_enter_reason = can_enter("LONG", f.ts, status)
+                    in_no_entry_for_big_trend = f.ts.hour == 9 and 0 <= f.ts.minute <= 15
+                    required_big_trend_metrics = (
+                        "ma75_slope_3m_ticks",
+                        "range20_ticks",
+                        "range30_ticks",
+                        "abs_vwap_gap_bps",
+                        "directional_range_position_30m_long",
+                    )
+                    metrics_available = all(metrics.get(k) is not None for k in required_big_trend_metrics) and f.vwap_gap_bps is not None
+                    spread_ok = f.spread_ticks <= 2.0
+                    if (
+                        big_trend_enabled
+                        and p.signal == "NO_ACTION"
+                        and long_row is not None
+                        and int(long_row["score"]) >= int(long_row["threshold"])
+                        and not entry_cutoff_reached
+                        and not in_no_entry_for_big_trend
+                        and time_in_windows(tstr, TRADE_WINDOWS)
+                        and status.open_position is None
+                        and allow_new_entry
+                        and can_enter_ok
+                        and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}
+                        and not (status.entry_global_block_until and f.ts < status.entry_global_block_until)
+                        and spread_ok
+                        and metrics_available
+                    ):
+                        p = PredictionSnapshot(
+                            f.ts,
+                            "BIG_TREND_START",
+                            0.5,
+                            0.5,
+                            0.5,
+                            0.5,
+                            "LONG_CANDIDATE",
+                            p.rsi9_value,
+                            "BIG_TREND_START",
+                            f"big_trend_score={int(long_row['score'])}",
+                            "big_trend_start_score_long",
+                        )
+                        big_trend_used_for_entry = True
+                        storage.log_structured(
+                            "INFO",
+                            "BIG_TREND_LONG_ENTRY_TRIGGERED",
+                            {
+                                "ts": f.ts.isoformat(),
+                                "signal": "LONG_CANDIDATE",
+                                "reason_1": "BIG_TREND_START",
+                                "reason_3": "big_trend_start_score_long",
+                                "score": long_row["score"],
+                                "threshold": long_row["threshold"],
+                                "components": long_row["components"],
+                                "current_price": f.price,
+                                "vwap": f.vwap,
+                                "vwap_gap_bps": f.vwap_gap_bps,
+                                "ma75_slope_3m_ticks": metrics.get("ma75_slope_3m_ticks"),
+                                "range20_ticks": metrics.get("range20_ticks"),
+                                "range30_ticks": metrics.get("range30_ticks"),
+                                "spread_ticks": f.spread_ticks,
+                                "can_enter_result": {"ok": can_enter_ok, "reason": can_enter_reason},
+                                "priority": 5,
+                            },
+                        )
+                    for row in big_trend_score_rows:
+                        storage.log_structured(
+                            "INFO",
+                            "BIG_TREND_START_SCORE_CALCULATED",
+                            {
+                                "ts": f.ts.isoformat(),
+                                "side": row["side"],
+                                "score": row["score"],
+                                "threshold": row["threshold"],
+                                "components": row["components"],
+                                "vwap_gap_bps": f.vwap_gap_bps,
+                                "abs_vwap_gap_bps": metrics.get("abs_vwap_gap_bps"),
+                                "ma75_slope_3m_ticks": metrics.get("ma75_slope_3m_ticks"),
+                                "range20_ticks": metrics.get("range20_ticks"),
+                                "range30_ticks": metrics.get("range30_ticks"),
+                                "directional_range_position_30m_long": metrics.get("directional_range_position_30m_long"),
+                                "spread_ticks": f.spread_ticks,
+                                "enabled": big_trend_enabled,
+                                "used_for_entry": bool(big_trend_used_for_entry and row["side"] == "LONG"),
+                                "log_reason": "enabled" if big_trend_enabled else "disabled_log_1m_only",
+                            },
+                        )
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
