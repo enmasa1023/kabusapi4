@@ -116,5 +116,12 @@
     "log_feature_candidates_when_disabled": true,
     "log_big_trend_score_when_disabled": false,
     "log_hold_score_when_disabled": true
+  },
+  "rsi17_drop_bullish_pullback_long_watch": {
+    "enabled": true,
+    "watch_minutes": 10,
+    "trigger_on_rsi_turn": true,
+    "trigger_on_ma5_recover": true,
+    "allow_same_bar_trigger": false
   }
 }

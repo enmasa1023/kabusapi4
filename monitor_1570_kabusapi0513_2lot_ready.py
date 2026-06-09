@@ -154,6 +154,152 @@ def load_config(path: Optional[str]) -> dict[str, Any]:
     return cfg
 
 
+
+
+NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
+    "volatility_regime_gate": {},
+    "entry_execution": {},
+    "take_profit_execution": {"enabled": True, "fallback_market_after_signal_sec": 180.0},
+    "scalping": {"enabled": SCALPING_ENABLED},
+    "rsi70_drop_long_watch": {
+        "enabled": True,
+        "watch_minutes": 10,
+        "trigger_on_rsi_turn": True,
+        "trigger_on_ma5_recover": True,
+        "allow_same_bar_trigger": False,
+    },
+    "rsi17_drop_bullish_pullback_long_watch": {
+        "enabled": True,
+        "watch_minutes": 10,
+        "trigger_on_rsi_turn": True,
+        "trigger_on_ma5_recover": True,
+        "allow_same_bar_trigger": False,
+    },
+    "feature_entries": {
+        "enabled": False,
+        "long_vwap_volume_momentum": True,
+        "short_vwap_extended_fail": True,
+    },
+    "big_trend_start_score": {
+        "enabled": False,
+        "long_threshold": 8,
+        "short_threshold": 9,
+    },
+    "hold_score_extension": {
+        "enabled": False,
+        "long_only": True,
+        "score_threshold": 8,
+        "release_threshold": 6,
+        "max_ma5_exit_skip_count": 1,
+    },
+    "analysis_signals": {
+        "log_feature_candidates_when_disabled": True,
+        "log_big_trend_score_when_disabled": False,
+        "log_hold_score_when_disabled": True,
+    },
+}
+
+
+def deep_merge_dict(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(defaults)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def build_runtime_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    order_qty = int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2))
+    runtime_config: dict[str, Any] = {
+        "config_path": args.config,
+        "config_file_loaded": bool(args.config),
+        "script_path": os.path.abspath(__file__),
+        "api_password": args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
+        "live_mode": (False if args.paper_mode else bool(args.live_mode or cfg.get("live_mode", True))),
+        "order_password": args.order_password or cfg.get("order_password") or args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
+        "order_qty": order_qty,
+        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", order_qty)),
+        "account_type": int(args.account_type if args.account_type is not None else cfg.get("account_type", 4)),
+        "margin_trade_type": int(args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3)),
+        "margin_trade_type_long": int(cfg.get("margin_trade_type_long", args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3))),
+        "margin_trade_type_short": int(cfg.get("margin_trade_type_short", 1)),
+        "entry_cash_margin": int(args.entry_cash_margin if args.entry_cash_margin is not None else cfg.get("entry_cash_margin", 2)),
+        "exit_cash_margin": int(args.exit_cash_margin if args.exit_cash_margin is not None else cfg.get("exit_cash_margin", 3)),
+        "entry_deliv_type": int(args.entry_deliv_type if args.entry_deliv_type is not None else cfg.get("entry_deliv_type", 0)),
+        "exit_deliv_type": int(args.exit_deliv_type if args.exit_deliv_type is not None else cfg.get("exit_deliv_type", 2)),
+        "entry_front_order_type": int(cfg.get("entry_front_order_type", 10)),
+        "exit_front_order_type": int(cfg.get("exit_front_order_type", 10)),
+        "entry_price": float(cfg.get("entry_price", 0)),
+        "exit_price": float(cfg.get("exit_price", 0)),
+        "expire_day": int(cfg.get("expire_day", 0)),
+        "live_entry_timeout_sec": int(args.live_entry_timeout_sec if args.live_entry_timeout_sec is not None else cfg.get("live_entry_timeout_sec", LIVE_ENTRY_TIMEOUT_SEC)),
+        "live_exit_timeout_sec": int(args.live_exit_timeout_sec if args.live_exit_timeout_sec is not None else cfg.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC)),
+        "live_retry_max": int(args.live_retry_max if args.live_retry_max is not None else cfg.get("live_retry_max", LIVE_RETRY_MAX)),
+        "entry_error_block_sec": int(cfg.get("entry_error_block_sec", ENTRY_ERROR_BLOCK_SEC)),
+        "recovery_cooldown_sec": int(cfg.get("recovery_cooldown_sec", RECOVERY_COOLDOWN_SEC)),
+        "adaptive_control": bool(cfg.get("adaptive_control", True)) and not bool(args.disable_adaptive_control),
+        "initial_vwap_mode": args.initial_vwap_mode or cfg.get("initial_vwap_mode", "2x"),
+        "outdir": args.outdir or cfg.get("outdir", "monitor_output"),
+        "runtime_minutes": args.runtime_minutes if args.runtime_minutes is not None else cfg.get("runtime_minutes"),
+        "base_url": args.base_url or cfg.get("base_url", API_BASE_DEFAULT),
+        "symbol": cfg.get("symbol", SYMBOL_DEFAULT),
+        "exchange": int(cfg.get("exchange", EXCHANGE_DEFAULT)),
+        "order_exchange": int(cfg.get("order_exchange", cfg.get("exchange", EXCHANGE_DEFAULT))),
+        "exit_order_exchange": int(cfg.get("exit_order_exchange", cfg.get("exchange", EXCHANGE_DEFAULT))),
+        "margin_entry_exchange": cfg.get("margin_entry_exchange"),
+        "poll_interval_sec": float(cfg.get("poll_interval_sec", POLL_INTERVAL_SEC)),
+        "console_status_interval_sec": float(cfg.get("console_status_interval_sec", CONSOLE_STATUS_INTERVAL_SEC)),
+        "force_close_after": str(cfg.get("force_close_after", FORCE_CLOSE_AFTER)),
+        "new_entry_cutoff_time": str(cfg.get("new_entry_cutoff_time", NEW_ENTRY_CUTOFF_TIME)),
+        "live_entry_overrides_long": cfg.get("live_entry_overrides_long", {}),
+        "live_entry_overrides_short": cfg.get("live_entry_overrides_short", {}),
+        "live_exit_overrides": cfg.get("live_exit_overrides", {}),
+    }
+    for key, defaults in NESTED_CONFIG_DEFAULTS.items():
+        raw_value = cfg.get(key, {})
+        runtime_config[key] = deep_merge_dict(defaults, raw_value if isinstance(raw_value, dict) else {})
+    return runtime_config
+
+
+def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
+    feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries"), dict) else {}
+    big_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score"), dict) else {}
+    hold_cfg = config.get("hold_score_extension", {}) if isinstance(config.get("hold_score_extension"), dict) else {}
+    rsi70_cfg = config.get("rsi70_drop_long_watch", {}) if isinstance(config.get("rsi70_drop_long_watch"), dict) else {}
+    analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals"), dict) else {}
+    return {
+        "config_path": config.get("config_path"),
+        "config_file_loaded": bool(config.get("config_file_loaded")),
+        "script_path": config.get("script_path", os.path.abspath(__file__)),
+        "symbol": config.get("symbol"),
+        "live_mode": bool(config.get("live_mode")),
+        "order_qty": config.get("order_qty"),
+        "order_exchange": config.get("order_exchange"),
+        "exit_order_exchange": config.get("exit_order_exchange"),
+        "margin_entry_exchange": config.get("margin_entry_exchange"),
+        "margin_trade_type_long": config.get("margin_trade_type_long"),
+        "margin_trade_type_short": config.get("margin_trade_type_short"),
+        "force_close_after": config.get("force_close_after"),
+        "new_entry_cutoff_time": config.get("new_entry_cutoff_time"),
+        "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
+        "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
+        "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
+        "big_trend_start_score_enabled": bool(big_cfg.get("enabled", False)),
+        "big_trend_long_threshold": big_cfg.get("long_threshold"),
+        "big_trend_short_threshold": big_cfg.get("short_threshold"),
+        "hold_score_extension_enabled": bool(hold_cfg.get("enabled", False)),
+        "hold_score_threshold": hold_cfg.get("score_threshold"),
+        "hold_score_release_threshold": hold_cfg.get("release_threshold"),
+        "hold_score_max_ma5_exit_skip_count": hold_cfg.get("max_ma5_exit_skip_count"),
+        "rsi70_drop_long_watch_enabled": bool(rsi70_cfg.get("enabled", False)),
+        "analysis_log_feature_candidates_when_disabled": bool(analysis_cfg.get("log_feature_candidates_when_disabled", False)),
+        "analysis_log_big_trend_score_when_disabled": bool(analysis_cfg.get("log_big_trend_score_when_disabled", False)),
+        "analysis_log_hold_score_when_disabled": bool(analysis_cfg.get("log_hold_score_when_disabled", False)),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", default=None)
@@ -642,6 +788,13 @@ class MonitorStatus:
     rsi70_drop_long_watch_started_price: Optional[float] = None
     rsi70_drop_long_watch_reason: str = ""
     rsi70_drop_long_watch_started_bar_ts: Optional[datetime] = None
+    rsi17_bullish_pullback_long_watch_active: bool = False
+    rsi17_bullish_pullback_long_watch_started_at: Optional[datetime] = None
+    rsi17_bullish_pullback_long_watch_expires_at: Optional[datetime] = None
+    rsi17_bullish_pullback_long_watch_started_rsi: Optional[float] = None
+    rsi17_bullish_pullback_long_watch_started_price: Optional[float] = None
+    rsi17_bullish_pullback_long_watch_reason: str = ""
+    rsi17_bullish_pullback_long_watch_started_bar_ts: Optional[datetime] = None
     force_close_state: str = ""
     failed_close_signature: str = ""
     failed_close_signature_ts: Optional[datetime] = None
@@ -2064,6 +2217,157 @@ def start_rsi70_drop_long_watch(
         print(f"[INFO] RSI70_DROP_LONG_WATCH_START {payload}", flush=True)
 
 
+def clear_rsi17_bullish_pullback_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    event: str,
+    ts: datetime,
+    rsi_now: Optional[float],
+    rsi_prev: Optional[float],
+    reason: str,
+) -> None:
+    payload = {
+        "ts": ts.isoformat(),
+        "started_at": status.rsi17_bullish_pullback_long_watch_started_at.isoformat() if status.rsi17_bullish_pullback_long_watch_started_at else None,
+        "expires_at": status.rsi17_bullish_pullback_long_watch_expires_at.isoformat() if status.rsi17_bullish_pullback_long_watch_expires_at else None,
+        "started_rsi": status.rsi17_bullish_pullback_long_watch_started_rsi,
+        "current_rsi": rsi_now,
+        "rsi_prev": rsi_prev,
+        "started_price": status.rsi17_bullish_pullback_long_watch_started_price,
+        "trigger_reason": reason,
+        "original_blocked_short_reason": status.rsi17_bullish_pullback_long_watch_reason,
+    }
+    if storage is not None:
+        storage.log_structured("INFO", event, payload)
+    else:
+        print(f"[INFO] {event} {payload}", flush=True)
+    status.rsi17_bullish_pullback_long_watch_active = False
+    status.rsi17_bullish_pullback_long_watch_started_at = None
+    status.rsi17_bullish_pullback_long_watch_expires_at = None
+    status.rsi17_bullish_pullback_long_watch_started_rsi = None
+    status.rsi17_bullish_pullback_long_watch_started_price = None
+    status.rsi17_bullish_pullback_long_watch_reason = ""
+    status.rsi17_bullish_pullback_long_watch_started_bar_ts = None
+
+
+def start_rsi17_bullish_pullback_long_watch(
+    status: MonitorStatus,
+    storage: Optional[Storage],
+    ts: datetime,
+    rsi_now: float,
+    rsi_prev: float,
+    rsi_prev2: float,
+    bar1: Bar,
+    watch_minutes: int = 10,
+    trigger_reason: str = "short_b_drop_ma75_down_bullish_structure_blocked",
+) -> None:
+    status.rsi17_bullish_pullback_long_watch_active = True
+    status.rsi17_bullish_pullback_long_watch_started_at = ts
+    status.rsi17_bullish_pullback_long_watch_expires_at = ts + timedelta(minutes=watch_minutes)
+    status.rsi17_bullish_pullback_long_watch_started_rsi = rsi_now
+    status.rsi17_bullish_pullback_long_watch_started_price = bar1.close
+    status.rsi17_bullish_pullback_long_watch_reason = trigger_reason
+    status.rsi17_bullish_pullback_long_watch_started_bar_ts = ts
+    payload = {
+        "started_at": ts.isoformat(),
+        "expires_at": status.rsi17_bullish_pullback_long_watch_expires_at.isoformat(),
+        "started_rsi": rsi_now,
+        "current_rsi": rsi_now,
+        "rsi_prev": rsi_prev,
+        "rsi_prev2": rsi_prev2,
+        "started_price": bar1.close,
+        "current_price": bar1.close,
+        "ma5": bar1.ma5,
+        "ma25": bar1.ma25,
+        "ma75": bar1.ma75,
+        "vwap": bar1.vwap,
+        "trigger_reason": trigger_reason,
+        "original_blocked_short_reason": "short_b_drop_ma75_down_bullish_structure_blocked",
+    }
+    if storage is not None:
+        storage.log_structured("INFO", "RSI17_BULLISH_PULLBACK_LONG_WATCH_START", payload)
+    else:
+        print(f"[INFO] RSI17_BULLISH_PULLBACK_LONG_WATCH_START {payload}", flush=True)
+
+
+def ma_slope_n(history: list[Bar], attr: str, bars_back: int) -> Optional[float]:
+    if len(history) <= bars_back:
+        return None
+    now_value = getattr(history[-1], attr, None)
+    prev_value = getattr(history[-1 - bars_back], attr, None)
+    if now_value is None or prev_value is None:
+        return None
+    return float(now_value) - float(prev_value)
+
+
+def short_b_drop_ma75_down_structure_decision(
+    bar1: Bar,
+    history: list[Bar],
+    feature: Optional[FeatureSnapshot],
+    rsi_now: float,
+    rsi_prev: float,
+    rsi_prev2: float,
+    ma75_slope_2m_value: Optional[float],
+) -> dict[str, Any]:
+    current_price = bar1.close
+    ma5 = bar1.ma5
+    ma25 = bar1.ma25
+    ma75 = bar1.ma75
+    vwap = bar1.vwap
+    regime = feature.regime if feature is not None else ""
+    vwap_gap_bps = feature.vwap_gap_bps if feature is not None else (((current_price - vwap) / vwap) * 10000.0 if vwap else None)
+    ma5_slope = ma_slope_n(history, "ma5", 1)
+    ma25_slope = ma_slope_n(history, "ma25", 1)
+    price_above_ma75 = ma75 is not None and current_price > ma75
+    ma5_gt_ma25 = ma5 is not None and ma25 is not None and ma5 > ma25
+    ma25_ge_ma75 = ma25 is not None and ma75 is not None and ma25 >= ma75
+    price_near_or_above_vwap = vwap is not None and current_price >= vwap * 0.998
+    price_le_ma75 = ma75 is not None and current_price <= ma75
+    vwap_weak = vwap is not None and ma5 is not None and ma25 is not None and current_price <= vwap and ma5 <= ma25
+    inverse_perfect = ma5 is not None and ma25 is not None and ma75 is not None and ((ma5 <= ma25 <= ma75) or (ma5 < ma25 and ma25 <= ma75))
+    trend_down_vwap = regime == "trend_down" and vwap is not None and current_price <= vwap
+    short_ma_weak = ma5 is not None and ma5_slope is not None and ma25_slope is not None and current_price <= ma5 and ma5_slope <= 0 and ma25_slope <= 0
+    bullish_structure = bool(
+        price_above_ma75
+        and ma5_gt_ma25
+        and ma25_ge_ma75
+        and price_near_or_above_vwap
+        and regime in {"", "trend_up"}
+    )
+    short_allowed = any([price_le_ma75, vwap_weak, inverse_perfect, trend_down_vwap, short_ma_weak]) and not bullish_structure
+    block_reason = ""
+    if not short_allowed:
+        block_reason = "short_b_drop_ma75_down_bullish_structure_blocked" if bullish_structure else "short_b_drop_ma75_down_weak_bearish_structure_blocked"
+    return {
+        "short_allowed": short_allowed,
+        "bullish_structure": bullish_structure,
+        "block_reason": block_reason,
+        "payload": {
+            "ts": bar1.ts.isoformat(),
+            "current_price": current_price,
+            "rsi_now": rsi_now,
+            "rsi_2min_ago": rsi_prev2,
+            "rsi_drop_2min": rsi_prev2 - rsi_now,
+            "ma5": ma5,
+            "ma25": ma25,
+            "ma75": ma75,
+            "ma75_2min_ago": history[-3].ma75 if len(history) >= 3 else None,
+            "ma75_slope_2min": ma75_slope_2m_value,
+            "ma5_slope": ma5_slope,
+            "ma25_slope": ma25_slope,
+            "vwap": vwap,
+            "vwap_gap_bps": vwap_gap_bps,
+            "regime": regime,
+            "price_above_ma75": price_above_ma75,
+            "ma5_gt_ma25": ma5_gt_ma25,
+            "ma25_ge_ma75": ma25_ge_ma75,
+            "price_near_or_above_vwap": price_near_or_above_vwap,
+            "block_reason": block_reason,
+            "would_have_reason_3": "short_b_drop_ma75_down",
+        },
+    }
+
+
 def build_rsi9_prediction(
     bar1: Optional[Bar],
     history: list[Bar],
@@ -2073,6 +2377,8 @@ def build_rsi9_prediction(
     allow_new_entry: bool = True,
     rsi70_watch_config: Optional[dict[str, Any]] = None,
     new_entry_cutoff_reached: bool = False,
+    rsi17_bullish_watch_config: Optional[dict[str, Any]] = None,
+    feature: Optional[FeatureSnapshot] = None,
 ) -> Optional[PredictionSnapshot]:
     if bar1 is None:
         return None
@@ -2130,6 +2436,9 @@ def build_rsi9_prediction(
     rsi70_cfg = rsi70_watch_config if isinstance(rsi70_watch_config, dict) else {}
     rsi70_watch_enabled = bool(rsi70_cfg.get("enabled", True))
     rsi70_allow_same_bar_trigger = bool(rsi70_cfg.get("allow_same_bar_trigger", False))
+    rsi17_watch_cfg = rsi17_bullish_watch_config if isinstance(rsi17_bullish_watch_config, dict) else {}
+    rsi17_bullish_watch_enabled = bool(rsi17_watch_cfg.get("enabled", True))
+    rsi17_bullish_allow_same_bar_trigger = bool(rsi17_watch_cfg.get("allow_same_bar_trigger", False))
 
     if status is not None and status.rsi70_drop_long_watch_active:
         if open_pos is not None:
@@ -2142,6 +2451,18 @@ def build_rsi9_prediction(
             clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, f"LIVE_STATE_{status.live_state}")
         elif status.entry_global_block_until and bar1.ts < status.entry_global_block_until:
             clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_CANCELLED", bar1.ts, rsi_now, rsi_prev, "ENTRY_GLOBAL_BLOCK")
+
+    if status is not None and status.rsi17_bullish_pullback_long_watch_active:
+        if open_pos is not None:
+            clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_CANCEL", bar1.ts, rsi_now, rsi_prev, "POSITION_OPEN")
+        elif status.rsi17_bullish_pullback_long_watch_expires_at and bar1.ts > status.rsi17_bullish_pullback_long_watch_expires_at:
+            clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_EXPIRE", bar1.ts, rsi_now, rsi_prev, "WATCH_TIMEOUT")
+        elif new_entry_cutoff_reached:
+            clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_CANCEL", bar1.ts, rsi_now, rsi_prev, "NEW_ENTRY_CUTOFF")
+        elif status.live_state in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED"}:
+            clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_CANCEL", bar1.ts, rsi_now, rsi_prev, f"LIVE_STATE_{status.live_state}")
+        elif status.entry_global_block_until and bar1.ts < status.entry_global_block_until:
+            clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_CANCEL", bar1.ts, rsi_now, rsi_prev, "ENTRY_GLOBAL_BLOCK")
 
     if open_pos is None and not in_no_entry and not new_entry_cutoff_reached:
         rsi_prev2 = rsi9_wilder(closes[:-2], RSI9_PERIOD) if len(closes) > RSI9_PERIOD + 2 else None
@@ -2181,9 +2502,60 @@ def build_rsi9_prediction(
                     clear_rsi70_drop_long_watch(status, storage, "RSI70_DROP_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, trigger_rule)
             elif not allow_new_entry and storage is not None:
                 storage.log_structured("INFO", "RSI70_DROP_LONG_WATCH_ACTIVE_BUT_ENTRY_NOT_ALLOWED", {"ts": bar1.ts.isoformat(), "rsi_now": rsi_now, "rsi_prev": rsi_prev})
+        if signal == "NO_ACTION" and status is not None and status.rsi17_bullish_pullback_long_watch_active:
+            same_bar = status.rsi17_bullish_pullback_long_watch_started_bar_ts == bar1.ts
+            can_trigger_same_bar = rsi17_bullish_allow_same_bar_trigger or not same_bar
+            ma5_recovered = bar1.ma5 is not None and bar1.close >= bar1.ma5
+            vwap_held = bar1.vwap is not None and bar1.close >= bar1.vwap and rsi_now >= rsi_prev
+            trigger_rule = ""
+            if allow_new_entry and can_trigger_same_bar and bool(rsi17_watch_cfg.get("trigger_on_rsi_turn", True)) and rsi_now > rsi_prev:
+                trigger_rule = "long_watch_from_rsi17_drop_bullish_pullback_rsi_turn"
+            elif allow_new_entry and can_trigger_same_bar and bool(rsi17_watch_cfg.get("trigger_on_ma5_recover", True)) and (ma5_recovered or vwap_held):
+                trigger_rule = "long_watch_from_rsi17_drop_bullish_pullback_ma5_recover"
+            if trigger_rule:
+                signal, side = "LONG_CANDIDATE", "LONG"
+                entry_rule = trigger_rule
+                payload = {
+                    "started_at": status.rsi17_bullish_pullback_long_watch_started_at.isoformat() if status.rsi17_bullish_pullback_long_watch_started_at else None,
+                    "expires_at": status.rsi17_bullish_pullback_long_watch_expires_at.isoformat() if status.rsi17_bullish_pullback_long_watch_expires_at else None,
+                    "started_rsi": status.rsi17_bullish_pullback_long_watch_started_rsi,
+                    "current_rsi": rsi_now,
+                    "rsi_prev": rsi_prev,
+                    "started_price": status.rsi17_bullish_pullback_long_watch_started_price,
+                    "current_price": bar1.close,
+                    "ma5": bar1.ma5,
+                    "ma25": bar1.ma25,
+                    "ma75": bar1.ma75,
+                    "vwap": bar1.vwap,
+                    "trigger_reason": trigger_rule,
+                    "original_blocked_short_reason": status.rsi17_bullish_pullback_long_watch_reason,
+                    "allow_same_bar_trigger": rsi17_bullish_allow_same_bar_trigger,
+                }
+                if storage is not None:
+                    storage.log_structured("INFO", "RSI17_BULLISH_PULLBACK_LONG_WATCH_TRIGGER", payload)
+                clear_rsi17_bullish_pullback_long_watch(status, storage, "RSI17_BULLISH_PULLBACK_LONG_WATCH_CANCEL", bar1.ts, rsi_now, rsi_prev, "TRIGGERED")
         if signal == "NO_ACTION" and ma_ok and allow_new_entry:
             short_ma = bar1.ma5 > bar1.ma25 > bar1.ma75
             all_ma_below = (bar1.close <= (bar1.ma5 or -1e18)) and (bar1.close <= (bar1.ma25 or -1e18)) and (bar1.close <= (bar1.ma75 or -1e18))
+            if rsi_prev2 is not None and 15.0 <= (rsi_prev2 - rsi_now) < 17.0 and storage is not None:
+                storage.log_structured(
+                    "INFO",
+                    "RSI_DROP_NEAR_MISS",
+                    {
+                        "ts": bar1.ts.isoformat(),
+                        "rsi_now": rsi_now,
+                        "rsi_2min_ago": rsi_prev2,
+                        "rsi_drop_2min": rsi_prev2 - rsi_now,
+                        "threshold": 17.0,
+                        "ma75_slope": ma75_slope_2m(history),
+                        "price": bar1.close,
+                        "ma5": bar1.ma5,
+                        "ma25": bar1.ma25,
+                        "ma75": bar1.ma75,
+                        "vwap": bar1.vwap,
+                        "would_have_side_if_threshold_met": "LONG" if (ma75_slope_2m(history) or 0) > 0 else "SHORT",
+                    },
+                )
             if rsi_prev2 is not None and (rsi_prev2 - rsi_now) >= 17.0:
                 slope2m = ma75_slope_2m(history)
                 ma75_current = history[-1].ma75 if len(history) >= 1 else None
@@ -2248,9 +2620,39 @@ def build_rsi9_prediction(
                         entry_rule = "short_b_drop_ma75_down_rsi_rebound_blocked"
                         print(f"[INFO] DROP17_MA75_SLOPE_SHORT_BLOCKED_RSI_REBOUND rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m} reason_3=short_b_drop_ma75_down_rsi_rebound_blocked", flush=True)
                     else:
-                        signal, side = "SHORT_CANDIDATE", "SHORT"
-                        entry_rule = "short_b_drop_ma75_down"
-                        print(f"[INFO] DROP17_MA75_SLOPE_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                        structure_decision = short_b_drop_ma75_down_structure_decision(bar1, history, feature, rsi_now, rsi_prev, rsi_prev2, slope2m)
+                        if structure_decision.get("short_allowed"):
+                            signal, side = "SHORT_CANDIDATE", "SHORT"
+                            entry_rule = "short_b_drop_ma75_down"
+                            print(f"[INFO] DROP17_MA75_SLOPE_SHORT rsi_now={rsi_now:.2f} rsi_prev={rsi_prev:.2f} rsi_prev2={rsi_prev2:.2f} ma75_current={ma75_current} ma75_2m_ago={ma75_2m_ago} ma75_slope_2m={slope2m}", flush=True)
+                        else:
+                            signal, side = "NO_ACTION", "NEUTRAL"
+                            entry_rule = str(structure_decision.get("block_reason") or "short_b_drop_ma75_down_weak_bearish_structure_blocked")
+                            event_type = "SHORT_B_DROP_MA75_DOWN_BLOCKED_BY_BULLISH_STRUCTURE" if structure_decision.get("bullish_structure") else "SHORT_B_DROP_MA75_DOWN_BLOCKED_BY_STRUCTURE"
+                            if storage is not None:
+                                storage.log_structured("INFO", event_type, structure_decision.get("payload", {}))
+                            print(f"[INFO] {event_type} rsi_now={rsi_now:.2f} rsi_prev2={rsi_prev2:.2f} reason_3={entry_rule}", flush=True)
+                            if (
+                                structure_decision.get("bullish_structure")
+                                and status is not None
+                                and rsi17_bullish_watch_enabled
+                                and allow_new_entry
+                                and not status.rsi17_bullish_pullback_long_watch_active
+                                and status.live_state == "FLAT"
+                                and open_pos is None
+                                and not new_entry_cutoff_reached
+                            ):
+                                start_rsi17_bullish_pullback_long_watch(
+                                    status,
+                                    storage,
+                                    bar1.ts,
+                                    rsi_now,
+                                    rsi_prev,
+                                    rsi_prev2,
+                                    bar1,
+                                    watch_minutes=int(rsi17_watch_cfg.get("watch_minutes", 10)),
+                                    trigger_reason=entry_rule,
+                                )
                 else:
                     signal, side = "NO_ACTION", "NEUTRAL"
                     entry_rule = "drop17_ma75_flat_or_unknown"
@@ -2534,6 +2936,9 @@ def should_defer_ma5_exit_by_hold_score(
 ) -> bool:
     cfg = hold_score_config if isinstance(hold_score_config, dict) else {}
     analysis = analysis_config if isinstance(analysis_config, dict) else {}
+    enabled = bool(cfg.get("enabled", False))
+    if storage is not None:
+        storage.log_structured("INFO", "HOLD_SCORE_EXTENSION_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": enabled, "raw_config_value": cfg.get("enabled"), "effective_value": enabled, "reason_if_disabled": "" if enabled else "hold_score_extension.enabled_false_or_missing"})
     if not cfg and not analysis.get("log_hold_score_when_disabled", True):
         return False
     metrics = feature_metrics or {}
@@ -5724,6 +6129,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     storage = Storage(db_path)
     storage.log("INFO", "START", "monitor start")
     storage.log_structured("INFO", "STARTUP_CONFIG", {"live_mode": config.get("live_mode"), "order_qty": config.get("order_qty"), "entry_min_fill_qty": config.get("entry_min_fill_qty"), "order_exchange": config.get("order_exchange"), "exit_order_exchange": config.get("exit_order_exchange")})
+    startup_payload = startup_config_effective_payload(config)
+    storage.log_structured("INFO", "STARTUP_CONFIG_EFFECTIVE", startup_payload)
+    print(f"STARTUP_CONFIG_EFFECTIVE {json.dumps(startup_payload, ensure_ascii=False, sort_keys=True)}", flush=True)
 
     client = KabuApiClient(config["base_url"])
     status = MonitorStatus()
@@ -5901,6 +6309,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     allow_new_entry=allow_new_entry,
                     rsi70_watch_config=config.get("rsi70_drop_long_watch", {}),
                     new_entry_cutoff_reached=entry_cutoff_reached,
+                    rsi17_bullish_watch_config=config.get("rsi17_drop_bullish_pullback_long_watch", {}),
+                    feature=f,
                 )
                 if p is None:
                     continue
@@ -5908,6 +6318,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals", {}), dict) else {}
                 feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries", {}), dict) else {}
                 feature_enabled = bool(feature_cfg.get("enabled", False))
+                if bar1_new is not None:
+                    storage.log_structured("INFO", "FEATURE_ENTRY_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": feature_enabled, "raw_config_value": feature_cfg.get("enabled"), "effective_value": feature_enabled, "reason_if_disabled": "" if feature_enabled else "feature_entries.enabled_false_or_missing"})
                 feature_candidates: list[PredictionSnapshot] = []
                 if not entry_cutoff_reached and status.open_position is None and allow_new_entry:
                     if bool(feature_cfg.get("long_vwap_volume_momentum", True)):
@@ -5954,6 +6366,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})
                 big_trend_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score", {}), dict) else {}
                 big_trend_enabled = bool(big_trend_cfg.get("enabled", False))
+                if bar1_new is not None:
+                    storage.log_structured("INFO", "BIG_TREND_START_SCORE_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": big_trend_enabled, "raw_config_value": big_trend_cfg.get("enabled"), "effective_value": big_trend_enabled, "reason_if_disabled": "" if big_trend_enabled else "big_trend_start_score.enabled_false_or_missing"})
                 log_big_trend_score = big_trend_enabled or bool(analysis_cfg.get("log_big_trend_score_when_disabled", False))
                 big_trend_score_rows: list[dict[str, Any]] = []
                 big_trend_used_for_entry = False
@@ -6048,6 +6462,24 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 "log_reason": "enabled" if big_trend_enabled else "disabled_log_1m_only",
                             },
                         )
+                if bar1_new is not None:
+                    storage.log_structured(
+                        "INFO",
+                        "SIGNAL_PRIORITY_DECISION",
+                        {
+                            "ts": f.ts.isoformat(),
+                            "rsi_signal": p.signal if p.reason_1 == "RSI9_ONLY" else "NO_ACTION",
+                            "feature_signal": feature_candidates[0].signal if feature_candidates else "NO_ACTION",
+                            "big_trend_signal": "LONG_CANDIDATE" if big_trend_used_for_entry else "NO_ACTION",
+                            "final_signal": p.signal,
+                            "blocked_signal": "SHORT_CANDIDATE" if p.reason_3 == "short_b_drop_ma75_down_bullish_structure_blocked" else "",
+                            "block_reason": p.reason_3 if "blocked" in p.reason_3 else "",
+                            "bullish_structure_score": 1 if p.reason_3 in {"short_b_drop_ma75_down_bullish_structure_blocked", "long_watch_from_rsi17_drop_bullish_pullback_rsi_turn", "long_watch_from_rsi17_drop_bullish_pullback_ma5_recover"} else 0,
+                            "bearish_structure_score": 1 if p.reason_3 == "short_b_drop_ma75_down" else 0,
+                            "reason_3_before": p.reason_3,
+                            "reason_3_after": p.reason_3,
+                        },
+                    )
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
@@ -6730,50 +7162,7 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     apply_runtime_threshold_overrides(cfg)
-    config = {
-        "api_password": args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "live_mode": (False if args.paper_mode else bool(args.live_mode or cfg.get("live_mode", True))),
-        "order_password": args.order_password or cfg.get("order_password") or args.api_password or cfg.get("api_password") or API_PASSWORD_HARDCODED,
-        "order_qty": int(args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)),
-        "entry_min_fill_qty": int(cfg.get("entry_min_fill_qty", (args.order_qty if args.order_qty is not None else cfg.get("order_qty", 2)))),
-        "account_type": int(args.account_type if args.account_type is not None else cfg.get("account_type", 4)),
-        "margin_trade_type": int(args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3)),
-        "margin_trade_type_long": int(cfg.get("margin_trade_type_long", args.margin_trade_type if args.margin_trade_type is not None else cfg.get("margin_trade_type", 3))),
-        "margin_trade_type_short": int(cfg.get("margin_trade_type_short", 1)),
-        "entry_cash_margin": int(args.entry_cash_margin if args.entry_cash_margin is not None else cfg.get("entry_cash_margin", 2)),
-        "exit_cash_margin": int(args.exit_cash_margin if args.exit_cash_margin is not None else cfg.get("exit_cash_margin", 3)),
-        "entry_deliv_type": int(args.entry_deliv_type if args.entry_deliv_type is not None else cfg.get("entry_deliv_type", 0)),
-        "exit_deliv_type": int(args.exit_deliv_type if args.exit_deliv_type is not None else cfg.get("exit_deliv_type", 2)),
-        "entry_front_order_type": int(cfg.get("entry_front_order_type", 10)),
-        "exit_front_order_type": int(cfg.get("exit_front_order_type", 10)),
-        "entry_price": float(cfg.get("entry_price", 0)),
-        "exit_price": float(cfg.get("exit_price", 0)),
-        "expire_day": int(cfg.get("expire_day", 0)),
-        "live_entry_timeout_sec": int(args.live_entry_timeout_sec if args.live_entry_timeout_sec is not None else cfg.get("live_entry_timeout_sec", LIVE_ENTRY_TIMEOUT_SEC)),
-        "live_exit_timeout_sec": int(args.live_exit_timeout_sec if args.live_exit_timeout_sec is not None else cfg.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC)),
-        "live_retry_max": int(args.live_retry_max if args.live_retry_max is not None else cfg.get("live_retry_max", LIVE_RETRY_MAX)),
-        "entry_error_block_sec": int(cfg.get("entry_error_block_sec", ENTRY_ERROR_BLOCK_SEC)),
-        "recovery_cooldown_sec": int(cfg.get("recovery_cooldown_sec", RECOVERY_COOLDOWN_SEC)),
-        "adaptive_control": bool(cfg.get("adaptive_control", True)) and not bool(args.disable_adaptive_control),
-        "initial_vwap_mode": args.initial_vwap_mode or cfg.get("initial_vwap_mode", "2x"),
-        "outdir": args.outdir or cfg.get("outdir", "monitor_output"),
-        "runtime_minutes": args.runtime_minutes if args.runtime_minutes is not None else cfg.get("runtime_minutes"),
-        "base_url": args.base_url or cfg.get("base_url", API_BASE_DEFAULT),
-        "symbol": cfg.get("symbol", SYMBOL_DEFAULT),
-        "exchange": int(cfg.get("exchange", EXCHANGE_DEFAULT)),
-        "order_exchange": int(cfg.get("order_exchange", cfg.get("exchange", EXCHANGE_DEFAULT))),
-        "exit_order_exchange": int(cfg.get("exit_order_exchange", cfg.get("exchange", EXCHANGE_DEFAULT))),
-        "margin_entry_exchange": cfg.get("margin_entry_exchange"),
-        "poll_interval_sec": float(cfg.get("poll_interval_sec", POLL_INTERVAL_SEC)),
-        "console_status_interval_sec": float(cfg.get("console_status_interval_sec", CONSOLE_STATUS_INTERVAL_SEC)),
-        "live_entry_overrides_long": cfg.get("live_entry_overrides_long", {}),
-        "live_entry_overrides_short": cfg.get("live_entry_overrides_short", {}),
-        "live_exit_overrides": cfg.get("live_exit_overrides", {}),
-        "volatility_regime_gate": cfg.get("volatility_regime_gate", {}),
-        "entry_execution": cfg.get("entry_execution", {}),
-        "take_profit_execution": cfg.get("take_profit_execution", {"enabled": True, "fallback_market_after_signal_sec": 5.0}),
-        "scalping": cfg.get("scalping", {"enabled": SCALPING_ENABLED}),
-    }
+    config = build_runtime_config(cfg, args)
     afternoon_trade_start = str(cfg.get("afternoon_trade_start", "12:30:00"))
     globals()["TRADE_WINDOWS"] = [
         ("09:03:00", "11:25:00"),
