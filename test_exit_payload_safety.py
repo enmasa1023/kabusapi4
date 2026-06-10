@@ -5,7 +5,11 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     PositionState,
     build_exit_order_payload,
     close_position_groups_from_managed_state,
+    TickSnapshot,
+    Bar,
+    FeatureSnapshot,
     execute_live_exit,
+    update_trailing_exit,
     validate_exit_payload,
 )
 
@@ -25,6 +29,13 @@ class FakeClient:
         self.sent_payloads = []
     def get_positions(self, symbol):
         return self.positions
+    def get_board(self, symbol, exchange):
+        return {
+            "CurrentPrice": 69005,
+            "VWAP": 69000,
+            "Buy1": {"Price": 69000, "Qty": 10},
+            "Sell1": {"Price": 69010, "Qty": 10},
+        }
     def send_order(self, payload):
         self.sent_payloads.append(payload)
         if len(self.sent_payloads) == 1:
@@ -52,7 +63,7 @@ def base_config():
         "exit_cash_margin": 3,
         "exit_deliv_type": 2,
         "account_type": 4,
-        "exit_front_order_type": 20,
+        "exit_front_order_type": 10,
         "exit_price": 0,
         "expire_day": 0,
         "margin_trade_type": 3,
@@ -145,3 +156,77 @@ def test_hard_stop_code8_uses_emergency_rebuild_not_backoff():
     event_types = [e[1] for e in storage.events]
     assert "HARD_STOP_CODE8_EMERGENCY_REBUILD" in event_types
     assert "EXIT_PENDING_STATE_RESET_AFTER_SEND_FAIL" in event_types
+
+
+def test_ma5_intrabar_exit_uses_best_bid_limit_even_when_config_market():
+    cfg = base_config()
+    pos = base_position(exchange=27, qty=2)
+    pos.strategy = "TEST"
+    status = Status()
+    status.open_position = pos
+    client = FakeClient(pos.managed_close_positions)
+    # This test is about the first payload, so make the first send succeed.
+    client.send_order = lambda payload: (client.sent_payloads.append(payload) or {"OrderId": "ok"})
+    storage = FakeStorage()
+    result = execute_live_exit(
+        client,
+        cfg,
+        "LONG",
+        storage,
+        pos,
+        None,
+        status,
+        force_marketable_limit=False,
+        force_market_order=False,
+        signal_price=69000.0,
+        pnl_ticks=52.0,
+        ma5_exit_context={"exit_reason": "MA5_INTRABAR_CROSS_TRAILING", "confirmed_ma5": 69006.0},
+    )
+    assert result.order_id == "ok"
+    payload = client.sent_payloads[0]
+    assert payload["FrontOrderType"] == 20
+    assert payload["Price"] == 69000
+    assert payload["CashMargin"] == 3
+    assert payload["DelivType"] == 2
+    assert payload.get("ClosePositions")
+    assert payload.get("ClosePositionOrder") in (None, "", 0)
+    assert any(e[1] == "MA5_EXIT_LIMIT_PRICE_SELECTED" for e in storage.events)
+
+
+def _feature_for_exit(ts, price):
+    return FeatureSnapshot(ts, price, 69000.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 1000, 3000, 10.0, "trend_up")
+
+
+def test_ma5_close_below_uses_finalized_bar_ma5_immediately():
+    pos = base_position(exchange=27, qty=2)
+    pos.trailing_active = True
+    pos.trailing_ma5_bar_bucket = datetime(2026, 6, 10, 9, 31)
+    pos.trailing_ma5_bar_open = 69000.0
+    pos.trailing_ma5_reference = 68980.0
+    pos.trailing_ma5_open_relation = "LONG_BELOW_OR_EQUAL_MA5"
+    storage = FakeStorage()
+    finalized = Bar(pos.trailing_ma5_bar_bucket, 69000.0, 69020.0, 68980.0, 69000.0, 1000, 69000.0, ma5=69006.0)
+    ex, reason, _ = update_trailing_exit(pos, _feature_for_exit(finalized.ts, 69000.0), bar1_new=finalized, storage=storage)
+    assert ex is True
+    assert reason == "MA5_CLOSE_BELOW_TRAILING"
+    event = next(e for e in storage.events if e[1] == "MA5_CLOSE_EXIT_EVALUATED_WITH_FINALIZED_MA5")
+    assert event[2]["finalized_ma5"] == 69006.0
+    assert event[2]["used_ma5_source"] == "finalized_bar_ma5"
+
+
+def test_ma5_close_above_uses_finalized_bar_ma5_immediately_for_short():
+    pos = base_position(exchange=27, qty=2)
+    pos.side = "SHORT"
+    pos.entry_price = 69160.0
+    pos.trailing_active = True
+    pos.trailing_ma5_bar_bucket = datetime(2026, 6, 10, 9, 31)
+    pos.trailing_ma5_bar_open = 69000.0
+    pos.trailing_ma5_reference = 69020.0
+    pos.trailing_ma5_open_relation = "SHORT_ABOVE_OR_EQUAL_MA5"
+    storage = FakeStorage()
+    finalized = Bar(pos.trailing_ma5_bar_bucket, 69000.0, 69040.0, 68980.0, 69010.0, 1000, 69000.0, ma5=69006.0)
+    ex, reason, _ = update_trailing_exit(pos, _feature_for_exit(finalized.ts, 69010.0), bar1_new=finalized, storage=storage)
+    assert ex is True
+    assert reason == "MA5_CLOSE_ABOVE_TRAILING"
+    event = next(e for e in storage.events if e[1] == "MA5_CLOSE_EXIT_EVALUATED_WITH_FINALIZED_MA5")
+    assert event[2]["finalized_ma5"] == 69006.0

@@ -101,7 +101,7 @@
     "short_vwap_extended_fail": true
   },
   "big_trend_start_score": {
-    "enabled": true,
+    "enabled": false,
     "long_threshold": 8,
     "short_threshold": 9
   },

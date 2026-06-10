@@ -74,11 +74,11 @@ def test_runtime_config_preserves_enabled_nested_settings():
     runtime = build_runtime_config(cfg, _args())
     payload = startup_config_effective_payload(runtime)
     assert runtime["feature_entries"]["enabled"] is True
-    assert runtime["big_trend_start_score"]["enabled"] is True
+    assert runtime["big_trend_start_score"]["enabled"] is False
     assert runtime["hold_score_extension"]["enabled"] is True
     assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is True
     assert payload["feature_entries_enabled"] is True
-    assert payload["big_trend_start_score_enabled"] is True
+    assert payload["big_trend_start_score_enabled"] is False
     assert payload["hold_score_extension_enabled"] is True
     assert payload["new_entry_cutoff_time"] == "14:50:00"
 
@@ -112,3 +112,34 @@ def test_short_b_drop_ma75_down_allowed_in_bearish_structure():
     decision = short_b_drop_ma75_down_structure_decision(history[-1], history, feature, rsi_now=45.0, rsi_prev=47.0, rsi_prev2=64.0, ma75_slope_2m_value=-80.0)
     assert decision["short_allowed"] is True
     assert decision["block_reason"] == ""
+
+
+def _history_for_rsi20_watch(ts, close, vwap):
+    bars = []
+    for i in range(12):
+        bars.append(_bar(ts - timedelta(minutes=11 - i), close, close + 20, close + 10, close - 10, vwap))
+    return bars
+
+
+def test_long_a_reversal_watch_blocks_when_price_below_vwap(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 10, 10, 0, tzinfo=JST)
+    history = _history_for_rsi20_watch(ts, 69000, 69050)
+    status = MonitorStatus(rsi20_long_watch_active=True, rsi20_long_watch_started_at=ts - timedelta(minutes=1), rsi20_long_watch_expires_at=ts + timedelta(minutes=9), rsi20_long_watch_started_rsi=20.0)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: {12: 21.0, 11: 20.0, 10: 25.0}.get(len(closes), 21.0))
+    pred = m.build_rsi9_prediction(history[-1], history, None, status=status, storage=None, allow_new_entry=True)
+    assert pred.signal == "NO_ACTION"
+    assert pred.reason_3 == "long_a_reversal_watch_vwap_blocked"
+
+
+def test_long_a_reversal_watch_allows_when_price_at_or_above_vwap(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 10, 10, 0, tzinfo=JST)
+    history = _history_for_rsi20_watch(ts, 69050, 69050)
+    status = MonitorStatus(rsi20_long_watch_active=True, rsi20_long_watch_started_at=ts - timedelta(minutes=1), rsi20_long_watch_expires_at=ts + timedelta(minutes=9), rsi20_long_watch_started_rsi=20.0)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: {12: 21.0, 11: 20.0, 10: 25.0}.get(len(closes), 21.0))
+    pred = m.build_rsi9_prediction(history[-1], history, None, status=status, storage=None, allow_new_entry=True)
+    assert pred.signal == "LONG_CANDIDATE"
+    assert pred.reason_3 == "long_a_reversal_watch"

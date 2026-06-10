@@ -138,6 +138,11 @@ RSI17_DROP_ENTRY_RULES = {
     "short_b_drop_ma75_down",
     "short_b_drop_from_rsi70_ma75_up",
 }
+MA5_TRAILING_EXIT_REASONS = {
+    "MA5_INTRABAR_CROSS_TRAILING",
+    "MA5_CLOSE_BELOW_TRAILING",
+    "MA5_CLOSE_ABOVE_TRAILING",
+}
 
 
 def now_jst() -> datetime:
@@ -2687,10 +2692,28 @@ def build_rsi9_prediction(
             if signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                 pass
             elif status.rsi20_long_watch_active and rsi_now > rsi_prev:
-                if allow_new_entry:
+                price_at_or_above_vwap = bar1.vwap is not None and bar1.close >= bar1.vwap
+                if allow_new_entry and price_at_or_above_vwap:
                     signal, side = "LONG_CANDIDATE", "LONG"
                     entry_rule = "long_a_reversal_watch"
                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_TRIGGERED", bar1.ts, rsi_now, rsi_prev, "RSI_TURNED_UP")
+                elif allow_new_entry:
+                    payload = {
+                        "ts": bar1.ts.isoformat(),
+                        "rsi_now": rsi_now,
+                        "rsi_prev": rsi_prev,
+                        "current_price": bar1.close,
+                        "current_vwap": bar1.vwap,
+                        "price_vs_vwap": (bar1.close - bar1.vwap) if bar1.vwap is not None else None,
+                        "block_reason": "price_below_vwap",
+                        "original_reason_3": "long_a_reversal_watch",
+                    }
+                    if storage is not None:
+                        storage.log_structured("INFO", "RSI20_LONG_WATCH_TRIGGER_BLOCKED_BY_VWAP", payload)
+                    else:
+                        print(f"[INFO] RSI20_LONG_WATCH_TRIGGER_BLOCKED_BY_VWAP {payload}", flush=True)
+                    signal, side = "NO_ACTION", "NEUTRAL"
+                    entry_rule = "long_a_reversal_watch_vwap_blocked"
                 else:
                     payload = {
                         "ts": bar1.ts.isoformat(),
@@ -2891,6 +2914,7 @@ def _log_ma5_trailing_exit(
     pnl_ticks: float,
     exit_reason: str,
     confirmed_bar_close: Optional[float] = None,
+    confirmed_ma5_override: Optional[float] = None,
 ) -> None:
     if storage is None:
         return
@@ -2908,7 +2932,7 @@ def _log_ma5_trailing_exit(
             "current_bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
             "current_bar_open": pos.trailing_ma5_bar_open,
             "confirmed_bar_close": confirmed_bar_close,
-            "confirmed_ma5": pos.trailing_ma5_reference,
+            "confirmed_ma5": confirmed_ma5_override if confirmed_ma5_override is not None else pos.trailing_ma5_reference,
             "pnl_ticks": pnl_ticks,
             "bar_bucket": pos.trailing_ma5_bar_bucket.isoformat() if pos.trailing_ma5_bar_bucket else None,
             "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
@@ -2916,8 +2940,8 @@ def _log_ma5_trailing_exit(
             "trailing_started_at": pos.trailing_started_at.isoformat() if pos.trailing_started_at else None,
             "exit_signal_ts": f.ts.isoformat(),
             "reason_detail": {
-                "long_close_below": exit_reason == "MA5_CLOSE_BELOW_TRAILING" and pos.trailing_ma5_bar_open is not None and pos.trailing_ma5_reference is not None and pos.trailing_ma5_bar_open <= pos.trailing_ma5_reference and confirmed_bar_close is not None and confirmed_bar_close < pos.trailing_ma5_reference,
-                "short_close_above": exit_reason == "MA5_CLOSE_ABOVE_TRAILING" and pos.trailing_ma5_bar_open is not None and pos.trailing_ma5_reference is not None and pos.trailing_ma5_bar_open >= pos.trailing_ma5_reference and confirmed_bar_close is not None and confirmed_bar_close > pos.trailing_ma5_reference,
+                "long_close_below": exit_reason == "MA5_CLOSE_BELOW_TRAILING" and pos.trailing_ma5_bar_open is not None and (confirmed_ma5_override if confirmed_ma5_override is not None else pos.trailing_ma5_reference) is not None and confirmed_bar_close is not None and confirmed_bar_close < (confirmed_ma5_override if confirmed_ma5_override is not None else pos.trailing_ma5_reference),
+                "short_close_above": exit_reason == "MA5_CLOSE_ABOVE_TRAILING" and pos.trailing_ma5_bar_open is not None and (confirmed_ma5_override if confirmed_ma5_override is not None else pos.trailing_ma5_reference) is not None and confirmed_bar_close is not None and confirmed_bar_close > (confirmed_ma5_override if confirmed_ma5_override is not None else pos.trailing_ma5_reference),
                 "intrabar_cross": exit_reason == "MA5_INTRABAR_CROSS_TRAILING",
             },
         },
@@ -3050,15 +3074,33 @@ def update_trailing_exit(
         and pos.trailing_ma5_reference is not None
     ):
         relation = pos.trailing_ma5_open_relation
-        confirmed_ma5 = pos.trailing_ma5_reference
-        if pos.side == "LONG" and relation == "LONG_BELOW_OR_EQUAL_MA5" and bar1_new.close < confirmed_ma5:
-            if should_defer_ma5_exit_by_hold_score(pos, f, pnl_ticks, "MA5_CLOSE_BELOW_TRAILING", hold_score_config, analysis_config, feature_metrics, storage):
-                return False, "HOLD", pnl_ticks
-            _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_CLOSE_BELOW_TRAILING", confirmed_bar_close=bar1_new.close)
-            return True, "MA5_CLOSE_BELOW_TRAILING", pnl_ticks
-        if pos.side == "SHORT" and relation == "SHORT_ABOVE_OR_EQUAL_MA5" and bar1_new.close > confirmed_ma5:
-            _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, "MA5_CLOSE_ABOVE_TRAILING", confirmed_bar_close=bar1_new.close)
-            return True, "MA5_CLOSE_ABOVE_TRAILING", pnl_ticks
+        previous_ma5_reference = pos.trailing_ma5_reference
+        finalized_ma5 = bar1_new.ma5
+        long_candidate = pos.side == "LONG" and relation == "LONG_BELOW_OR_EQUAL_MA5"
+        short_candidate = pos.side == "SHORT" and relation == "SHORT_ABOVE_OR_EQUAL_MA5"
+        if finalized_ma5 is not None and (long_candidate or short_candidate):
+            exit_reason_candidate = "MA5_CLOSE_BELOW_TRAILING" if pos.side == "LONG" else "MA5_CLOSE_ABOVE_TRAILING"
+            exit_triggered = (bar1_new.close < finalized_ma5) if pos.side == "LONG" else (bar1_new.close > finalized_ma5)
+            if storage is not None:
+                storage.log_structured(
+                    "INFO",
+                    "MA5_CLOSE_EXIT_EVALUATED_WITH_FINALIZED_MA5",
+                    {
+                        "bar_ts": bar1_new.ts.isoformat(),
+                        "position_side": pos.side,
+                        "exit_reason_candidate": exit_reason_candidate,
+                        "finalized_close": bar1_new.close,
+                        "finalized_ma5": finalized_ma5,
+                        "previous_ma5_reference": previous_ma5_reference,
+                        "used_ma5_source": "finalized_bar_ma5",
+                        "exit_triggered": exit_triggered,
+                    },
+                )
+            if exit_triggered:
+                if pos.side == "LONG" and should_defer_ma5_exit_by_hold_score(pos, f, pnl_ticks, exit_reason_candidate, hold_score_config, analysis_config, feature_metrics, storage):
+                    return False, "HOLD", pnl_ticks
+                _log_ma5_trailing_exit(storage, pos, f, pnl_ticks, exit_reason_candidate, confirmed_bar_close=bar1_new.close, confirmed_ma5_override=finalized_ma5)
+                return True, exit_reason_candidate, pnl_ticks
 
     confirmed_ma5 = confirmed_bar1.ma5 if confirmed_bar1 is not None else None
     if (
@@ -5151,6 +5193,7 @@ def execute_live_exit(
 
         close_signature = safe_json({"side": side, "margin_trade_type": pos.margin_trade_type, "groups": close_position_groups, "force_market_order": force_market_order})
         exit_reason_for_order = ma5_exit_context.get("exit_reason") if isinstance(ma5_exit_context, dict) else ("FORCE_CLOSE" if force_market_order else "LIVE_EXIT")
+        is_ma5_trailing_exit = exit_reason_for_order in MA5_TRAILING_EXIT_REASONS
         if exit_reason_for_order != "HARD_STOP_LOSS" and status.failed_close_signature == close_signature and status.failed_close_signature_ts is not None:
             if (now_jst() - status.failed_close_signature_ts).total_seconds() < 30:
                 storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_FAILED_RETRY", {**context, "reason": "BACKOFF_SAME_CLOSE_SIGNATURE", "close_signature": close_signature, "failed_close_signature_ts": status.failed_close_signature_ts.isoformat(), "positions_summary": positions_summary_for_log(positions)})
@@ -5163,7 +5206,7 @@ def execute_live_exit(
                 front_order_type = 10
                 limit_price = 0.0
                 exit_order_mode = "market_1520_force_close"
-            elif force_marketable_limit or pos.strategy == "RSI9":
+            elif is_ma5_trailing_exit or force_marketable_limit or pos.strategy == "RSI9":
                 front_order_type = 20
                 refreshed_snapshot = latest_snapshot
                 try:
@@ -5176,9 +5219,26 @@ def execute_live_exit(
                     board_fetch_ts = now_jst()
                     storage.log("WARN", "EXIT_BOARD_REFRESH_FAILED", f"attempt={attempt+1} side={side} strategy={pos.strategy} error={e}")
                 limit_price = marketable_exit_limit_price(pos, refreshed_snapshot)
-                exit_order_mode = "marketable_limit"
+                exit_order_mode = "best_quote_limit_ma5_exit" if is_ma5_trailing_exit else "marketable_limit"
                 if limit_price is None or limit_price <= 0:
                     return LiveOrderResult(False, "MARKETABLE_EXIT_LIMIT_PRICE_UNAVAILABLE", recoverable=True)
+                if is_ma5_trailing_exit:
+                    storage.log_structured(
+                        "INFO",
+                        "MA5_EXIT_LIMIT_PRICE_SELECTED",
+                        {
+                            **context,
+                            "exit_reason": exit_reason_for_order,
+                            "position_side": pos.side,
+                            "best_bid": refreshed_snapshot.buy1_price if refreshed_snapshot else None,
+                            "best_ask": refreshed_snapshot.sell1_price if refreshed_snapshot else None,
+                            "selected_limit_price": limit_price,
+                            "front_order_type": front_order_type,
+                            "expected_side": "1" if pos.side == "LONG" else "2",
+                            "current_price": refreshed_snapshot.price if refreshed_snapshot else None,
+                            "ma5_reference": ma5_exit_context.get("confirmed_ma5") if isinstance(ma5_exit_context, dict) else None,
+                        },
+                    )
                 storage.log_structured(
                     "INFO",
                     "EXIT_BOARD_SNAPSHOT_FOR_ORDER",
@@ -6891,11 +6951,12 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             exit_actual_fill_price: Optional[float] = None
                             exit_signal_ts = f.ts
                             exit_signal_price = f.price
+                            ma5_context_ma5 = (bar1_new.ma5 if ex_reason in {"MA5_CLOSE_BELOW_TRAILING", "MA5_CLOSE_ABOVE_TRAILING"} and bar1_new is not None else pos.trailing_ma5_reference)
                             ma5_exit_context = {
                                 "exit_reason": ex_reason,
                                 "current_bar_bucket": current_bar_bucket_1m.isoformat() if current_bar_bucket_1m else None,
                                 "current_bar_open": current_bar_open_1m,
-                                "confirmed_ma5": pos.trailing_ma5_reference,
+                                "confirmed_ma5": ma5_context_ma5,
                                 "confirmed_bar_close": bar1_new.close if bar1_new is not None else None,
                                 "trailing_ma5_open_relation": pos.trailing_ma5_open_relation,
                             }
@@ -6954,7 +7015,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         p,
                                         status,
                                         latest_snapshot=snap,
-                                        force_marketable_limit=(pos.strategy == "RSI9"),
+                                        force_marketable_limit=(pos.strategy == "RSI9" or ex_reason in MA5_TRAILING_EXIT_REASONS),
                                         force_market_order=False,
                                         exit_signal_ts=exit_signal_ts,
                                         signal_price=exit_signal_price,
