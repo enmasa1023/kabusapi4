@@ -3064,21 +3064,18 @@ def update_trailing_exit(
                 },
             )
 
-    # First evaluate close-confirmation for the 1m bucket that just finalized,
-    # using the MA5/reference captured when that bucket started.  This avoids
-    # mixing the newly-started bucket with the closed bucket.
+    # First evaluate close-confirmation for the 1m bucket that just finalized.
+    # CLOSE exits must use only the finalized bar's own MA5 and close; the
+    # open-vs-old-MA5 relation is intentionally ignored here and is kept only for
+    # intrabar cross checks below.
     if (
         bar1_new is not None
         and pos.trailing_ma5_bar_bucket is not None
         and bar1_new.ts == pos.trailing_ma5_bar_bucket
-        and pos.trailing_ma5_reference is not None
     ):
-        relation = pos.trailing_ma5_open_relation
         previous_ma5_reference = pos.trailing_ma5_reference
         finalized_ma5 = bar1_new.ma5
-        long_candidate = pos.side == "LONG" and relation == "LONG_BELOW_OR_EQUAL_MA5"
-        short_candidate = pos.side == "SHORT" and relation == "SHORT_ABOVE_OR_EQUAL_MA5"
-        if finalized_ma5 is not None and (long_candidate or short_candidate):
+        if finalized_ma5 is not None:
             exit_reason_candidate = "MA5_CLOSE_BELOW_TRAILING" if pos.side == "LONG" else "MA5_CLOSE_ABOVE_TRAILING"
             exit_triggered = (bar1_new.close < finalized_ma5) if pos.side == "LONG" else (bar1_new.close > finalized_ma5)
             if storage is not None:

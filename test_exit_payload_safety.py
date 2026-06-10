@@ -203,7 +203,7 @@ def test_ma5_close_below_uses_finalized_bar_ma5_immediately():
     pos.trailing_ma5_bar_bucket = datetime(2026, 6, 10, 9, 31)
     pos.trailing_ma5_bar_open = 69000.0
     pos.trailing_ma5_reference = 68980.0
-    pos.trailing_ma5_open_relation = "LONG_BELOW_OR_EQUAL_MA5"
+    pos.trailing_ma5_open_relation = "LONG_ABOVE_MA5"
     storage = FakeStorage()
     finalized = Bar(pos.trailing_ma5_bar_bucket, 69000.0, 69020.0, 68980.0, 69000.0, 1000, 69000.0, ma5=69006.0)
     ex, reason, _ = update_trailing_exit(pos, _feature_for_exit(finalized.ts, 69000.0), bar1_new=finalized, storage=storage)
@@ -222,7 +222,7 @@ def test_ma5_close_above_uses_finalized_bar_ma5_immediately_for_short():
     pos.trailing_ma5_bar_bucket = datetime(2026, 6, 10, 9, 31)
     pos.trailing_ma5_bar_open = 69000.0
     pos.trailing_ma5_reference = 69020.0
-    pos.trailing_ma5_open_relation = "SHORT_ABOVE_OR_EQUAL_MA5"
+    pos.trailing_ma5_open_relation = "SHORT_BELOW_MA5"
     storage = FakeStorage()
     finalized = Bar(pos.trailing_ma5_bar_bucket, 69000.0, 69040.0, 68980.0, 69010.0, 1000, 69000.0, ma5=69006.0)
     ex, reason, _ = update_trailing_exit(pos, _feature_for_exit(finalized.ts, 69010.0), bar1_new=finalized, storage=storage)
