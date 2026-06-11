@@ -98,7 +98,9 @@
   "feature_entries": {
     "enabled": true,
     "long_vwap_volume_momentum": true,
-    "short_vwap_extended_fail": true
+    "short_vwap_extended_fail": true,
+    "long_rsi_pullback_scalp": true,
+    "short_extended_ma5_fail_scalp": true
   },
   "big_trend_start_score": {
     "enabled": false,
@@ -123,5 +125,17 @@
     "trigger_on_rsi_turn": true,
     "trigger_on_ma5_recover": true,
     "allow_same_bar_trigger": false
+  },
+  "scalp_feature_entries": {
+    "long_rsi_pullback_scalp": {
+      "enabled": true,
+      "take_ticks": 10,
+      "stop_ticks": 10
+    },
+    "short_extended_ma5_fail_scalp": {
+      "enabled": true,
+      "take_ticks": 15,
+      "stop_ticks": 20
+    }
   }
 }

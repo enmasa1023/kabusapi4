@@ -121,6 +121,11 @@ SCALP_EXIT_PARAMS: dict[str, tuple[int, int, int, int]] = {
     "SCALP_BREAKOUT_LONG": (10, 10, 10, 60),
     "SCALP_STRICT_SHORT": (10, 10, 8, 60),
 }
+SCALP_FEATURE_RULE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "long_rsi_pullback_scalp": {"enabled": True, "take_ticks": 10, "stop_ticks": 10, "strategy": "SCALP_FEATURE_LONG"},
+    "short_extended_ma5_fail_scalp": {"enabled": True, "take_ticks": 15, "stop_ticks": 20, "strategy": "SCALP_FEATURE_SHORT"},
+}
+SCALP_FEATURE_STRATEGIES = {"SCALP_FEATURE_LONG", "SCALP_FEATURE_SHORT"}
 
 RSI9_PERIOD = 9
 RSI9_LONG_ENTRY = 20.0
@@ -184,7 +189,10 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "enabled": False,
         "long_vwap_volume_momentum": True,
         "short_vwap_extended_fail": True,
+        "long_rsi_pullback_scalp": True,
+        "short_extended_ma5_fail_scalp": True,
     },
+    "scalp_feature_entries": SCALP_FEATURE_RULE_DEFAULTS,
     "big_trend_start_score": {
         "enabled": False,
         "long_threshold": 8,
@@ -270,6 +278,8 @@ def build_runtime_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[
 
 def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
     feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries"), dict) else {}
+    long_scalp_cfg = scalp_feature_rule_config(config, "long_rsi_pullback_scalp")
+    short_scalp_cfg = scalp_feature_rule_config(config, "short_extended_ma5_fail_scalp")
     big_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score"), dict) else {}
     hold_cfg = config.get("hold_score_extension", {}) if isinstance(config.get("hold_score_extension"), dict) else {}
     rsi70_cfg = config.get("rsi70_drop_long_watch", {}) if isinstance(config.get("rsi70_drop_long_watch"), dict) else {}
@@ -291,6 +301,12 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
+        "feature_long_rsi_pullback_scalp": bool(feature_cfg.get("long_rsi_pullback_scalp", False)) and bool(long_scalp_cfg.get("enabled", False)),
+        "feature_short_extended_ma5_fail_scalp": bool(feature_cfg.get("short_extended_ma5_fail_scalp", False)) and bool(short_scalp_cfg.get("enabled", False)),
+        "long_rsi_pullback_scalp_take_ticks": int(long_scalp_cfg.get("take_ticks", SCALP_FEATURE_RULE_DEFAULTS["long_rsi_pullback_scalp"]["take_ticks"])),
+        "long_rsi_pullback_scalp_stop_ticks": int(long_scalp_cfg.get("stop_ticks", SCALP_FEATURE_RULE_DEFAULTS["long_rsi_pullback_scalp"]["stop_ticks"])),
+        "short_extended_ma5_fail_scalp_take_ticks": int(short_scalp_cfg.get("take_ticks", SCALP_FEATURE_RULE_DEFAULTS["short_extended_ma5_fail_scalp"]["take_ticks"])),
+        "short_extended_ma5_fail_scalp_stop_ticks": int(short_scalp_cfg.get("stop_ticks", SCALP_FEATURE_RULE_DEFAULTS["short_extended_ma5_fail_scalp"]["stop_ticks"])),
         "big_trend_start_score_enabled": bool(big_cfg.get("enabled", False)),
         "big_trend_long_threshold": big_cfg.get("long_threshold"),
         "big_trend_short_threshold": big_cfg.get("short_threshold"),
@@ -659,6 +675,7 @@ class PositionState:
     take_ticks: int
     min_hold_sec: int
     max_hold_sec: int
+    entry_rule: str = ""
     entry_vwap_gap_bps: float = 0.0
     entry_regime: str = ""
     entry_vwap_mode: str = "2x"
@@ -884,11 +901,14 @@ def position_state_payload(pos: Optional[PositionState]) -> dict[str, Any]:
         "state": "OPEN",
         "side": pos.side,
         "strategy": pos.strategy,
+        "entry_rule": pos.entry_rule,
         "entry_time": pos.entry_ts.isoformat(),
         "entry_price": pos.entry_price,
         "margin_trade_type": pos.margin_trade_type,
         "entry_order_id": pos.entry_order_id,
         "exit_order_id": pos.exit_order_id,
+        "stop_ticks": pos.stop_ticks,
+        "take_ticks": pos.take_ticks,
         "take_profit_order_id": pos.take_profit_order_id,
         "managed_execution_ids": list(pos.managed_execution_ids or []),
         "managed_close_positions": list(pos.managed_close_positions or []),
@@ -987,7 +1007,7 @@ class Storage:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS paper_trades(
               trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-              entry_ts TEXT, exit_ts TEXT, entry_side TEXT, strategy TEXT,
+              entry_ts TEXT, exit_ts TEXT, entry_side TEXT, strategy TEXT, entry_rule TEXT,
               entry_price REAL, exit_price REAL,
               pnl_ticks REAL, holding_sec REAL, exit_reason TEXT,
               mfe_ticks REAL, mae_ticks REAL,
@@ -1040,6 +1060,7 @@ class Storage:
     def _ensure_paper_trade_exit_detail_columns(self, cur: sqlite3.Cursor) -> None:
         cols = [r[1] for r in cur.execute("PRAGMA table_info(paper_trades)").fetchall()]
         wanted = {
+            "entry_rule": "TEXT",
             "exit_signal_price": "REAL",
             "exit_order_limit_price": "REAL",
             "exit_actual_fill_price": "REAL",
@@ -1269,15 +1290,16 @@ class Storage:
         with self._connect() as con:
             con.execute(
                 """INSERT INTO paper_trades(
-                     entry_ts,exit_ts,entry_side,strategy,entry_price,exit_price,pnl_ticks,holding_sec,exit_reason,mfe_ticks,mae_ticks,
+                     entry_ts,exit_ts,entry_side,strategy,entry_rule,entry_price,exit_price,pnl_ticks,holding_sec,exit_reason,mfe_ticks,mae_ticks,
                      exit_signal_price,exit_order_limit_price,exit_actual_fill_price,exit_fill_source,exit_signal_ts,
                      exit_order_send_ts,exit_order_response_ts,exit_decision_to_send_ms,exit_order_id
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     kwargs.get("entry_ts"),
                     kwargs.get("exit_ts"),
                     kwargs.get("entry_side"),
                     kwargs.get("strategy"),
+                    kwargs.get("entry_rule"),
                     kwargs.get("entry_price"),
                     kwargs.get("exit_price"),
                     kwargs.get("pnl_ticks"),
@@ -1649,6 +1671,178 @@ def extended_feature_metrics(f: FeatureSnapshot, history: list[Bar]) -> dict[str
         "directional_range_position_30m_short": (1.0 - range_pos_30) if range_pos_30 is not None else None,
         "tick_size": tick_size,
     }
+
+
+def scalp_feature_rule_config(config: dict[str, Any], rule_name: str) -> dict[str, Any]:
+    defaults = SCALP_FEATURE_RULE_DEFAULTS.get(rule_name, {})
+    raw_all = config.get("scalp_feature_entries", {}) if isinstance(config.get("scalp_feature_entries"), dict) else {}
+    raw_rule = raw_all.get(rule_name, {}) if isinstance(raw_all.get(rule_name), dict) else {}
+    return deep_merge_dict(defaults, raw_rule)
+
+
+def scalp_feature_ticks(config: dict[str, Any], rule_name: str) -> tuple[int, int]:
+    rule_cfg = scalp_feature_rule_config(config, rule_name)
+    defaults = SCALP_FEATURE_RULE_DEFAULTS[rule_name]
+    take_ticks = int(rule_cfg.get("take_ticks", defaults["take_ticks"]))
+    stop_ticks = int(rule_cfg.get("stop_ticks", defaults["stop_ticks"]))
+    return take_ticks, stop_ticks
+
+
+def scalp_feature_strategy_for_rule(rule_name: str) -> str:
+    return str(SCALP_FEATURE_RULE_DEFAULTS.get(rule_name, {}).get("strategy", ""))
+
+
+def is_scalp_feature_rule(rule_name: str) -> bool:
+    return rule_name in SCALP_FEATURE_RULE_DEFAULTS
+
+
+def _first_failed_reason(checks: list[tuple[str, bool]]) -> str:
+    for reason, ok in checks:
+        if not ok:
+            return reason
+    return ""
+
+
+def build_scalp_feature_candidates(
+    f: FeatureSnapshot,
+    metrics: dict[str, Any],
+    config: dict[str, Any],
+    rsi9_value: Optional[float],
+    rsi9_prev: Optional[float],
+    latest_bar: Optional[Bar],
+    *,
+    allow_new_entry: bool,
+    entry_cutoff_reached: bool,
+    open_position_exists: bool,
+    storage: Optional[Storage] = None,
+    log_blocked: bool = False,
+) -> list[PredictionSnapshot]:
+    """Build high-priority scalp feature candidates without mutating legacy feature rules.
+
+    Priority inside this helper intentionally matches the live policy:
+    short_extended_ma5_fail_scalp first, then long_rsi_pullback_scalp.
+    Existing feature entries are appended by the caller after these candidates.
+    """
+    feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries"), dict) else {}
+    feature_enabled = bool(feature_cfg.get("enabled", False))
+    can_consider = feature_enabled and allow_new_entry and not entry_cutoff_reached and not open_position_exists
+    candidates: list[PredictionSnapshot] = []
+
+    short_rule = "short_extended_ma5_fail_scalp"
+    short_cfg = scalp_feature_rule_config(config, short_rule)
+    short_enabled = can_consider and bool(feature_cfg.get(short_rule, True)) and bool(short_cfg.get("enabled", True))
+    latest_close = latest_bar.close if latest_bar is not None else None
+    latest_ma5 = latest_bar.ma5 if latest_bar is not None else None
+    short_take, short_stop = scalp_feature_ticks(config, short_rule)
+    short_checks = [
+        ("feature_or_entry_blocked", short_enabled),
+        ("abs_vwap_gap_bps_missing_or_le_60", metrics.get("abs_vwap_gap_bps") is not None and metrics.get("abs_vwap_gap_bps") > 60),
+        ("ret5_ticks_missing_or_lt_5", metrics.get("ret5_ticks") is not None and metrics.get("ret5_ticks") >= 5),
+        ("ret1_ticks_missing_or_gt_minus_5", metrics.get("ret1_ticks") is not None and metrics.get("ret1_ticks") <= -5),
+        ("ma5_missing", latest_ma5 is not None),
+        ("close_not_below_ma5", latest_close is not None and latest_ma5 is not None and latest_close < latest_ma5),
+        ("vwap_gap_bps_le_180", f.vwap_gap_bps > 180),
+    ]
+    short_block = _first_failed_reason(short_checks)
+    if not short_block:
+        candidates.append(
+            PredictionSnapshot(
+                f.ts,
+                "FEATURE_ENTRY",
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                "SHORT_CANDIDATE",
+                rsi9_value if rsi9_value is not None else float("nan"),
+                "SCALP_FEATURE_SHORT",
+                f"ret1_ticks={metrics['ret1_ticks']:.2f},ret5_ticks={metrics['ret5_ticks']:.2f}",
+                short_rule,
+            )
+        )
+        if storage is not None:
+            storage.log_structured(
+                "INFO",
+                "SHORT_EXTENDED_MA5_FAIL_SCALP_TRIGGERED",
+                {
+                    "ts": f.ts.isoformat(),
+                    "price": f.price,
+                    "vwap": f.vwap,
+                    "vwap_gap_bps": f.vwap_gap_bps,
+                    "abs_vwap_gap_bps": metrics.get("abs_vwap_gap_bps"),
+                    "ret1_ticks": metrics.get("ret1_ticks"),
+                    "ret5_ticks": metrics.get("ret5_ticks"),
+                    "close": latest_close,
+                    "ma5": latest_ma5,
+                    "take_ticks": short_take,
+                    "stop_ticks": short_stop,
+                    "reason_3": short_rule,
+                },
+            )
+
+    long_rule = "long_rsi_pullback_scalp"
+    long_cfg = scalp_feature_rule_config(config, long_rule)
+    long_enabled = can_consider and bool(feature_cfg.get(long_rule, True)) and bool(long_cfg.get("enabled", True))
+    long_take, long_stop = scalp_feature_ticks(config, long_rule)
+    rsi_delta = (rsi9_value - rsi9_prev) if rsi9_value is not None and rsi9_prev is not None else None
+    long_checks = [
+        ("feature_or_entry_blocked", long_enabled),
+        ("vwap_missing", f.vwap is not None and f.vwap > 0),
+        ("price_below_vwap", f.vwap is not None and f.price >= f.vwap),
+        ("rsi9_missing", rsi9_value is not None),
+        ("rsi9_not_below_40", rsi9_value is not None and rsi9_value < 40),
+        ("rsi9_prev_missing", rsi9_prev is not None),
+        ("rsi9_not_falling_1m", rsi_delta is not None and rsi_delta < 0),
+    ]
+    long_block = _first_failed_reason(long_checks)
+    if not long_block:
+        candidates.append(
+            PredictionSnapshot(
+                f.ts,
+                "FEATURE_ENTRY",
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                "LONG_CANDIDATE",
+                rsi9_value if rsi9_value is not None else float("nan"),
+                "SCALP_FEATURE_LONG",
+                f"rsi9={rsi9_value:.2f},rsi9_prev={rsi9_prev:.2f}",
+                long_rule,
+            )
+        )
+        if storage is not None:
+            storage.log_structured(
+                "INFO",
+                "LONG_RSI_PULLBACK_SCALP_TRIGGERED",
+                {
+                    "ts": f.ts.isoformat(),
+                    "price": f.price,
+                    "vwap": f.vwap,
+                    "price_vs_vwap": f.price - f.vwap,
+                    "rsi9": rsi9_value,
+                    "rsi9_prev": rsi9_prev,
+                    "rsi9_delta_1m": rsi_delta,
+                    "take_ticks": long_take,
+                    "stop_ticks": long_stop,
+                    "reason_3": long_rule,
+                },
+            )
+    elif log_blocked and long_enabled and storage is not None:
+        storage.log_structured(
+            "INFO",
+            "LONG_RSI_PULLBACK_SCALP_CANDIDATE_BLOCKED",
+            {
+                "ts": f.ts.isoformat(),
+                "block_reason": long_block,
+                "price": f.price,
+                "vwap": f.vwap,
+                "rsi9": rsi9_value,
+                "rsi9_prev": rsi9_prev,
+            },
+        )
+
+    return candidates
 
 
 def big_trend_start_score(side: str, f: FeatureSnapshot, metrics: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -2796,6 +2990,10 @@ def create_position(
     elif pred.reason_1 in SCALP_EXIT_PARAMS:
         strategy = pred.reason_1
         stop_ticks, take_ticks, min_hold, max_hold = SCALP_EXIT_PARAMS[strategy]
+    elif pred.reason_1 in SCALP_FEATURE_STRATEGIES and is_scalp_feature_rule(pred.reason_3):
+        strategy = pred.reason_1
+        take_ticks, stop_ticks = scalp_feature_ticks(config, pred.reason_3)
+        min_hold, max_hold = 0, 3600
     elif (pred.p_up_3m if is_long else pred.p_down_3m) >= (
         pred.p_up_1m if is_long else pred.p_down_1m
     ):
@@ -2822,6 +3020,7 @@ def create_position(
         take_ticks=take_ticks,
         min_hold_sec=min_hold,
         max_hold_sec=max_hold,
+        entry_rule=pred.reason_3,
         entry_vwap_gap_bps=f.vwap_gap_bps,
         entry_regime=f.regime,
         entry_vwap_mode=CURRENT_VWAP_MODE,
@@ -2831,13 +3030,46 @@ def create_position(
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
-        hard_stop_ticks=int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
+        hard_stop_ticks=stop_ticks if strategy in SCALP_FEATURE_STRATEGIES else int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
     )
 
 
 def current_pnl_ticks(pos: PositionState, current_price: float) -> float:
     pnl_ticks = price_to_ticks(current_price - pos.entry_price, pos.entry_price)
     return -pnl_ticks if pos.side == "SHORT" else pnl_ticks
+
+
+def scalp_feature_entry_parameters_payload(pos: PositionState, entry_rule: str) -> dict[str, Any]:
+    tick_size = tick_size_for_1570(pos.entry_price)
+    take_delta = pos.take_ticks * tick_size
+    stop_delta = pos.stop_ticks * tick_size
+    if pos.side == "LONG":
+        take_price = pos.entry_price + take_delta
+        stop_price = pos.entry_price - stop_delta
+    else:
+        take_price = pos.entry_price - take_delta
+        stop_price = pos.entry_price + stop_delta
+    return {
+        "entry_rule": entry_rule,
+        "strategy": pos.strategy,
+        "side": pos.side,
+        "entry_price": pos.entry_price,
+        "take_ticks": pos.take_ticks,
+        "stop_ticks": pos.stop_ticks,
+        "hard_stop_ticks": pos.hard_stop_ticks,
+        "take_price": take_price,
+        "stop_price": stop_price,
+    }
+
+
+def log_scalp_feature_entry_parameters(storage: Storage, pos: PositionState, entry_rule: str) -> None:
+    if pos.strategy not in SCALP_FEATURE_STRATEGIES:
+        return
+    storage.log_structured(
+        "INFO",
+        "SCALP_FEATURE_ENTRY_PARAMETERS_APPLIED",
+        scalp_feature_entry_parameters_payload(pos, entry_rule),
+    )
 
 
 def _trailing_payload(pos: PositionState, f: FeatureSnapshot, pnl_ticks: float) -> dict[str, Any]:
@@ -3012,6 +3244,47 @@ def update_trailing_exit(
     feature_metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str, float]:
     pnl_ticks = current_pnl_ticks(pos, f.price)
+    if pos.strategy in SCALP_FEATURE_STRATEGIES:
+        if pnl_ticks >= pos.take_ticks:
+            if storage is not None:
+                storage.log_structured(
+                    "INFO",
+                    "SCALP_FEATURE_TAKE_PROFIT_SIGNAL",
+                    {
+                        "ts": f.ts.isoformat(),
+                        "side": pos.side,
+                        "strategy": pos.strategy,
+                        "entry_price": pos.entry_price,
+                        "current_price": f.price,
+                        "pnl_ticks": pnl_ticks,
+                        "take_ticks": pos.take_ticks,
+                        "stop_ticks": pos.stop_ticks,
+                        "hard_stop_ticks": pos.hard_stop_ticks,
+                        "exit_reason": "TAKE_PROFIT",
+                    },
+                )
+            return True, "TAKE_PROFIT", pnl_ticks
+        if pnl_ticks <= -pos.stop_ticks:
+            if storage is not None:
+                storage.log_structured(
+                    "WARN",
+                    "SCALP_FEATURE_STOP_LOSS_SIGNAL",
+                    {
+                        "ts": f.ts.isoformat(),
+                        "side": pos.side,
+                        "strategy": pos.strategy,
+                        "entry_price": pos.entry_price,
+                        "current_price": f.price,
+                        "pnl_ticks": pnl_ticks,
+                        "take_ticks": pos.take_ticks,
+                        "stop_ticks": pos.stop_ticks,
+                        "hard_stop_ticks": pos.hard_stop_ticks,
+                        "exit_reason": "STOP_LOSS",
+                    },
+                )
+            return True, "STOP_LOSS", pnl_ticks
+        return False, "HOLD", pnl_ticks
+
     # HARD_STOP_LOSS is intentionally the first ordinary exit check.  It is
     # strategy-independent and supersedes legacy stop_ticks values (some of
     # which are 10 ticks) so positions are not stopped before the explicit
@@ -4092,6 +4365,7 @@ def create_position_from_actual_position(
         take_ticks=template_pos.take_ticks,
         min_hold_sec=template_pos.min_hold_sec,
         max_hold_sec=template_pos.max_hold_sec,
+        entry_rule=template_pos.entry_rule,
         entry_vwap_gap_bps=template_pos.entry_vwap_gap_bps,
         entry_regime=template_pos.entry_regime,
         entry_vwap_mode=template_pos.entry_vwap_mode,
@@ -6377,7 +6651,21 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 feature_enabled = bool(feature_cfg.get("enabled", False))
                 if bar1_new is not None:
                     storage.log_structured("INFO", "FEATURE_ENTRY_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": feature_enabled, "raw_config_value": feature_cfg.get("enabled"), "effective_value": feature_enabled, "reason_if_disabled": "" if feature_enabled else "feature_entries.enabled_false_or_missing"})
-                feature_candidates: list[PredictionSnapshot] = []
+                history_list = list(rb1.history)
+                rsi9_prev_for_feature = rsi9_wilder([b.close for b in history_list[:-1]], RSI9_PERIOD) if len(history_list) > RSI9_PERIOD + 1 else None
+                feature_candidates: list[PredictionSnapshot] = build_scalp_feature_candidates(
+                    f,
+                    metrics,
+                    config,
+                    p.rsi9_value,
+                    rsi9_prev_for_feature,
+                    rb1.latest(),
+                    allow_new_entry=allow_new_entry and p.signal == "NO_ACTION",
+                    entry_cutoff_reached=entry_cutoff_reached,
+                    open_position_exists=status.open_position is not None,
+                    storage=storage,
+                    log_blocked=bar1_new is not None,
+                )
                 if not entry_cutoff_reached and status.open_position is None and allow_new_entry:
                     if bool(feature_cfg.get("long_vwap_volume_momentum", True)):
                         if (
@@ -6752,6 +7040,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             if verified_pos is not None and verified_pos.filled_qty > 0:
                                                 candidate_pos = verified_pos
                                                 status.open_position = candidate_pos
+                                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
                                                 status.live_state = "OPEN"
                                                 status.pending_entry_side = None
                                                 status.pending_entry_ts = None
@@ -6788,6 +7077,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                     candidate_pos.entry_fill_price,
                                                 )
                                                 status.open_position = candidate_pos
+                                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
                                                 status.live_state = "OPEN"
                                                 if status.rsi20_long_watch_active:
                                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
@@ -6823,6 +7113,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 mae_ticks = 0.0
                             else:
                                 status.open_position = candidate_pos
+                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
                                 status.live_state = "OPEN"
                                 if status.rsi20_long_watch_active:
                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
@@ -7108,6 +7399,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                     exit_ts=f.ts.isoformat(),
                                     entry_side=pos.side,
                                     strategy=pos.strategy,
+                                    entry_rule=pos.entry_rule,
                                     entry_price=pos.entry_fill_price if pos.entry_fill_price is not None else pos.entry_price,
                                     exit_price=pos.exit_fill_price if pos.exit_fill_price is not None else f.price,
                                     pnl_ticks=pnl_ticks,

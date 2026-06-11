@@ -74,10 +74,18 @@ def test_runtime_config_preserves_enabled_nested_settings():
     runtime = build_runtime_config(cfg, _args())
     payload = startup_config_effective_payload(runtime)
     assert runtime["feature_entries"]["enabled"] is True
+    assert runtime["feature_entries"]["long_rsi_pullback_scalp"] is True
+    assert runtime["feature_entries"]["short_extended_ma5_fail_scalp"] is True
+    assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["take_ticks"] == 10
+    assert runtime["scalp_feature_entries"]["short_extended_ma5_fail_scalp"]["stop_ticks"] == 20
     assert runtime["big_trend_start_score"]["enabled"] is False
     assert runtime["hold_score_extension"]["enabled"] is True
     assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is True
     assert payload["feature_entries_enabled"] is True
+    assert payload["feature_long_rsi_pullback_scalp"] is True
+    assert payload["feature_short_extended_ma5_fail_scalp"] is True
+    assert payload["long_rsi_pullback_scalp_take_ticks"] == 10
+    assert payload["short_extended_ma5_fail_scalp_stop_ticks"] == 20
     assert payload["big_trend_start_score_enabled"] is False
     assert payload["hold_score_extension_enabled"] is True
     assert payload["new_entry_cutoff_time"] == "14:50:00"
@@ -143,3 +151,101 @@ def test_long_a_reversal_watch_allows_when_price_at_or_above_vwap(monkeypatch):
     pred = m.build_rsi9_prediction(history[-1], history, None, status=status, storage=None, allow_new_entry=True)
     assert pred.signal == "LONG_CANDIDATE"
     assert pred.reason_3 == "long_a_reversal_watch"
+
+
+def _base_runtime_config():
+    return build_runtime_config(load_config("config_1570_live_prod.json"), _args())
+
+
+def test_long_rsi_pullback_scalp_triggers_and_applies_exit_ticks():
+    from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates, create_position
+
+    ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    candidates = build_scalp_feature_candidates(
+        feature,
+        {},
+        cfg,
+        35.0,
+        38.0,
+        _bar(ts, 67000, 66950, 66920, 66800, 66900),
+        allow_new_entry=True,
+        entry_cutoff_reached=False,
+        open_position_exists=False,
+    )
+    assert candidates[0].signal == "LONG_CANDIDATE"
+    assert candidates[0].reason_1 == "SCALP_FEATURE_LONG"
+    assert candidates[0].reason_3 == "long_rsi_pullback_scalp"
+    pos = create_position(candidates[0], feature, cfg)
+    assert pos.strategy == "SCALP_FEATURE_LONG"
+    assert pos.take_ticks == 10
+    assert pos.stop_ticks == 10
+    assert pos.hard_stop_ticks == 10
+
+
+def test_long_rsi_pullback_scalp_blocks_below_vwap_or_rsi_rising():
+    from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates
+
+    ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    latest = _bar(ts, 67000, 66950, 66920, 66800, 66900)
+    below_vwap = build_scalp_feature_candidates(
+        _feature(ts, 66800, 66900, "range"), {}, cfg, 35.0, 38.0, latest,
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=False,
+    )
+    assert all(c.reason_3 != "long_rsi_pullback_scalp" for c in below_vwap)
+    rsi_rising = build_scalp_feature_candidates(
+        _feature(ts, 67000, 66900, "range"), {}, cfg, 38.0, 35.0, latest,
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=False,
+    )
+    assert all(c.reason_3 != "long_rsi_pullback_scalp" for c in rsi_rising)
+
+
+def test_short_extended_ma5_fail_scalp_triggers_and_applies_exit_ticks():
+    from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates, create_position
+
+    ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    feature = _feature(ts, 67000, 65000, "range")
+    feature.vwap_gap_bps = 200.0
+    metrics = {"abs_vwap_gap_bps": 200.0, "ret5_ticks": 10.0, "ret1_ticks": -6.0}
+    latest = _bar(ts, 67000, 67050, 67060, 66900, 65000)
+    candidates = build_scalp_feature_candidates(
+        feature, metrics, cfg, 55.0, 56.0, latest,
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=False,
+    )
+    assert candidates[0].signal == "SHORT_CANDIDATE"
+    assert candidates[0].reason_1 == "SCALP_FEATURE_SHORT"
+    assert candidates[0].reason_3 == "short_extended_ma5_fail_scalp"
+    pos = create_position(candidates[0], feature, cfg)
+    assert pos.strategy == "SCALP_FEATURE_SHORT"
+    assert pos.take_ticks == 15
+    assert pos.stop_ticks == 20
+    assert pos.hard_stop_ticks == 20
+
+
+def test_short_extended_ma5_fail_scalp_blocks_ma5_above_or_gap_insufficient_or_open_position():
+    from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates
+
+    ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    feature = _feature(ts, 67000, 65000, "range")
+    feature.vwap_gap_bps = 200.0
+    metrics = {"abs_vwap_gap_bps": 200.0, "ret5_ticks": 10.0, "ret1_ticks": -6.0}
+    ma5_above = build_scalp_feature_candidates(
+        feature, metrics, cfg, 55.0, 56.0, _bar(ts, 67100, 67050, 67060, 66900, 65000),
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=False,
+    )
+    assert all(c.reason_3 != "short_extended_ma5_fail_scalp" for c in ma5_above)
+    feature.vwap_gap_bps = 100.0
+    gap_short = build_scalp_feature_candidates(
+        feature, {"abs_vwap_gap_bps": 100.0, "ret5_ticks": 10.0, "ret1_ticks": -6.0}, cfg, 55.0, 56.0, _bar(ts, 67000, 67050, 67060, 66900, 65000),
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=False,
+    )
+    assert all(c.reason_3 != "short_extended_ma5_fail_scalp" for c in gap_short)
+    with_position = build_scalp_feature_candidates(
+        feature, metrics, cfg, 35.0, 38.0, _bar(ts, 67000, 67050, 67060, 66900, 65000),
+        allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=True,
+    )
+    assert with_position == []
