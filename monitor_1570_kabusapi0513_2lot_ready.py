@@ -122,7 +122,7 @@ SCALP_EXIT_PARAMS: dict[str, tuple[int, int, int, int]] = {
     "SCALP_STRICT_SHORT": (10, 10, 8, 60),
 }
 SCALP_FEATURE_RULE_DEFAULTS: dict[str, dict[str, Any]] = {
-    "long_rsi_pullback_scalp": {"enabled": True, "take_ticks": 10, "stop_ticks": 10, "strategy": "SCALP_FEATURE_LONG"},
+    "long_rsi_pullback_scalp": {"enabled": True, "take_ticks": 10, "stop_ticks": 15, "strategy": "SCALP_FEATURE_LONG"},
     "short_extended_ma5_fail_scalp": {"enabled": True, "take_ticks": 15, "stop_ticks": 20, "strategy": "SCALP_FEATURE_SHORT"},
 }
 SCALP_FEATURE_STRATEGIES = {"SCALP_FEATURE_LONG", "SCALP_FEATURE_SHORT"}
@@ -252,6 +252,7 @@ def build_runtime_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[
         "live_retry_max": int(args.live_retry_max if args.live_retry_max is not None else cfg.get("live_retry_max", LIVE_RETRY_MAX)),
         "entry_error_block_sec": int(cfg.get("entry_error_block_sec", ENTRY_ERROR_BLOCK_SEC)),
         "recovery_cooldown_sec": int(cfg.get("recovery_cooldown_sec", RECOVERY_COOLDOWN_SEC)),
+        "hard_stop_ticks": int(cfg.get("hard_stop_ticks", HARD_STOP_TICKS)),
         "adaptive_control": bool(cfg.get("adaptive_control", True)) and not bool(args.disable_adaptive_control),
         "initial_vwap_mode": args.initial_vwap_mode or cfg.get("initial_vwap_mode", "2x"),
         "outdir": args.outdir or cfg.get("outdir", "monitor_output"),
@@ -298,6 +299,7 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "margin_trade_type_short": config.get("margin_trade_type_short"),
         "force_close_after": config.get("force_close_after"),
         "new_entry_cutoff_time": config.get("new_entry_cutoff_time"),
+        "hard_stop_ticks": int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
@@ -3062,14 +3064,16 @@ def scalp_feature_entry_parameters_payload(pos: PositionState, entry_rule: str) 
     }
 
 
-def log_scalp_feature_entry_parameters(storage: Storage, pos: PositionState, entry_rule: str) -> None:
-    if pos.strategy not in SCALP_FEATURE_STRATEGIES:
-        return
-    storage.log_structured(
-        "INFO",
-        "SCALP_FEATURE_ENTRY_PARAMETERS_APPLIED",
-        scalp_feature_entry_parameters_payload(pos, entry_rule),
-    )
+def entry_risk_parameter_source(pos: PositionState, entry_rule: str) -> str:
+    if pos.strategy in SCALP_FEATURE_STRATEGIES and is_scalp_feature_rule(entry_rule):
+        return f"scalp_feature_entries.{entry_rule}"
+    return "config.hard_stop_ticks"
+
+
+def log_entry_risk_parameters(storage: Storage, pos: PositionState, entry_rule: str) -> None:
+    payload = scalp_feature_entry_parameters_payload(pos, entry_rule)
+    payload["source"] = entry_risk_parameter_source(pos, entry_rule)
+    storage.log_structured("INFO", "ENTRY_RISK_PARAMETERS_APPLIED", payload)
 
 
 def _trailing_payload(pos: PositionState, f: FeatureSnapshot, pnl_ticks: float) -> dict[str, Any]:
@@ -5091,7 +5095,7 @@ def validate_exit_payload(
     close_positions = payload.get("ClosePositions")
     if not isinstance(close_positions, list) or not close_positions:
         return False, "CLOSE_POSITIONS_MISSING"
-    if payload.get("ClosePositionOrder") not in (None, "", 0):
+    if "ClosePositionOrder" in payload:
         return False, "CLOSE_POSITIONS_AND_ORDER_MIXED"
     qty_sum = 0
     for row in close_positions:
@@ -7040,7 +7044,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             if verified_pos is not None and verified_pos.filled_qty > 0:
                                                 candidate_pos = verified_pos
                                                 status.open_position = candidate_pos
-                                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
+                                                log_entry_risk_parameters(storage, candidate_pos, p.reason_3)
                                                 status.live_state = "OPEN"
                                                 status.pending_entry_side = None
                                                 status.pending_entry_ts = None
@@ -7077,7 +7081,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                     candidate_pos.entry_fill_price,
                                                 )
                                                 status.open_position = candidate_pos
-                                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
+                                                log_entry_risk_parameters(storage, candidate_pos, p.reason_3)
                                                 status.live_state = "OPEN"
                                                 if status.rsi20_long_watch_active:
                                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")
@@ -7113,7 +7117,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 mae_ticks = 0.0
                             else:
                                 status.open_position = candidate_pos
-                                log_scalp_feature_entry_parameters(storage, candidate_pos, p.reason_3)
+                                log_entry_risk_parameters(storage, candidate_pos, p.reason_3)
                                 status.live_state = "OPEN"
                                 if status.rsi20_long_watch_active:
                                     clear_rsi20_long_watch(status, storage, "RSI20_LONG_WATCH_CANCELLED", f.ts, extract_rsi_from_pred(p), None, "ENTRY_FILLED_BY_OTHER_SIGNAL")

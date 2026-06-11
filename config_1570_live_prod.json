@@ -130,12 +130,13 @@
     "long_rsi_pullback_scalp": {
       "enabled": true,
       "take_ticks": 10,
-      "stop_ticks": 10
+      "stop_ticks": 15
     },
     "short_extended_ma5_fail_scalp": {
       "enabled": true,
       "take_ticks": 15,
       "stop_ticks": 20
     }
-  }
+  },
+  "hard_stop_ticks": 20
 }

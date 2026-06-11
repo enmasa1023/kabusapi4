@@ -77,14 +77,18 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["feature_entries"]["long_rsi_pullback_scalp"] is True
     assert runtime["feature_entries"]["short_extended_ma5_fail_scalp"] is True
     assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["take_ticks"] == 10
+    assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["stop_ticks"] == 15
     assert runtime["scalp_feature_entries"]["short_extended_ma5_fail_scalp"]["stop_ticks"] == 20
+    assert runtime["hard_stop_ticks"] == 20
     assert runtime["big_trend_start_score"]["enabled"] is False
     assert runtime["hold_score_extension"]["enabled"] is True
     assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is True
     assert payload["feature_entries_enabled"] is True
     assert payload["feature_long_rsi_pullback_scalp"] is True
     assert payload["feature_short_extended_ma5_fail_scalp"] is True
+    assert payload["hard_stop_ticks"] == 20
     assert payload["long_rsi_pullback_scalp_take_ticks"] == 10
+    assert payload["long_rsi_pullback_scalp_stop_ticks"] == 15
     assert payload["short_extended_ma5_fail_scalp_stop_ticks"] == 20
     assert payload["big_trend_start_score_enabled"] is False
     assert payload["hold_score_extension_enabled"] is True
@@ -157,6 +161,18 @@ def _base_runtime_config():
     return build_runtime_config(load_config("config_1570_live_prod.json"), _args())
 
 
+def test_existing_feature_position_uses_config_hard_stop_20():
+    from monitor_1570_kabusapi0513_2lot_ready import PredictionSnapshot, create_position
+
+    ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    pred = PredictionSnapshot(ts, "FEATURE_ENTRY", 0.5, 0.5, 0.5, 0.5, "LONG_CANDIDATE", 50.0, "FEATURE_ENTRY", "ret5_ticks=5", "long_feature_vwap_volume_momentum")
+    pos = create_position(pred, _feature(ts, 67000, 66900, "trend_up"), cfg)
+    assert pos.strategy in {"STRAT_1M", "STRAT_3M"}
+    assert pos.entry_rule == "long_feature_vwap_volume_momentum"
+    assert pos.hard_stop_ticks == 20
+
+
 def test_long_rsi_pullback_scalp_triggers_and_applies_exit_ticks():
     from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates, create_position
 
@@ -180,8 +196,8 @@ def test_long_rsi_pullback_scalp_triggers_and_applies_exit_ticks():
     pos = create_position(candidates[0], feature, cfg)
     assert pos.strategy == "SCALP_FEATURE_LONG"
     assert pos.take_ticks == 10
-    assert pos.stop_ticks == 10
-    assert pos.hard_stop_ticks == 10
+    assert pos.stop_ticks == 15
+    assert pos.hard_stop_ticks == 15
 
 
 def test_long_rsi_pullback_scalp_blocks_below_vwap_or_rsi_rising():

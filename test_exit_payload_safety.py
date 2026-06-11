@@ -102,6 +102,11 @@ def test_fast_path_uses_actual_exchange_27_not_config_1():
     payload = build_exit_order_payload(cfg, "LONG", groups[0][1], qty=2, exchange=groups[0][0], margin_trade_type=3)
     assert payload["Exchange"] == 27
     assert validate_exit_payload(payload, pos.managed_close_positions, pos, 2)[0]
+    payload_with_mixed_close_order = dict(payload)
+    payload_with_mixed_close_order["ClosePositionOrder"] = 0
+    ok, reason = validate_exit_payload(payload_with_mixed_close_order, pos.managed_close_positions, pos, 2)
+    assert ok is False
+    assert reason == "CLOSE_POSITIONS_AND_ORDER_MIXED"
 
 
 def test_fast_path_fallback_when_exchange_missing():
@@ -189,7 +194,7 @@ def test_ma5_intrabar_exit_uses_best_bid_limit_even_when_config_market():
     assert payload["CashMargin"] == 3
     assert payload["DelivType"] == 2
     assert payload.get("ClosePositions")
-    assert payload.get("ClosePositionOrder") in (None, "", 0)
+    assert "ClosePositionOrder" not in payload
     assert any(e[1] == "MA5_EXIT_LIMIT_PRICE_SELECTED" for e in storage.events)
 
 
