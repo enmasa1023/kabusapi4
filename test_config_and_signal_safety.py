@@ -10,6 +10,7 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     short_b_drop_ma75_down_structure_decision,
     start_rsi17_bullish_pullback_long_watch,
     startup_config_effective_payload,
+    HARD_STOP_TICKS,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -79,6 +80,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["take_ticks"] == 10
     assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["stop_ticks"] == 15
     assert runtime["scalp_feature_entries"]["short_extended_ma5_fail_scalp"]["stop_ticks"] == 20
+    assert HARD_STOP_TICKS == 20
     assert runtime["hard_stop_ticks"] == 20
     assert runtime["big_trend_start_score"]["enabled"] is False
     assert runtime["hold_score_extension"]["enabled"] is True

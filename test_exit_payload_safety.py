@@ -235,3 +235,56 @@ def test_ma5_close_above_uses_finalized_bar_ma5_immediately_for_short():
     assert reason == "MA5_CLOSE_ABOVE_TRAILING"
     event = next(e for e in storage.events if e[1] == "MA5_CLOSE_EXIT_EVALUATED_WITH_FINALIZED_MA5")
     assert event[2]["finalized_ma5"] == 69006.0
+
+
+def _scalp_position(side: str, strategy: str, entry_rule: str):
+    pos = base_position(exchange=27, qty=2)
+    pos.side = side
+    pos.strategy = strategy
+    pos.entry_rule = entry_rule
+    pos.take_ticks = 10 if side == "LONG" else 15
+    pos.stop_ticks = 15 if side == "LONG" else 20
+    pos.hard_stop_ticks = pos.stop_ticks
+    if side == "SHORT":
+        pos.managed_close_positions[0]["Side"] = "1"
+    return pos
+
+
+def _assert_scalp_exit_best_quote_limit(side: str, strategy: str, entry_rule: str, exit_reason: str, expected_price: float):
+    cfg = base_config()
+    pos = _scalp_position(side, strategy, entry_rule)
+    status = Status()
+    status.open_position = pos
+    client = FakeClient(pos.managed_close_positions)
+    client.send_order = lambda payload: (client.sent_payloads.append(payload) or {"OrderId": "ok"})
+    storage = FakeStorage()
+    result = execute_live_exit(
+        client,
+        cfg,
+        side,
+        storage,
+        pos,
+        None,
+        status,
+        force_marketable_limit=False,
+        force_market_order=False,
+        signal_price=69005.0,
+        pnl_ticks=10.0 if exit_reason == "TAKE_PROFIT" else -15.0,
+        ma5_exit_context={"exit_reason": exit_reason},
+    )
+    assert result.order_id == "ok"
+    payload = client.sent_payloads[0]
+    assert payload["FrontOrderType"] == 20
+    assert payload["Price"] == expected_price
+    assert payload["Price"] > 0
+    assert any(e[1] == "SCALP_FEATURE_EXIT_LIMIT_PRICE_SELECTED" for e in storage.events)
+
+
+def test_scalp_feature_long_take_profit_and_stop_loss_use_best_bid_limit():
+    _assert_scalp_exit_best_quote_limit("LONG", "SCALP_FEATURE_LONG", "long_rsi_pullback_scalp", "TAKE_PROFIT", 69000)
+    _assert_scalp_exit_best_quote_limit("LONG", "SCALP_FEATURE_LONG", "long_rsi_pullback_scalp", "STOP_LOSS", 69000)
+
+
+def test_scalp_feature_short_take_profit_and_stop_loss_use_best_ask_limit():
+    _assert_scalp_exit_best_quote_limit("SHORT", "SCALP_FEATURE_SHORT", "short_extended_ma5_fail_scalp", "TAKE_PROFIT", 69010)
+    _assert_scalp_exit_best_quote_limit("SHORT", "SCALP_FEATURE_SHORT", "short_extended_ma5_fail_scalp", "STOP_LOSS", 69010)

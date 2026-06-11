@@ -90,7 +90,7 @@ MAX_HOLD_SEC_1M = 300
 MAX_HOLD_SEC_3M = 300
 STOP_TICKS_1M = 10
 STOP_TICKS_3M = 10
-HARD_STOP_TICKS = 15
+HARD_STOP_TICKS = 20
 TAKE_TICKS_1M = 10
 TAKE_TICKS_3M = 10
 PROB_UPPER_1M = 0.58
@@ -5469,6 +5469,7 @@ def execute_live_exit(
         close_signature = safe_json({"side": side, "margin_trade_type": pos.margin_trade_type, "groups": close_position_groups, "force_market_order": force_market_order})
         exit_reason_for_order = ma5_exit_context.get("exit_reason") if isinstance(ma5_exit_context, dict) else ("FORCE_CLOSE" if force_market_order else "LIVE_EXIT")
         is_ma5_trailing_exit = exit_reason_for_order in MA5_TRAILING_EXIT_REASONS
+        is_scalp_feature_fixed_exit = pos.strategy in SCALP_FEATURE_STRATEGIES and exit_reason_for_order in {"TAKE_PROFIT", "STOP_LOSS"}
         if exit_reason_for_order != "HARD_STOP_LOSS" and status.failed_close_signature == close_signature and status.failed_close_signature_ts is not None:
             if (now_jst() - status.failed_close_signature_ts).total_seconds() < 30:
                 storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_FAILED_RETRY", {**context, "reason": "BACKOFF_SAME_CLOSE_SIGNATURE", "close_signature": close_signature, "failed_close_signature_ts": status.failed_close_signature_ts.isoformat(), "positions_summary": positions_summary_for_log(positions)})
@@ -5481,7 +5482,7 @@ def execute_live_exit(
                 front_order_type = 10
                 limit_price = 0.0
                 exit_order_mode = "market_1520_force_close"
-            elif is_ma5_trailing_exit or force_marketable_limit or pos.strategy == "RSI9":
+            elif is_ma5_trailing_exit or is_scalp_feature_fixed_exit or force_marketable_limit or pos.strategy == "RSI9":
                 front_order_type = 20
                 refreshed_snapshot = latest_snapshot
                 try:
@@ -5494,9 +5495,36 @@ def execute_live_exit(
                     board_fetch_ts = now_jst()
                     storage.log("WARN", "EXIT_BOARD_REFRESH_FAILED", f"attempt={attempt+1} side={side} strategy={pos.strategy} error={e}")
                 limit_price = marketable_exit_limit_price(pos, refreshed_snapshot)
-                exit_order_mode = "best_quote_limit_ma5_exit" if is_ma5_trailing_exit else "marketable_limit"
+                if is_ma5_trailing_exit:
+                    exit_order_mode = "best_quote_limit_ma5_exit"
+                elif is_scalp_feature_fixed_exit:
+                    exit_order_mode = "best_quote_limit_scalp_feature_exit"
+                else:
+                    exit_order_mode = "marketable_limit"
                 if limit_price is None or limit_price <= 0:
                     return LiveOrderResult(False, "MARKETABLE_EXIT_LIMIT_PRICE_UNAVAILABLE", recoverable=True)
+                if is_scalp_feature_fixed_exit:
+                    storage.log_structured(
+                        "INFO",
+                        "SCALP_FEATURE_EXIT_LIMIT_PRICE_SELECTED",
+                        {
+                            **context,
+                            "ts": now_jst().isoformat(),
+                            "entry_rule": pos.entry_rule,
+                            "strategy": pos.strategy,
+                            "position_side": pos.side,
+                            "exit_reason": exit_reason_for_order,
+                            "best_bid": refreshed_snapshot.buy1_price if refreshed_snapshot else None,
+                            "best_ask": refreshed_snapshot.sell1_price if refreshed_snapshot else None,
+                            "selected_limit_price": limit_price,
+                            "front_order_type": front_order_type,
+                            "entry_price": pos.entry_price,
+                            "current_price": refreshed_snapshot.price if refreshed_snapshot else None,
+                            "take_ticks": pos.take_ticks,
+                            "stop_ticks": pos.stop_ticks,
+                            "pnl_ticks": pnl_ticks,
+                        },
+                    )
                 if is_ma5_trailing_exit:
                     storage.log_structured(
                         "INFO",
@@ -5544,6 +5572,10 @@ def execute_live_exit(
                 margin_trade_type=pos.margin_trade_type,
                 exchange=position_exchange,
             )
+            if (is_ma5_trailing_exit or is_scalp_feature_fixed_exit) and not force_market_order:
+                # live_exit_overrides must not turn protective best-quote limit exits into market orders.
+                payload["FrontOrderType"] = 20
+                payload["Price"] = float(limit_price or 0.0)
             validation_positions = positions_for_close_positions(positions, close_positions) if positions else close_position_rows_for_group(pos, close_positions)
             valid_payload, validation_reason = validate_exit_payload(payload, validation_positions, pos, group_total_qty)
             if not valid_payload:
