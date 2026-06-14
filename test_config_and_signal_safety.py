@@ -83,6 +83,8 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["long_rsi50_trend_hold"]["enabled"] is True
     assert runtime["long_rsi50_trend_hold"]["entry_rsi9_min"] == 50
     assert runtime["long_rsi50_trend_hold"]["exit_rsi9_max"] == 49
+    assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
+    assert runtime["entry_execution"]["fallback_to_market"] is False
     assert runtime["feature_entries"]["enabled"] is False
     assert runtime["feature_entries"]["long_rsi_pullback_scalp"] is False
     assert runtime["feature_entries"]["short_extended_ma5_fail_scalp"] is False
@@ -107,7 +109,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["short_extended_ma5_fail_scalp_stop_ticks"] == 20
     assert payload["big_trend_start_score_enabled"] is False
     assert payload["hold_score_extension_enabled"] is False
-    assert payload["new_entry_cutoff_time"] == "14:50:00"
+    assert payload["new_entry_cutoff_time"] == "15:10:00"
 
 
 def test_short_b_drop_ma75_down_blocked_in_bullish_pullback_structure():
@@ -314,6 +316,21 @@ def test_long_rsi50_trend_hold_entry_at_50_and_no_entry_below(monkeypatch):
     monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 49.99)
     pred2 = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
     assert pred2.signal == "NO_ACTION"
+
+
+def test_long_rsi50_trend_hold_allows_0900_0915_window(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 12, 9, 5, tzinfo=JST)
+    cfg = _base_runtime_config()
+    status = MonitorStatus()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    snap = TickSnapshot(ts, 67000, 1000, 66900, 67010, 10, 67000, 10)
+    history = _rsi50_history(ts)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 50.0)
+    pred = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred.signal == "LONG_CANDIDATE"
+    assert pred.reason_3 == "long_rsi50_trend_hold"
 
 
 def test_long_rsi50_mode_ignores_existing_feature_candidates():

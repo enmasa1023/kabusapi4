@@ -5,6 +5,7 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     PositionState,
     build_exit_order_payload,
     close_position_groups_from_managed_state,
+    entry_limit_price,
     TickSnapshot,
     Bar,
     FeatureSnapshot,
@@ -347,3 +348,9 @@ def test_force_close_1520_remains_market_order():
     payload = client.sent_payloads[0]
     assert payload["FrontOrderType"] == 10
     assert payload["Price"] == 0.0
+
+
+def test_long_entry_marketable_best_uses_best_ask_limit():
+    snap = TickSnapshot(datetime(2026, 6, 12, 9, 5), 69005, 1000, 69000, 69010, 10, 69000, 10)
+    assert entry_limit_price("LONG", snap, "marketable_best") == 69010
+    assert base_config()["exit_front_order_type"] == 10

@@ -87,7 +87,7 @@
     "fallback_market_after_signal_sec": 180.0
   },
   "force_close_after": "15:20:00",
-  "new_entry_cutoff_time": "14:50:00",
+  "new_entry_cutoff_time": "15:10:00",
   "strategy_mode": "long_rsi50_trend_hold_only",
   "long_rsi50_trend_hold": {
     "enabled": true,

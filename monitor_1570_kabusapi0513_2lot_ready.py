@@ -2997,7 +2997,10 @@ def build_long_rsi50_trend_hold_prediction(
         return None
     cfg = long_rsi50_trend_hold_config(config)
     entry_rsi9_min = float(cfg.get("entry_rsi9_min", 50))
-    in_no_entry = bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15
+    # long_rsi50_trend_hold_only intentionally does not apply the legacy
+    # 09:00-09:15 no-entry window.  It only respects the configured
+    # new_entry_cutoff_time and the generic safety/pending/live-state guards.
+    in_no_entry = False
     pending_entry = bool(status is not None and status.pending_entry_side is not None)
     pending_exit = bool(status is not None and status.pending_exit)
     live_state_ok = status is None or status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
