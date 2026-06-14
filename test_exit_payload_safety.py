@@ -288,3 +288,62 @@ def test_scalp_feature_long_take_profit_and_stop_loss_use_best_bid_limit():
 def test_scalp_feature_short_take_profit_and_stop_loss_use_best_ask_limit():
     _assert_scalp_exit_best_quote_limit("SHORT", "SCALP_FEATURE_SHORT", "short_extended_ma5_fail_scalp", "TAKE_PROFIT", 69010)
     _assert_scalp_exit_best_quote_limit("SHORT", "SCALP_FEATURE_SHORT", "short_extended_ma5_fail_scalp", "STOP_LOSS", 69010)
+
+
+def test_long_rsi50_exit_uses_best_bid_limit_not_market():
+    cfg = base_config()
+    pos = base_position(exchange=27, qty=2)
+    pos.strategy = "LONG_RSI50_TREND_HOLD"
+    pos.entry_rule = "long_rsi50_trend_hold"
+    status = Status()
+    status.open_position = pos
+    client = FakeClient(pos.managed_close_positions)
+    client.send_order = lambda payload: (client.sent_payloads.append(payload) or {"OrderId": "ok"})
+    storage = FakeStorage()
+    result = execute_live_exit(
+        client,
+        cfg,
+        "LONG",
+        storage,
+        pos,
+        None,
+        status,
+        force_marketable_limit=False,
+        force_market_order=False,
+        signal_price=69005.0,
+        pnl_ticks=10.0,
+        ma5_exit_context={"exit_reason": "RSI9_LE_49_EXIT"},
+    )
+    assert result.order_id == "ok"
+    payload = client.sent_payloads[0]
+    assert payload["FrontOrderType"] == 20
+    assert payload["Price"] == 69000
+    assert payload["Price"] > 0
+
+
+def test_force_close_1520_remains_market_order():
+    cfg = base_config()
+    pos = base_position(exchange=27, qty=2)
+    status = Status()
+    status.open_position = pos
+    client = FakeClient(pos.managed_close_positions)
+    client.send_order = lambda payload: (client.sent_payloads.append(payload) or {"OrderId": "ok"})
+    storage = FakeStorage()
+    result = execute_live_exit(
+        client,
+        cfg,
+        "LONG",
+        storage,
+        pos,
+        None,
+        status,
+        force_marketable_limit=False,
+        force_market_order=True,
+        signal_price=69005.0,
+        pnl_ticks=10.0,
+        ma5_exit_context={"exit_reason": "FORCE_CLOSE_1520"},
+    )
+    assert result.order_id == "ok"
+    payload = client.sent_payloads[0]
+    assert payload["FrontOrderType"] == 10
+    assert payload["Price"] == 0.0

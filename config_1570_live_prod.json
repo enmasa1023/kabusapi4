@@ -88,6 +88,17 @@
   },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "14:50:00",
+  "strategy_mode": "long_rsi50_trend_hold_only",
+  "long_rsi50_trend_hold": {
+    "enabled": true,
+    "entry_rsi9_min": 50,
+    "exit_rsi9_max": 49,
+    "hard_stop_ticks": 20,
+    "allow_short": false,
+    "allow_add_position": false,
+    "use_take_profit": false,
+    "use_ma5_trailing": false
+  },
   "rsi70_drop_long_watch": {
     "enabled": true,
     "watch_minutes": 10,
@@ -96,11 +107,11 @@
     "allow_same_bar_trigger": false
   },
   "feature_entries": {
-    "enabled": true,
-    "long_vwap_volume_momentum": true,
-    "short_vwap_extended_fail": true,
-    "long_rsi_pullback_scalp": true,
-    "short_extended_ma5_fail_scalp": true
+    "enabled": false,
+    "long_vwap_volume_momentum": false,
+    "short_vwap_extended_fail": false,
+    "long_rsi_pullback_scalp": false,
+    "short_extended_ma5_fail_scalp": false
   },
   "big_trend_start_score": {
     "enabled": false,
@@ -108,7 +119,7 @@
     "short_threshold": 9
   },
   "hold_score_extension": {
-    "enabled": true,
+    "enabled": false,
     "long_only": true,
     "score_threshold": 8,
     "release_threshold": 6,

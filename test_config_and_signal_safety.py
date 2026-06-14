@@ -6,10 +6,15 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     FeatureSnapshot,
     MonitorStatus,
     build_runtime_config,
+    build_long_rsi50_trend_hold_prediction,
     load_config,
+    PredictionSnapshot,
     short_b_drop_ma75_down_structure_decision,
+    should_exit,
     start_rsi17_bullish_pullback_long_watch,
     startup_config_effective_payload,
+    TickSnapshot,
+    PositionState,
     HARD_STOP_TICKS,
 )
 
@@ -74,26 +79,34 @@ def test_runtime_config_preserves_enabled_nested_settings():
     cfg = load_config("config_1570_live_prod.json")
     runtime = build_runtime_config(cfg, _args())
     payload = startup_config_effective_payload(runtime)
-    assert runtime["feature_entries"]["enabled"] is True
-    assert runtime["feature_entries"]["long_rsi_pullback_scalp"] is True
-    assert runtime["feature_entries"]["short_extended_ma5_fail_scalp"] is True
+    assert runtime["strategy_mode"] == "long_rsi50_trend_hold_only"
+    assert runtime["long_rsi50_trend_hold"]["enabled"] is True
+    assert runtime["long_rsi50_trend_hold"]["entry_rsi9_min"] == 50
+    assert runtime["long_rsi50_trend_hold"]["exit_rsi9_max"] == 49
+    assert runtime["feature_entries"]["enabled"] is False
+    assert runtime["feature_entries"]["long_rsi_pullback_scalp"] is False
+    assert runtime["feature_entries"]["short_extended_ma5_fail_scalp"] is False
     assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["take_ticks"] == 10
     assert runtime["scalp_feature_entries"]["long_rsi_pullback_scalp"]["stop_ticks"] == 15
     assert runtime["scalp_feature_entries"]["short_extended_ma5_fail_scalp"]["stop_ticks"] == 20
     assert HARD_STOP_TICKS == 20
     assert runtime["hard_stop_ticks"] == 20
     assert runtime["big_trend_start_score"]["enabled"] is False
-    assert runtime["hold_score_extension"]["enabled"] is True
+    assert runtime["hold_score_extension"]["enabled"] is False
     assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is True
-    assert payload["feature_entries_enabled"] is True
-    assert payload["feature_long_rsi_pullback_scalp"] is True
-    assert payload["feature_short_extended_ma5_fail_scalp"] is True
+    assert payload["strategy_mode"] == "long_rsi50_trend_hold_only"
+    assert payload["long_rsi50_trend_hold_enabled"] is True
+    assert payload["long_rsi50_trend_hold_entry_rsi9_min"] == 50
+    assert payload["long_rsi50_trend_hold_exit_rsi9_max"] == 49
+    assert payload["feature_entries_enabled"] is False
+    assert payload["feature_long_rsi_pullback_scalp"] is False
+    assert payload["feature_short_extended_ma5_fail_scalp"] is False
     assert payload["hard_stop_ticks"] == 20
     assert payload["long_rsi_pullback_scalp_take_ticks"] == 10
     assert payload["long_rsi_pullback_scalp_stop_ticks"] == 15
     assert payload["short_extended_ma5_fail_scalp_stop_ticks"] == 20
     assert payload["big_trend_start_score_enabled"] is False
-    assert payload["hold_score_extension_enabled"] is True
+    assert payload["hold_score_extension_enabled"] is False
     assert payload["new_entry_cutoff_time"] == "14:50:00"
 
 
@@ -163,6 +176,17 @@ def _base_runtime_config():
     return build_runtime_config(load_config("config_1570_live_prod.json"), _args())
 
 
+def _feature_enabled_runtime_config():
+    cfg = _base_runtime_config()
+    cfg["strategy_mode"] = "legacy"
+    cfg["feature_entries"]["enabled"] = True
+    cfg["feature_entries"]["long_vwap_volume_momentum"] = True
+    cfg["feature_entries"]["short_vwap_extended_fail"] = True
+    cfg["feature_entries"]["long_rsi_pullback_scalp"] = True
+    cfg["feature_entries"]["short_extended_ma5_fail_scalp"] = True
+    return cfg
+
+
 def test_existing_feature_position_uses_config_hard_stop_20():
     from monitor_1570_kabusapi0513_2lot_ready import PredictionSnapshot, create_position
 
@@ -179,7 +203,7 @@ def test_long_rsi_pullback_scalp_triggers_and_applies_exit_ticks():
     from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates, create_position
 
     ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
-    cfg = _base_runtime_config()
+    cfg = _feature_enabled_runtime_config()
     feature = _feature(ts, 67000, 66900, "trend_up")
     candidates = build_scalp_feature_candidates(
         feature,
@@ -206,7 +230,7 @@ def test_long_rsi_pullback_scalp_blocks_below_vwap_or_rsi_rising():
     from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates
 
     ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
-    cfg = _base_runtime_config()
+    cfg = _feature_enabled_runtime_config()
     latest = _bar(ts, 67000, 66950, 66920, 66800, 66900)
     below_vwap = build_scalp_feature_candidates(
         _feature(ts, 66800, 66900, "range"), {}, cfg, 35.0, 38.0, latest,
@@ -224,7 +248,7 @@ def test_short_extended_ma5_fail_scalp_triggers_and_applies_exit_ticks():
     from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates, create_position
 
     ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
-    cfg = _base_runtime_config()
+    cfg = _feature_enabled_runtime_config()
     feature = _feature(ts, 67000, 65000, "range")
     feature.vwap_gap_bps = 200.0
     metrics = {"abs_vwap_gap_bps": 200.0, "ret5_ticks": 10.0, "ret1_ticks": -6.0}
@@ -247,7 +271,7 @@ def test_short_extended_ma5_fail_scalp_blocks_ma5_above_or_gap_insufficient_or_o
     from monitor_1570_kabusapi0513_2lot_ready import build_scalp_feature_candidates
 
     ts = datetime(2026, 6, 11, 10, 0, tzinfo=JST)
-    cfg = _base_runtime_config()
+    cfg = _feature_enabled_runtime_config()
     feature = _feature(ts, 67000, 65000, "range")
     feature.vwap_gap_bps = 200.0
     metrics = {"abs_vwap_gap_bps": 200.0, "ret5_ticks": 10.0, "ret1_ticks": -6.0}
@@ -267,3 +291,79 @@ def test_short_extended_ma5_fail_scalp_blocks_ma5_above_or_gap_insufficient_or_o
         allow_new_entry=True, entry_cutoff_reached=False, open_position_exists=True,
     )
     assert with_position == []
+
+
+def _rsi50_history(ts):
+    return [_bar(ts - timedelta(minutes=14 - i), 67000 + i, 67000, 67000, 67000, 67000) for i in range(15)]
+
+
+def test_long_rsi50_trend_hold_entry_at_50_and_no_entry_below(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    status = MonitorStatus()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    snap = TickSnapshot(ts, 67000, 1000, 66900, 67010, 10, 67000, 10)
+    history = _rsi50_history(ts)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 50.0)
+    pred = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred.signal == "LONG_CANDIDATE"
+    assert pred.reason_1 == "LONG_RSI50_TREND_HOLD"
+    assert pred.reason_3 == "long_rsi50_trend_hold"
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 49.99)
+    pred2 = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred2.signal == "NO_ACTION"
+
+
+def test_long_rsi50_mode_ignores_existing_feature_candidates():
+    cfg = _feature_enabled_runtime_config()
+    cfg["strategy_mode"] = "long_rsi50_trend_hold_only"
+    assert cfg["feature_entries"]["enabled"] is True
+    # Existing feature helpers may still identify candidates when invoked
+    # directly, but run_monitor bypasses them in long_rsi50_trend_hold_only mode.
+    assert cfg["strategy_mode"] == "long_rsi50_trend_hold_only"
+
+
+def _long_rsi50_position(ts):
+    return PositionState(
+        side="LONG",
+        strategy="LONG_RSI50_TREND_HOLD",
+        entry_ts=ts - timedelta(minutes=5),
+        entry_price=67000.0,
+        entry_p_up_1m=0.5,
+        entry_p_up_3m=0.5,
+        stop_ticks=20,
+        take_ticks=0,
+        min_hold_sec=0,
+        max_hold_sec=3600,
+        entry_rule="long_rsi50_trend_hold",
+        hard_stop_ticks=20,
+    )
+
+
+def test_long_rsi50_trend_hold_exit_at_49_and_holds_above():
+    ts = datetime(2026, 6, 12, 10, 10, tzinfo=JST)
+    cfg = _base_runtime_config()
+    pos = _long_rsi50_position(ts)
+    feature = _feature(ts, 67050, 66900, "trend_up")
+    pred = PredictionSnapshot(ts, "LONG_RSI50_TREND_HOLD", 0.5, 0.5, 0.5, 0.5, "NO_ACTION", 49.0, "LONG_RSI50_TREND_HOLD", "rsi9=49.00", "none")
+    ex, reason, _ = should_exit(pos, feature, pred, bar1_new=_bar(ts, 67050, 67000, 67000, 67000, 66900), config=cfg, latest_snapshot=TickSnapshot(ts, 67050, 1000, 66900, 67060, 10, 67050, 10))
+    assert ex is True
+    assert reason == "RSI9_LE_49_EXIT"
+    pred_hold = PredictionSnapshot(ts, "LONG_RSI50_TREND_HOLD", 0.5, 0.5, 0.5, 0.5, "NO_ACTION", 49.1, "LONG_RSI50_TREND_HOLD", "rsi9=49.10", "none")
+    ex2, reason2, _ = should_exit(pos, feature, pred_hold, bar1_new=_bar(ts, 67050, 67000, 67000, 67000, 66900), config=cfg)
+    assert ex2 is False
+    assert reason2 == "HOLD"
+
+
+def test_long_rsi50_trend_hold_hard_stop_uses_20_ticks():
+    ts = datetime(2026, 6, 12, 10, 10, tzinfo=JST)
+    cfg = _base_runtime_config()
+    pos = _long_rsi50_position(ts)
+    feature = _feature(ts, 66800, 66900, "trend_up")
+    pred = PredictionSnapshot(ts, "LONG_RSI50_TREND_HOLD", 0.5, 0.5, 0.5, 0.5, "NO_ACTION", 55.0, "LONG_RSI50_TREND_HOLD", "rsi9=55.00", "none")
+    ex, reason, pnl = should_exit(pos, feature, pred, bar1_new=_bar(ts, 66800, 67000, 67000, 67000, 66900), config=cfg)
+    assert pnl <= -20
+    assert ex is True
+    assert reason == "HARD_STOP_LOSS"

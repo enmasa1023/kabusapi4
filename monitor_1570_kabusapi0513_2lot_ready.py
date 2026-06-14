@@ -91,6 +91,10 @@ MAX_HOLD_SEC_3M = 300
 STOP_TICKS_1M = 10
 STOP_TICKS_3M = 10
 HARD_STOP_TICKS = 20
+STRATEGY_MODE_LONG_RSI50_ONLY = "long_rsi50_trend_hold_only"
+LONG_RSI50_ENTRY_RULE = "long_rsi50_trend_hold"
+LONG_RSI50_STRATEGY = "LONG_RSI50_TREND_HOLD"
+LONG_RSI50_EXIT_REASON = "RSI9_LE_49_EXIT"
 TAKE_TICKS_1M = 10
 TAKE_TICKS_3M = 10
 PROB_UPPER_1M = 0.58
@@ -187,10 +191,20 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "feature_entries": {
         "enabled": False,
-        "long_vwap_volume_momentum": True,
-        "short_vwap_extended_fail": True,
-        "long_rsi_pullback_scalp": True,
-        "short_extended_ma5_fail_scalp": True,
+        "long_vwap_volume_momentum": False,
+        "short_vwap_extended_fail": False,
+        "long_rsi_pullback_scalp": False,
+        "short_extended_ma5_fail_scalp": False,
+    },
+    "long_rsi50_trend_hold": {
+        "enabled": True,
+        "entry_rsi9_min": 50,
+        "exit_rsi9_max": 49,
+        "hard_stop_ticks": 20,
+        "allow_short": False,
+        "allow_add_position": False,
+        "use_take_profit": False,
+        "use_ma5_trailing": False,
     },
     "scalp_feature_entries": SCALP_FEATURE_RULE_DEFAULTS,
     "big_trend_start_score": {
@@ -270,6 +284,7 @@ def build_runtime_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[
         "live_entry_overrides_long": cfg.get("live_entry_overrides_long", {}),
         "live_entry_overrides_short": cfg.get("live_entry_overrides_short", {}),
         "live_exit_overrides": cfg.get("live_exit_overrides", {}),
+        "strategy_mode": str(cfg.get("strategy_mode", "legacy")),
     }
     for key, defaults in NESTED_CONFIG_DEFAULTS.items():
         raw_value = cfg.get(key, {})
@@ -285,6 +300,7 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
     hold_cfg = config.get("hold_score_extension", {}) if isinstance(config.get("hold_score_extension"), dict) else {}
     rsi70_cfg = config.get("rsi70_drop_long_watch", {}) if isinstance(config.get("rsi70_drop_long_watch"), dict) else {}
     analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals"), dict) else {}
+    rsi50_cfg = long_rsi50_trend_hold_config(config)
     return {
         "config_path": config.get("config_path"),
         "config_file_loaded": bool(config.get("config_file_loaded")),
@@ -300,6 +316,10 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "force_close_after": config.get("force_close_after"),
         "new_entry_cutoff_time": config.get("new_entry_cutoff_time"),
         "hard_stop_ticks": int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
+        "strategy_mode": config.get("strategy_mode", "legacy"),
+        "long_rsi50_trend_hold_enabled": bool(rsi50_cfg.get("enabled", False)),
+        "long_rsi50_trend_hold_entry_rsi9_min": float(rsi50_cfg.get("entry_rsi9_min", 50)),
+        "long_rsi50_trend_hold_exit_rsi9_max": float(rsi50_cfg.get("exit_rsi9_max", 49)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
@@ -1682,6 +1702,18 @@ def scalp_feature_rule_config(config: dict[str, Any], rule_name: str) -> dict[st
     return deep_merge_dict(defaults, raw_rule)
 
 
+def long_rsi50_trend_hold_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("long_rsi50_trend_hold", {}) if isinstance(config.get("long_rsi50_trend_hold"), dict) else {}
+    return deep_merge_dict(NESTED_CONFIG_DEFAULTS["long_rsi50_trend_hold"], raw)
+
+
+def is_long_rsi50_trend_hold_only(config: dict[str, Any]) -> bool:
+    return (
+        str(config.get("strategy_mode", "legacy")) == STRATEGY_MODE_LONG_RSI50_ONLY
+        and bool(long_rsi50_trend_hold_config(config).get("enabled", True))
+    )
+
+
 def scalp_feature_ticks(config: dict[str, Any], rule_name: str) -> tuple[int, int]:
     rule_cfg = scalp_feature_rule_config(config, rule_name)
     defaults = SCALP_FEATURE_RULE_DEFAULTS[rule_name]
@@ -2943,6 +2975,103 @@ def build_rsi9_prediction(
     )
 
 
+def build_long_rsi50_trend_hold_prediction(
+    bar1: Optional[Bar],
+    history: list[Bar],
+    open_pos: Optional[PositionState],
+    status: Optional[MonitorStatus],
+    feature: FeatureSnapshot,
+    latest_snapshot: Optional[TickSnapshot],
+    config: dict[str, Any],
+    storage: Optional[Storage] = None,
+    allow_new_entry: bool = True,
+    new_entry_cutoff_reached: bool = False,
+) -> Optional[PredictionSnapshot]:
+    if bar1 is None:
+        return None
+    closes = [b.close for b in history]
+    if len(closes) <= RSI9_PERIOD + 1:
+        return None
+    rsi_now = rsi9_wilder(closes, RSI9_PERIOD)
+    if rsi_now is None:
+        return None
+    cfg = long_rsi50_trend_hold_config(config)
+    entry_rsi9_min = float(cfg.get("entry_rsi9_min", 50))
+    in_no_entry = bar1.ts.hour == 9 and 0 <= bar1.ts.minute <= 15
+    pending_entry = bool(status is not None and status.pending_entry_side is not None)
+    pending_exit = bool(status is not None and status.pending_exit)
+    live_state_ok = status is None or status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
+    can_enter_ok = True
+    can_enter_reason = "OK"
+    if status is not None:
+        can_enter_ok, can_enter_reason = can_enter("LONG", bar1.ts, status)
+    entry_ok = (
+        bool(cfg.get("enabled", True))
+        and open_pos is None
+        and not pending_entry
+        and not pending_exit
+        and allow_new_entry
+        and not new_entry_cutoff_reached
+        and not in_no_entry
+        and live_state_ok
+        and can_enter_ok
+        and rsi_now >= entry_rsi9_min
+    )
+    signal = "LONG_CANDIDATE" if entry_ok else "NO_ACTION"
+    reason_3 = LONG_RSI50_ENTRY_RULE if entry_ok else "none"
+    if entry_ok and storage is not None:
+        storage.log_structured(
+            "INFO",
+            "LONG_RSI50_TREND_HOLD_ENTRY_TRIGGERED",
+            {
+                "ts": feature.ts.isoformat(),
+                "bar_ts": bar1.ts.isoformat(),
+                "price": feature.price,
+                "best_ask": latest_snapshot.sell1_price if latest_snapshot is not None else None,
+                "rsi9": rsi_now,
+                "entry_rsi9_min": entry_rsi9_min,
+                "entry_rule": LONG_RSI50_ENTRY_RULE,
+                "strategy": LONG_RSI50_STRATEGY,
+                "position_state": position_state_payload(open_pos),
+                "pending_entry": pending_entry,
+                "pending_exit": pending_exit,
+            },
+        )
+    elif storage is not None and bar1.ts == feature.ts.replace(second=0, microsecond=0):
+        storage.log_structured(
+            "INFO",
+            "LONG_RSI50_TREND_HOLD_ENTRY_EVALUATED",
+            {
+                "ts": feature.ts.isoformat(),
+                "bar_ts": bar1.ts.isoformat(),
+                "rsi9": rsi_now,
+                "entry_rsi9_min": entry_rsi9_min,
+                "signal": signal,
+                "allow_new_entry": allow_new_entry,
+                "new_entry_cutoff_reached": new_entry_cutoff_reached,
+                "in_no_entry": in_no_entry,
+                "open_position_exists": open_pos is not None,
+                "pending_entry": pending_entry,
+                "pending_exit": pending_exit,
+                "live_state_ok": live_state_ok,
+                "can_enter": {"ok": can_enter_ok, "reason": can_enter_reason},
+            },
+        )
+    return PredictionSnapshot(
+        ts=bar1.ts,
+        regime=LONG_RSI50_STRATEGY,
+        p_up_1m=0.5,
+        p_down_1m=0.5,
+        p_up_3m=0.5,
+        p_down_3m=0.5,
+        signal=signal,
+        rsi9_value=rsi_now,
+        reason_1=LONG_RSI50_STRATEGY,
+        reason_2=f"rsi9={rsi_now:.2f}",
+        reason_3=reason_3,
+    )
+
+
 
 
 def extract_rsi_from_pred(pred: Optional[PredictionSnapshot]) -> Optional[float]:
@@ -2986,7 +3115,11 @@ def create_position(
         is_long = pred.signal == "LONG_CANDIDATE"
         side = "LONG" if is_long else "SHORT"
     is_long = side == "LONG"
-    if pred.reason_1 == "RSI9_ONLY":
+    if pred.reason_1 == LONG_RSI50_STRATEGY or pred.reason_3 == LONG_RSI50_ENTRY_RULE:
+        strategy = LONG_RSI50_STRATEGY
+        hard_stop = int(long_rsi50_trend_hold_config(config).get("hard_stop_ticks", config.get("hard_stop_ticks", HARD_STOP_TICKS)))
+        stop_ticks, take_ticks, min_hold, max_hold = hard_stop, 0, 0, 3600
+    elif pred.reason_1 == "RSI9_ONLY":
         strategy = "RSI9"
         stop_ticks, take_ticks, min_hold, max_hold = 9999, 9999, 0, 3600
     elif pred.reason_1 in SCALP_EXIT_PARAMS:
@@ -3032,7 +3165,7 @@ def create_position(
         order_qty=int(config.get("order_qty",2)),
         filled_qty=0,
         remaining_qty=0,
-        hard_stop_ticks=stop_ticks if strategy in SCALP_FEATURE_STRATEGIES else int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
+        hard_stop_ticks=stop_ticks if strategy in SCALP_FEATURE_STRATEGIES or strategy == LONG_RSI50_STRATEGY else int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
     )
 
 
@@ -3046,10 +3179,10 @@ def scalp_feature_entry_parameters_payload(pos: PositionState, entry_rule: str) 
     take_delta = pos.take_ticks * tick_size
     stop_delta = pos.stop_ticks * tick_size
     if pos.side == "LONG":
-        take_price = pos.entry_price + take_delta
+        take_price = (pos.entry_price + take_delta) if pos.take_ticks > 0 else None
         stop_price = pos.entry_price - stop_delta
     else:
-        take_price = pos.entry_price - take_delta
+        take_price = (pos.entry_price - take_delta) if pos.take_ticks > 0 else None
         stop_price = pos.entry_price + stop_delta
     return {
         "entry_rule": entry_rule,
@@ -3065,6 +3198,8 @@ def scalp_feature_entry_parameters_payload(pos: PositionState, entry_rule: str) 
 
 
 def entry_risk_parameter_source(pos: PositionState, entry_rule: str) -> str:
+    if pos.strategy == LONG_RSI50_STRATEGY or entry_rule == LONG_RSI50_ENTRY_RULE:
+        return LONG_RSI50_ENTRY_RULE
     if pos.strategy in SCALP_FEATURE_STRATEGIES and is_scalp_feature_rule(entry_rule):
         return f"scalp_feature_entries.{entry_rule}"
     return "config.hard_stop_ticks"
@@ -3414,12 +3549,59 @@ def should_exit(
     hold_score_config: Optional[dict[str, Any]] = None,
     analysis_config: Optional[dict[str, Any]] = None,
     feature_metrics: Optional[dict[str, Any]] = None,
+    config: Optional[dict[str, Any]] = None,
+    latest_snapshot: Optional[TickSnapshot] = None,
 ) -> tuple[bool, str, float]:
     # Profit exits for STRAT_1M/STRAT_3M/RSI9 (including RSI17 special entries)
     # are managed by +10tick activation followed by confirmed-1m-MA5 exit rules.
     # This intentionally replaces fixed +10tick / +5tick staged take-profit orders
     # and the former highest/lowest-price 20tick trailing stop while preserving
     # HARD_STOP_LOSS and the external force-close flow.
+    if pos.strategy == LONG_RSI50_STRATEGY:
+        pnl_ticks = current_pnl_ticks(pos, f.price)
+        if pnl_ticks <= -pos.hard_stop_ticks:
+            if storage is not None:
+                storage.log_structured(
+                    "WARN",
+                    "HARD_STOP_LOSS_SIGNAL",
+                    {
+                        "ts": f.ts.isoformat(),
+                        "side": pos.side,
+                        "strategy": pos.strategy,
+                        "entry_rule": pos.entry_rule,
+                        "entry_price": pos.entry_price,
+                        "current_price": f.price,
+                        "pnl_ticks": pnl_ticks,
+                        "hard_stop_ticks": pos.hard_stop_ticks,
+                        "exit_reason": "HARD_STOP_LOSS",
+                    },
+                )
+            return True, "HARD_STOP_LOSS", pnl_ticks
+        cfg = long_rsi50_trend_hold_config(config or {})
+        exit_rsi9_max = float(cfg.get("exit_rsi9_max", 49))
+        if bar1_new is not None and pred.rsi9_value is not None and pred.rsi9_value <= exit_rsi9_max:
+            if storage is not None:
+                storage.log_structured(
+                    "INFO",
+                    "LONG_RSI50_TREND_HOLD_EXIT_TRIGGERED",
+                    {
+                        "ts": f.ts.isoformat(),
+                        "bar_ts": bar1_new.ts.isoformat(),
+                        "entry_rule": pos.entry_rule,
+                        "strategy": pos.strategy,
+                        "position_side": pos.side,
+                        "entry_price": pos.entry_price,
+                        "current_price": f.price,
+                        "best_bid": latest_snapshot.buy1_price if latest_snapshot is not None else None,
+                        "rsi9": pred.rsi9_value,
+                        "exit_rsi9_max": exit_rsi9_max,
+                        "pnl_ticks": pnl_ticks,
+                        "exit_reason": LONG_RSI50_EXIT_REASON,
+                    },
+                )
+            return True, LONG_RSI50_EXIT_REASON, pnl_ticks
+        return False, "HOLD", pnl_ticks
+
     return update_trailing_exit(
         pos,
         f,
@@ -5470,6 +5652,7 @@ def execute_live_exit(
         exit_reason_for_order = ma5_exit_context.get("exit_reason") if isinstance(ma5_exit_context, dict) else ("FORCE_CLOSE" if force_market_order else "LIVE_EXIT")
         is_ma5_trailing_exit = exit_reason_for_order in MA5_TRAILING_EXIT_REASONS
         is_scalp_feature_fixed_exit = pos.strategy in SCALP_FEATURE_STRATEGIES and exit_reason_for_order in {"TAKE_PROFIT", "STOP_LOSS"}
+        is_long_rsi50_exit = pos.strategy == LONG_RSI50_STRATEGY and exit_reason_for_order == LONG_RSI50_EXIT_REASON
         if exit_reason_for_order != "HARD_STOP_LOSS" and status.failed_close_signature == close_signature and status.failed_close_signature_ts is not None:
             if (now_jst() - status.failed_close_signature_ts).total_seconds() < 30:
                 storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_FAILED_RETRY", {**context, "reason": "BACKOFF_SAME_CLOSE_SIGNATURE", "close_signature": close_signature, "failed_close_signature_ts": status.failed_close_signature_ts.isoformat(), "positions_summary": positions_summary_for_log(positions)})
@@ -5482,7 +5665,7 @@ def execute_live_exit(
                 front_order_type = 10
                 limit_price = 0.0
                 exit_order_mode = "market_1520_force_close"
-            elif is_ma5_trailing_exit or is_scalp_feature_fixed_exit or force_marketable_limit or pos.strategy == "RSI9":
+            elif is_ma5_trailing_exit or is_scalp_feature_fixed_exit or is_long_rsi50_exit or force_marketable_limit or pos.strategy == "RSI9":
                 front_order_type = 20
                 refreshed_snapshot = latest_snapshot
                 try:
@@ -5499,6 +5682,8 @@ def execute_live_exit(
                     exit_order_mode = "best_quote_limit_ma5_exit"
                 elif is_scalp_feature_fixed_exit:
                     exit_order_mode = "best_quote_limit_scalp_feature_exit"
+                elif is_long_rsi50_exit:
+                    exit_order_mode = "best_quote_limit_long_rsi50_exit"
                 else:
                     exit_order_mode = "marketable_limit"
                 if limit_price is None or limit_price <= 0:
@@ -5572,7 +5757,7 @@ def execute_live_exit(
                 margin_trade_type=pos.margin_trade_type,
                 exchange=position_exchange,
             )
-            if (is_ma5_trailing_exit or is_scalp_feature_fixed_exit) and not force_market_order:
+            if (is_ma5_trailing_exit or is_scalp_feature_fixed_exit or is_long_rsi50_exit) and not force_market_order:
                 # live_exit_overrides must not turn protective best-quote limit exits into market orders.
                 payload["FrontOrderType"] = 20
                 payload["Price"] = float(limit_price or 0.0)
@@ -6667,29 +6852,47 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     and status.pending_entry_side is None
                     and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
                 )
-                p = build_rsi9_prediction(
-                    rb1.latest(),
-                    list(rb1.history),
-                    status.open_position,
-                    status=status,
-                    storage=storage,
-                    allow_new_entry=allow_new_entry,
-                    rsi70_watch_config=config.get("rsi70_drop_long_watch", {}),
-                    new_entry_cutoff_reached=entry_cutoff_reached,
-                    rsi17_bullish_watch_config=config.get("rsi17_drop_bullish_pullback_long_watch", {}),
-                    feature=f,
-                )
+                long_rsi50_only = is_long_rsi50_trend_hold_only(config)
+                if long_rsi50_only and status.pending_add:
+                    status.pending_add = False
+                    storage.log("INFO", "LONG_RSI50_MODE_PENDING_ADD_CLEARED", "reason=ADD_DISABLED_IN_LONG_RSI50_TREND_HOLD_ONLY")
+                if long_rsi50_only:
+                    p = build_long_rsi50_trend_hold_prediction(
+                        rb1.latest(),
+                        list(rb1.history),
+                        status.open_position,
+                        status,
+                        f,
+                        snap,
+                        config,
+                        storage=storage,
+                        allow_new_entry=allow_new_entry,
+                        new_entry_cutoff_reached=entry_cutoff_reached,
+                    )
+                else:
+                    p = build_rsi9_prediction(
+                        rb1.latest(),
+                        list(rb1.history),
+                        status.open_position,
+                        status=status,
+                        storage=storage,
+                        allow_new_entry=allow_new_entry,
+                        rsi70_watch_config=config.get("rsi70_drop_long_watch", {}),
+                        new_entry_cutoff_reached=entry_cutoff_reached,
+                        rsi17_bullish_watch_config=config.get("rsi17_drop_bullish_pullback_long_watch", {}),
+                        feature=f,
+                    )
                 if p is None:
                     continue
                 metrics = extended_feature_metrics(f, list(rb1.history))
                 analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals", {}), dict) else {}
                 feature_cfg = config.get("feature_entries", {}) if isinstance(config.get("feature_entries", {}), dict) else {}
                 feature_enabled = bool(feature_cfg.get("enabled", False))
-                if bar1_new is not None:
+                if bar1_new is not None and not long_rsi50_only:
                     storage.log_structured("INFO", "FEATURE_ENTRY_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": feature_enabled, "raw_config_value": feature_cfg.get("enabled"), "effective_value": feature_enabled, "reason_if_disabled": "" if feature_enabled else "feature_entries.enabled_false_or_missing"})
                 history_list = list(rb1.history)
                 rsi9_prev_for_feature = rsi9_wilder([b.close for b in history_list[:-1]], RSI9_PERIOD) if len(history_list) > RSI9_PERIOD + 1 else None
-                feature_candidates: list[PredictionSnapshot] = build_scalp_feature_candidates(
+                feature_candidates: list[PredictionSnapshot] = [] if long_rsi50_only else build_scalp_feature_candidates(
                     f,
                     metrics,
                     config,
@@ -6702,7 +6905,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     storage=storage,
                     log_blocked=bar1_new is not None,
                 )
-                if not entry_cutoff_reached and status.open_position is None and allow_new_entry:
+                if (not long_rsi50_only) and not entry_cutoff_reached and status.open_position is None and allow_new_entry:
                     if bool(feature_cfg.get("long_vwap_volume_momentum", True)):
                         if (
                             metrics.get("abs_vwap_gap_bps") is not None
@@ -6723,7 +6926,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             and metrics["ret1_ticks"] <= -5
                         ):
                             feature_candidates.append(PredictionSnapshot(f.ts, "FEATURE_ENTRY", 0.5, 0.5, 0.5, 0.5, "SHORT_CANDIDATE", p.rsi9_value, "FEATURE_ENTRY", f"ret1_ticks={metrics['ret1_ticks']:.2f}", "short_feature_vwap_extended_fail"))
-                if feature_candidates:
+                if (not long_rsi50_only) and feature_candidates:
                     if feature_enabled and p.signal == "NO_ACTION":
                         p = feature_candidates[0]
                         storage.log_structured(
@@ -6747,12 +6950,12 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             storage.log_structured("INFO", "FEATURE_ENTRY_CANDIDATE_LOG_ONLY", {"ts": f.ts.isoformat(), "signal": fp.signal, "reason_1": fp.reason_1, "reason_3": fp.reason_3, "metrics": metrics, "feature_entries_enabled": feature_enabled})
                 big_trend_cfg = config.get("big_trend_start_score", {}) if isinstance(config.get("big_trend_start_score", {}), dict) else {}
                 big_trend_enabled = bool(big_trend_cfg.get("enabled", False))
-                if bar1_new is not None:
+                if bar1_new is not None and not long_rsi50_only:
                     storage.log_structured("INFO", "BIG_TREND_START_SCORE_ENABLED_DECISION", {"ts": f.ts.isoformat(), "enabled_from_runtime_config": big_trend_enabled, "raw_config_value": big_trend_cfg.get("enabled"), "effective_value": big_trend_enabled, "reason_if_disabled": "" if big_trend_enabled else "big_trend_start_score.enabled_false_or_missing"})
                 log_big_trend_score = big_trend_enabled or bool(analysis_cfg.get("log_big_trend_score_when_disabled", False))
                 big_trend_score_rows: list[dict[str, Any]] = []
                 big_trend_used_for_entry = False
-                if log_big_trend_score and bar1_new is not None:
+                if (not long_rsi50_only) and log_big_trend_score and bar1_new is not None:
                     for score_side in ("LONG", "SHORT"):
                         score, components = big_trend_start_score(score_side, f, metrics)
                         threshold = int(big_trend_cfg.get("long_threshold", 8) if score_side == "LONG" else big_trend_cfg.get("short_threshold", 9))
@@ -6849,7 +7052,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         "SIGNAL_PRIORITY_DECISION",
                         {
                             "ts": f.ts.isoformat(),
-                            "rsi_signal": p.signal if p.reason_1 == "RSI9_ONLY" else "NO_ACTION",
+                            "rsi_signal": p.signal if p.reason_1 in {"RSI9_ONLY", LONG_RSI50_STRATEGY} else "NO_ACTION",
                             "feature_signal": feature_candidates[0].signal if feature_candidates else "NO_ACTION",
                             "big_trend_signal": "LONG_CANDIDATE" if big_trend_used_for_entry else "NO_ACTION",
                             "final_signal": p.signal,
@@ -6883,7 +7086,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             status.pending_entry_ts = f.ts
                             storage.log("INFO", "RSI_PENDING_ENTRY", f"side={status.pending_entry_side} signal_ts={f.ts.isoformat()}")
 
-                if (not force_close_handled_above) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
+                if (not long_rsi50_only) and (not force_close_handled_above) and bar1_new is not None and status.open_position is not None and status.live_state == "OPEN":
                     add_ok, add_reason = should_rsi9_long_add(rb1.latest(), list(rb1.history), status.open_position)
                     if status.pending_exit:
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", "reason=PENDING_EXIT")
@@ -6897,7 +7100,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     elif not add_ok:
                         storage.log("INFO", "RSI9_LONG_ADD_SKIP", f"reason={add_reason}")
 
-                if status.pending_add and status.open_position is not None and status.open_position.side == "LONG":
+                if (not long_rsi50_only) and status.pending_add and status.open_position is not None and status.open_position.side == "LONG":
                     pos_add = status.open_position
                     if pos_add.rsi10_add_done:
                         status.pending_add = False
@@ -7210,6 +7413,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 hold_score_config=config.get("hold_score_extension", {}),
                                 analysis_config=analysis_cfg,
                                 feature_metrics=metrics,
+                                config=config,
+                                latest_snapshot=snap,
                             )
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
@@ -7339,7 +7544,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         p,
                                         status,
                                         latest_snapshot=snap,
-                                        force_marketable_limit=(pos.strategy == "RSI9" or ex_reason in MA5_TRAILING_EXIT_REASONS),
+                                        force_marketable_limit=(pos.strategy == "RSI9" or ex_reason in MA5_TRAILING_EXIT_REASONS or (pos.strategy == LONG_RSI50_STRATEGY and ex_reason == LONG_RSI50_EXIT_REASON)),
                                         force_market_order=False,
                                         exit_signal_ts=exit_signal_ts,
                                         signal_price=exit_signal_price,
