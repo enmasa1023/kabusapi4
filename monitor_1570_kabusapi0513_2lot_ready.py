@@ -6859,6 +6859,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 if long_rsi50_only and status.pending_add:
                     status.pending_add = False
                     storage.log("INFO", "LONG_RSI50_MODE_PENDING_ADD_CLEARED", "reason=ADD_DISABLED_IN_LONG_RSI50_TREND_HOLD_ONLY")
+                if long_rsi50_only and status.pending_entry_side not in {None, "LONG"}:
+                    blocked_side = status.pending_entry_side
+                    status.pending_entry_side = None
+                    status.pending_entry_ts = None
+                    storage.log_structured(
+                        "ERROR",
+                        "LONG_RSI50_MODE_SHORT_PENDING_ENTRY_CLEARED",
+                        {
+                            "ts": f.ts.isoformat(),
+                            "blocked_side": blocked_side,
+                            "strategy_mode": config.get("strategy_mode"),
+                            "reason": "SHORT_ENTRY_FORBIDDEN_IN_LONG_RSI50_TREND_HOLD_ONLY",
+                        },
+                    )
                 if long_rsi50_only:
                     p = build_long_rsi50_trend_hold_prediction(
                         rb1.latest(),
@@ -7082,6 +7096,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 if (not force_close_handled_above) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
                     if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                         pending_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
+                        if long_rsi50_only and (pending_side != "LONG" or p.reason_3 != LONG_RSI50_ENTRY_RULE):
+                            storage.log_structured(
+                                "ERROR",
+                                "LONG_RSI50_MODE_NON_LONG_SIGNAL_BLOCKED",
+                                {
+                                    "ts": f.ts.isoformat(),
+                                    "signal": effective_signal,
+                                    "pending_side": pending_side,
+                                    "reason_1": p.reason_1,
+                                    "reason_3": p.reason_3,
+                                    "strategy_mode": config.get("strategy_mode"),
+                                },
+                            )
+                            continue
                         if entry_cutoff_reached:
                             log_new_entry_cutoff_block(storage, config, f.ts, effective_signal, p.reason_3, pending_side)
                         else:
@@ -7192,6 +7220,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         status.pending_entry_ts = None
                     else:
                         side = status.pending_entry_side
+                        if long_rsi50_only and side != "LONG":
+                            storage.log_structured(
+                                "ERROR",
+                                "LONG_RSI50_MODE_PENDING_ENTRY_EXECUTION_BLOCKED",
+                                {
+                                    "ts": f.ts.isoformat(),
+                                    "blocked_side": side,
+                                    "strategy_mode": config.get("strategy_mode"),
+                                    "reason": "ONLY_LONG_ENTRIES_ALLOWED",
+                                },
+                            )
+                            status.pending_entry_side = None
+                            status.pending_entry_ts = None
+                            continue
                         enter_ok, _ = can_enter(side, f.ts, status)
                         if enter_ok:
                             if p.reason_3 in RSI17_DROP_ENTRY_RULES:
