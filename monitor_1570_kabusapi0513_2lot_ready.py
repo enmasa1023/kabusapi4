@@ -205,6 +205,9 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "allow_add_position": False,
         "use_take_profit": False,
         "use_ma5_trailing": False,
+        "use_ema13_trend_filter": True,
+        "ema13_period": 13,
+        "ema13_lookback_bars": 4,
     },
     "scalp_feature_entries": SCALP_FEATURE_RULE_DEFAULTS,
     "big_trend_start_score": {
@@ -320,6 +323,9 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "long_rsi50_trend_hold_enabled": bool(rsi50_cfg.get("enabled", False)),
         "long_rsi50_trend_hold_entry_rsi9_min": float(rsi50_cfg.get("entry_rsi9_min", 50)),
         "long_rsi50_trend_hold_exit_rsi9_max": float(rsi50_cfg.get("exit_rsi9_max", 49)),
+        "long_rsi50_trend_hold_use_ema13_trend_filter": bool(rsi50_cfg.get("use_ema13_trend_filter", True)),
+        "long_rsi50_trend_hold_ema13_period": int(rsi50_cfg.get("ema13_period", 13)),
+        "long_rsi50_trend_hold_ema13_lookback_bars": int(rsi50_cfg.get("ema13_lookback_bars", 4)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
@@ -641,6 +647,7 @@ class Bar:
     vwap: float
     ma5: Optional[float] = None
     ma13: Optional[float] = None
+    ema13: Optional[float] = None
     ma25: Optional[float] = None
     ma75: Optional[float] = None
     atr14: Optional[float] = None
@@ -1000,15 +1007,17 @@ class Storage:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS bars_1m(
               ts TEXT PRIMARY KEY, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
-              ma5 REAL, ma13 REAL, ma25 REAL, ma75 REAL, atr14 REAL
+              ma5 REAL, ma13 REAL, ema13 REAL, ma25 REAL, ma75 REAL, atr14 REAL
             )""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS bars_3m(
               ts TEXT PRIMARY KEY, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
-              ma5 REAL, ma13 REAL, ma25 REAL, ma75 REAL, atr14 REAL
+              ma5 REAL, ma13 REAL, ema13 REAL, ma25 REAL, ma75 REAL, atr14 REAL
             )""")
             self._ensure_bar_ma13_column(cur, "bars_1m")
             self._ensure_bar_ma13_column(cur, "bars_3m")
+            self._ensure_bar_ema13_column(cur, "bars_1m")
+            self._ensure_bar_ema13_column(cur, "bars_3m")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS feature_snapshot(
               ts TEXT PRIMARY KEY,
@@ -1068,6 +1077,11 @@ class Storage:
         cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
         if "ma13" not in cols:
             cur.execute(f"ALTER TABLE {table} ADD COLUMN ma13 REAL")
+
+    def _ensure_bar_ema13_column(self, cur: sqlite3.Cursor, table: str) -> None:
+        cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "ema13" not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN ema13 REAL")
 
     def _ensure_prediction_rsi9_column(self, cur: sqlite3.Cursor) -> None:
         cols = [r[1] for r in cur.execute("PRAGMA table_info(prediction_snapshot)").fetchall()]
@@ -1176,8 +1190,8 @@ class Storage:
         with self._connect() as con:
             con.execute(
                 f"""INSERT OR REPLACE INTO {table}
-                (ts,open,high,low,close,volume,vwap,ma5,ma13,ma25,ma75,atr14)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ts,open,high,low,close,volume,vwap,ma5,ma13,ema13,ma25,ma75,atr14)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     b.ts.isoformat(),
                     b.open,
@@ -1188,6 +1202,7 @@ class Storage:
                     b.vwap,
                     b.ma5,
                     b.ma13,
+                    b.ema13,
                     b.ma25,
                     b.ma75,
                     b.atr14,
@@ -1405,6 +1420,15 @@ class RollingBars:
             bar.ma5 = sum(closes[-5:]) / 5.0
         if len(closes) >= 13:
             bar.ma13 = sum(closes[-13:]) / 13.0
+            period = 13
+            alpha = 2.0 / (period + 1.0)
+            if len(closes) == period:
+                bar.ema13 = sum(closes[-period:]) / float(period)
+            else:
+                prev_ema13 = self.history[-2].ema13 if len(self.history) >= 2 else None
+                if prev_ema13 is None:
+                    prev_ema13 = sum(closes[-period - 1:-1]) / float(period)
+                bar.ema13 = alpha * bar.close + (1.0 - alpha) * prev_ema13
         if len(closes) >= 25:
             bar.ma25 = sum(closes[-25:]) / 25.0
         if len(closes) >= 75:
@@ -1424,6 +1448,27 @@ class RollingBars:
             if len(true_ranges) >= 14:
                 bar.atr14 = sum(true_ranges[-14:]) / 14.0
         return bar
+
+
+def fill_missing_ema13(bars: list[Bar], period: int = 13) -> list[Bar]:
+    """Fill missing EMA13 values from close prices while preserving stored values."""
+    alpha = 2.0 / (period + 1.0)
+    prev_ema: Optional[float] = None
+    closes: list[float] = []
+    for bar in bars:
+        closes.append(bar.close)
+        if bar.ema13 is not None:
+            prev_ema = bar.ema13
+            continue
+        if len(closes) < period:
+            bar.ema13 = None
+            continue
+        if len(closes) == period or prev_ema is None:
+            prev_ema = sum(closes[-period:]) / float(period)
+        else:
+            prev_ema = alpha * bar.close + (1.0 - alpha) * prev_ema
+        bar.ema13 = prev_ema
+    return bars
 
 
 
@@ -1446,9 +1491,11 @@ def preload_prev_day_1m_bars(outdir: str, today_db_path: str, limit: int = 120) 
     con = sqlite3.connect(prev_db_path)
     try:
         cur = con.cursor()
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(bars_1m)").fetchall()]
+        ema13_select = "ema13" if "ema13" in cols else "NULL AS ema13"
         cur.execute(
-            """
-            SELECT ts,open,high,low,close,volume,vwap,ma5,ma13,ma25,ma75,atr14
+            f"""
+            SELECT ts,open,high,low,close,volume,vwap,ma5,ma13,{ema13_select},ma25,ma75,atr14
             FROM bars_1m
             ORDER BY ts DESC
             LIMIT ?
@@ -1472,14 +1519,15 @@ def preload_prev_day_1m_bars(outdir: str, today_db_path: str, limit: int = 120) 
                     vwap=float(row[6] or row[4]),
                     ma5=(float(row[7]) if row[7] is not None else None),
                     ma13=(float(row[8]) if row[8] is not None else None),
-                    ma25=(float(row[9]) if row[9] is not None else None),
-                    ma75=(float(row[10]) if row[10] is not None else None),
-                    atr14=(float(row[11]) if row[11] is not None else None),
+                    ema13=(float(row[9]) if row[9] is not None else None),
+                    ma25=(float(row[10]) if row[10] is not None else None),
+                    ma75=(float(row[11]) if row[11] is not None else None),
+                    atr14=(float(row[12]) if row[12] is not None else None),
                 )
             )
         except Exception:
             continue
-    return bars
+    return fill_missing_ema13(bars)
 
 def extract_snapshot(raw: dict[str, Any]) -> TickSnapshot:
     def g(path: str) -> Any:
@@ -2997,6 +3045,26 @@ def build_long_rsi50_trend_hold_prediction(
         return None
     cfg = long_rsi50_trend_hold_config(config)
     entry_rsi9_min = float(cfg.get("entry_rsi9_min", 50))
+    use_ema13_filter = bool(cfg.get("use_ema13_trend_filter", True))
+    ema13_lookback_bars = int(cfg.get("ema13_lookback_bars", 4))
+    ema13_now = bar1.ema13
+    ema13_lookback_value = None
+    if len(history) >= ema13_lookback_bars + 1:
+        ema13_lookback_value = history[-1 - ema13_lookback_bars].ema13
+    ema13_delta = (
+        ema13_now - ema13_lookback_value
+        if ema13_now is not None and ema13_lookback_value is not None
+        else None
+    )
+    ema13_block_reason = ""
+    if use_ema13_filter:
+        if ema13_now is None:
+            ema13_block_reason = "EMA13_MISSING"
+        elif ema13_lookback_value is None:
+            ema13_block_reason = "EMA13_LOOKBACK_MISSING"
+        elif ema13_now <= ema13_lookback_value:
+            ema13_block_reason = "EMA13_NOT_RISING"
+    ema13_ok = (not use_ema13_filter) or not ema13_block_reason
     # long_rsi50_trend_hold_only intentionally does not apply the legacy
     # 09:00-09:15 no-entry window.  It only respects the configured
     # new_entry_cutoff_time and the generic safety/pending/live-state guards.
@@ -3019,6 +3087,7 @@ def build_long_rsi50_trend_hold_prediction(
         and live_state_ok
         and can_enter_ok
         and rsi_now >= entry_rsi9_min
+        and ema13_ok
     )
     signal = "LONG_CANDIDATE" if entry_ok else "NO_ACTION"
     reason_3 = LONG_RSI50_ENTRY_RULE if entry_ok else "none"
@@ -3033,11 +3102,40 @@ def build_long_rsi50_trend_hold_prediction(
                 "best_ask": latest_snapshot.sell1_price if latest_snapshot is not None else None,
                 "rsi9": rsi_now,
                 "entry_rsi9_min": entry_rsi9_min,
+                "ema13": ema13_now,
+                "ema13_lookback_value": ema13_lookback_value,
+                "ema13_lookback_bars": ema13_lookback_bars,
+                "ema13_delta": ema13_delta,
+                "use_ema13_trend_filter": use_ema13_filter,
                 "entry_rule": LONG_RSI50_ENTRY_RULE,
                 "strategy": LONG_RSI50_STRATEGY,
                 "position_state": position_state_payload(open_pos),
                 "pending_entry": pending_entry,
                 "pending_exit": pending_exit,
+            },
+        )
+    elif (
+        storage is not None
+        and rsi_now >= entry_rsi9_min
+        and use_ema13_filter
+        and ema13_block_reason
+    ):
+        storage.log_structured(
+            "INFO",
+            "LONG_RSI50_TREND_HOLD_ENTRY_BLOCKED_BY_EMA13",
+            {
+                "ts": feature.ts.isoformat(),
+                "bar_ts": bar1.ts.isoformat(),
+                "rsi9": rsi_now,
+                "entry_rsi9_min": entry_rsi9_min,
+                "ema13": ema13_now,
+                "ema13_lookback_value": ema13_lookback_value,
+                "ema13_lookback_bars": ema13_lookback_bars,
+                "ema13_delta": ema13_delta,
+                "use_ema13_trend_filter": use_ema13_filter,
+                "block_reason": ema13_block_reason,
+                "entry_rule": LONG_RSI50_ENTRY_RULE,
+                "strategy": LONG_RSI50_STRATEGY,
             },
         )
     elif storage is not None and bar1.ts == feature.ts.replace(second=0, microsecond=0):
@@ -3049,6 +3147,12 @@ def build_long_rsi50_trend_hold_prediction(
                 "bar_ts": bar1.ts.isoformat(),
                 "rsi9": rsi_now,
                 "entry_rsi9_min": entry_rsi9_min,
+                "ema13": ema13_now,
+                "ema13_lookback_value": ema13_lookback_value,
+                "ema13_lookback_bars": ema13_lookback_bars,
+                "ema13_delta": ema13_delta,
+                "use_ema13_trend_filter": use_ema13_filter,
+                "ema13_block_reason": ema13_block_reason,
                 "signal": signal,
                 "allow_new_entry": allow_new_entry,
                 "new_entry_cutoff_reached": new_entry_cutoff_reached,

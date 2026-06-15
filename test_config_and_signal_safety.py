@@ -5,8 +5,10 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     Bar,
     FeatureSnapshot,
     MonitorStatus,
+    RollingBars,
     build_runtime_config,
     build_long_rsi50_trend_hold_prediction,
+    fill_missing_ema13,
     load_config,
     PredictionSnapshot,
     short_b_drop_ma75_down_structure_decision,
@@ -46,8 +48,8 @@ def _args(config_path="config_1570_live_prod.json"):
     )
 
 
-def _bar(ts, close, ma5, ma25, ma75, vwap):
-    return Bar(ts=ts, open=close, high=close + 10, low=close - 10, close=close, volume=1000, vwap=vwap, ma5=ma5, ma25=ma25, ma75=ma75)
+def _bar(ts, close, ma5, ma25, ma75, vwap, ema13=None):
+    return Bar(ts=ts, open=close, high=close + 10, low=close - 10, close=close, volume=1000, vwap=vwap, ma5=ma5, ma25=ma25, ma75=ma75, ema13=ema13)
 
 
 def _feature(ts, price, vwap, regime):
@@ -83,6 +85,9 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["long_rsi50_trend_hold"]["enabled"] is True
     assert runtime["long_rsi50_trend_hold"]["entry_rsi9_min"] == 50
     assert runtime["long_rsi50_trend_hold"]["exit_rsi9_max"] == 49
+    assert runtime["long_rsi50_trend_hold"]["use_ema13_trend_filter"] is True
+    assert runtime["long_rsi50_trend_hold"]["ema13_period"] == 13
+    assert runtime["long_rsi50_trend_hold"]["ema13_lookback_bars"] == 4
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
     assert runtime["entry_execution"]["fallback_to_market"] is False
     assert runtime["feature_entries"]["enabled"] is False
@@ -95,11 +100,14 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["hard_stop_ticks"] == 20
     assert runtime["big_trend_start_score"]["enabled"] is False
     assert runtime["hold_score_extension"]["enabled"] is False
-    assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is True
+    assert runtime["rsi17_drop_bullish_pullback_long_watch"]["enabled"] is False
     assert payload["strategy_mode"] == "long_rsi50_trend_hold_only"
     assert payload["long_rsi50_trend_hold_enabled"] is True
     assert payload["long_rsi50_trend_hold_entry_rsi9_min"] == 50
     assert payload["long_rsi50_trend_hold_exit_rsi9_max"] == 49
+    assert payload["long_rsi50_trend_hold_use_ema13_trend_filter"] is True
+    assert payload["long_rsi50_trend_hold_ema13_period"] == 13
+    assert payload["long_rsi50_trend_hold_ema13_lookback_bars"] == 4
     assert payload["feature_entries_enabled"] is False
     assert payload["feature_long_rsi_pullback_scalp"] is False
     assert payload["feature_short_extended_ma5_fail_scalp"] is False
@@ -296,7 +304,10 @@ def test_short_extended_ma5_fail_scalp_blocks_ma5_above_or_gap_insufficient_or_o
 
 
 def _rsi50_history(ts):
-    return [_bar(ts - timedelta(minutes=14 - i), 67000 + i, 67000, 67000, 67000, 67000) for i in range(15)]
+    bars = []
+    for i in range(15):
+        bars.append(_bar(ts - timedelta(minutes=14 - i), 67000 + i, 67000, 67000, 67000, 67000, ema13=100.0 + i))
+    return bars
 
 
 def test_long_rsi50_trend_hold_entry_at_50_and_no_entry_below(monkeypatch):
@@ -316,6 +327,49 @@ def test_long_rsi50_trend_hold_entry_at_50_and_no_entry_below(monkeypatch):
     monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 49.99)
     pred2 = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
     assert pred2.signal == "NO_ACTION"
+
+
+def test_ema13_calculation_seed_and_recursive_update():
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    rb = RollingBars(1)
+    for i in range(12):
+        bar = Bar(ts=ts + timedelta(minutes=i), open=100 + i, high=100 + i, low=100 + i, close=100 + i, volume=1000, vwap=100 + i)
+        rb.history.append(bar)
+        rb._decorate_bar(bar)
+        assert bar.ema13 is None
+    bar13 = Bar(ts=ts + timedelta(minutes=12), open=112, high=112, low=112, close=112, volume=1000, vwap=112)
+    rb.history.append(bar13)
+    rb._decorate_bar(bar13)
+    assert bar13.ema13 == sum(range(100, 113)) / 13.0
+    bar14 = Bar(ts=ts + timedelta(minutes=13), open=113, high=113, low=113, close=113, volume=1000, vwap=113)
+    rb.history.append(bar14)
+    rb._decorate_bar(bar14)
+    alpha = 2.0 / 14.0
+    assert bar14.ema13 == alpha * 113 + (1.0 - alpha) * bar13.ema13
+
+
+def test_fill_missing_ema13_for_prev_day_warmup():
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    bars = [Bar(ts=ts + timedelta(minutes=i), open=100 + i, high=100 + i, low=100 + i, close=100 + i, volume=1000, vwap=100 + i) for i in range(14)]
+    filled = fill_missing_ema13(bars)
+    assert filled[11].ema13 is None
+    assert filled[12].ema13 == sum(range(100, 113)) / 13.0
+    assert filled[13].ema13 is not None
+
+
+def test_long_rsi50_trend_hold_blocks_when_ema13_not_rising(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    status = MonitorStatus()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    snap = TickSnapshot(ts, 67000, 1000, 66900, 67010, 10, 67000, 10)
+    history = _rsi50_history(ts)
+    history[-1].ema13 = history[-5].ema13
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 55.0)
+    pred = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred.signal == "NO_ACTION"
 
 
 def test_long_rsi50_trend_hold_allows_0900_0915_window(monkeypatch):
@@ -372,6 +426,10 @@ def test_long_rsi50_trend_hold_exit_at_49_and_holds_above():
     ex2, reason2, _ = should_exit(pos, feature, pred_hold, bar1_new=_bar(ts, 67050, 67000, 67000, 67000, 66900), config=cfg)
     assert ex2 is False
     assert reason2 == "HOLD"
+    pred_hold_ema_down = PredictionSnapshot(ts, "LONG_RSI50_TREND_HOLD", 0.5, 0.5, 0.5, 0.5, "NO_ACTION", 55.0, "LONG_RSI50_TREND_HOLD", "rsi9=55.00", "none")
+    ex3, reason3, _ = should_exit(pos, feature, pred_hold_ema_down, bar1_new=_bar(ts, 67050, 67000, 67000, 67000, 66900, ema13=90.0), config=cfg)
+    assert ex3 is False
+    assert reason3 == "HOLD"
 
 
 def test_long_rsi50_trend_hold_hard_stop_uses_20_ticks():

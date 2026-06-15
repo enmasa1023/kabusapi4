@@ -80,7 +80,7 @@
     "log_execution_detail": true
   },
   "scalping": {
-    "enabled": true
+    "enabled": false
   },
   "take_profit_execution": {
     "enabled": true,
@@ -97,10 +97,13 @@
     "allow_short": false,
     "allow_add_position": false,
     "use_take_profit": false,
-    "use_ma5_trailing": false
+    "use_ma5_trailing": false,
+    "use_ema13_trend_filter": true,
+    "ema13_period": 13,
+    "ema13_lookback_bars": 4
   },
   "rsi70_drop_long_watch": {
-    "enabled": true,
+    "enabled": false,
     "watch_minutes": 10,
     "trigger_on_rsi_turn": true,
     "trigger_on_ma5_recover": true,
@@ -131,7 +134,7 @@
     "log_hold_score_when_disabled": true
   },
   "rsi17_drop_bullish_pullback_long_watch": {
-    "enabled": true,
+    "enabled": false,
     "watch_minutes": 10,
     "trigger_on_rsi_turn": true,
     "trigger_on_ma5_recover": true,
