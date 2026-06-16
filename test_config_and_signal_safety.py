@@ -20,6 +20,7 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     HARD_STOP_TICKS,
     TRADE_WINDOWS,
     time_in_windows,
+    websocket_snapshot_freshness,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -94,6 +95,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["market_data_source"]["mode"] == "websocket"
     assert runtime["market_data_source"]["fallback_to_rest"] is True
     assert runtime["market_data_source"]["bar_finalize_delay_ms"] == 300
+    assert runtime["market_data_source"]["max_ws_snapshot_age_sec"] == 3.0
     assert runtime["entry_reference_close_guard"]["enabled"] is True
     assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 2
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
@@ -120,6 +122,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["market_data_source_mode"] == "websocket"
     assert payload["market_data_source_fallback_to_rest"] is True
     assert payload["bar_finalize_delay_ms"] == 300
+    assert payload["market_data_source_max_ws_snapshot_age_sec"] == 3.0
     assert payload["entry_reference_close_guard_enabled"] is True
     assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 2
     assert payload["feature_entries_enabled"] is False
@@ -369,6 +372,47 @@ def test_fill_missing_ema13_for_prev_day_warmup():
     assert filled[11].ema13 is None
     assert filled[12].ema13 == sum(range(100, 113)) / 13.0
     assert filled[13].ema13 is not None
+
+
+def test_websocket_snapshot_freshness_rejects_stale_and_duplicate():
+    now = datetime(2026, 6, 12, 9, 1, 0, tzinfo=JST)
+    fresh = TickSnapshot(now - timedelta(seconds=2), 67000, 1000, 66990, 67010, 10, 66990, 10)
+    stale = TickSnapshot(now - timedelta(seconds=4), 67000, 1000, 66990, 67010, 10, 66990, 10)
+
+    ok, reason, age = websocket_snapshot_freshness(fresh, True, now, 3.0, None)
+    assert ok is True
+    assert reason == "OK"
+    assert age == 2.0
+
+    ok_stale, reason_stale, _ = websocket_snapshot_freshness(stale, True, now, 3.0, None)
+    assert ok_stale is False
+    assert reason_stale == "WS_SNAPSHOT_STALE"
+
+    ok_dup, reason_dup, _ = websocket_snapshot_freshness(fresh, True, now, 3.0, fresh.ts)
+    assert ok_dup is False
+    assert reason_dup == "WS_SNAPSHOT_DUPLICATE"
+
+    ok_unavailable, reason_unavailable, _ = websocket_snapshot_freshness(None, False, now, 3.0, None)
+    assert ok_unavailable is False
+    assert reason_unavailable == "WS_UNAVAILABLE"
+
+
+def test_rolling_bars_time_trigger_finalizes_after_delay():
+    rb = RollingBars(1)
+    tick_ts = datetime(2026, 6, 12, 9, 0, 10, tzinfo=JST)
+    rb.update(TickSnapshot(tick_ts, 67000, 1000, 66990, 67010, 10, 66990, 10), finalize_delay_ms=300)
+    early_next_min = rb.update(
+        TickSnapshot(datetime(2026, 6, 12, 9, 1, 0, 100000, tzinfo=JST), 67020, 1001, 67010, 67030, 10, 67010, 10),
+        finalize_delay_ms=300,
+    )
+    assert early_next_min is None
+    assert rb.force_finalize_completed_bucket(datetime(2026, 6, 12, 9, 1, 0, 299000, tzinfo=JST), 300) is None
+    finalized = rb.force_finalize_completed_bucket(datetime(2026, 6, 12, 9, 1, 0, 300000, tzinfo=JST), 300)
+    assert finalized is not None
+    assert finalized.ts == datetime(2026, 6, 12, 9, 0, tzinfo=JST)
+    assert finalized.close == 67000
+    assert rb.current_bucket == datetime(2026, 6, 12, 9, 1, tzinfo=JST)
+    assert rb.rows and rb.rows[0].price == 67020
 
 
 def test_long_rsi50_trend_hold_blocks_when_ema13_not_rising(monkeypatch):

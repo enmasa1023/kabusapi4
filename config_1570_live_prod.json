@@ -90,7 +90,8 @@
     "mode": "websocket",
     "fallback_to_rest": true,
     "bar_finalize_delay_ms": 300,
-    "rest_polling_when_ws_unavailable": true
+    "rest_polling_when_ws_unavailable": true,
+    "max_ws_snapshot_age_sec": 3.0
   },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "15:10:00",
