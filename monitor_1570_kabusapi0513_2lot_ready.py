@@ -7223,7 +7223,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         "reason": "REST_MODE" if market_data_mode != "websocket" else "WS_FALLBACK",
                     },
                 )
+            snapshot_accepted = True
             if last_processed_snapshot_ts is not None and snap.ts <= last_processed_snapshot_ts:
+                snapshot_accepted = False
                 storage.log_structured(
                     "WARN",
                     "FINAL_SNAPSHOT_DUPLICATE_OR_OLD_SKIPPED",
@@ -7233,29 +7235,52 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat(),
                         "now_ts": now_.isoformat(),
                         "reason": "FINAL_SNAPSHOT_TS_NOT_NEWER",
+                        "snapshot_accepted": False,
+                        "clock_driven_tasks_still_executed": True,
                     },
                 )
-                time.sleep(config["poll_interval_sec"])
-                continue
-            storage.log_structured(
-                "INFO",
-                "FINAL_SNAPSHOT_ACCEPTED",
-                {
-                    "source": final_snapshot_source,
-                    "snapshot_ts": snap.ts.isoformat(),
-                    "last_processed_snapshot_ts_before": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                    "last_processed_snapshot_ts_after": snap.ts.isoformat(),
-                    "price": snap.price,
-                    "sell1_price": snap.sell1_price,
-                    "buy1_price": snap.buy1_price,
-                },
-            )
-            last_processed_snapshot_ts = snap.ts
-            last_snapshot = snap
-            tick_buf.append(snap)
-            spread_ticks = calc_spread_ticks(snap)
-            storage.insert_snapshot(snap, spread_ticks)
-            status.count += 1
+            else:
+                storage.log_structured(
+                    "INFO",
+                    "FINAL_SNAPSHOT_ACCEPTED",
+                    {
+                        "source": final_snapshot_source,
+                        "snapshot_ts": snap.ts.isoformat(),
+                        "last_processed_snapshot_ts_before": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                        "last_processed_snapshot_ts_after": snap.ts.isoformat(),
+                        "snapshot_accepted": True,
+                        "price": snap.price,
+                        "sell1_price": snap.sell1_price,
+                        "buy1_price": snap.buy1_price,
+                    },
+                )
+                last_processed_snapshot_ts = snap.ts
+                last_snapshot = snap
+                tick_buf.append(snap)
+                spread_ticks = calc_spread_ticks(snap)
+                storage.insert_snapshot(snap, spread_ticks)
+                status.count += 1
+
+            bar1_time_finalized = rb1.force_finalize_completed_bucket(now_, bar_finalize_delay_ms)
+            if bar1_time_finalized:
+                rsi9_for_time_finalized = rsi9_wilder([b.close for b in rb1.history], RSI9_PERIOD)
+                storage.log_structured(
+                    "INFO",
+                    "BAR_FINALIZED_BY_TIME_TRIGGER",
+                    {
+                        "bar_ts": bar1_time_finalized.ts.isoformat(),
+                        "finalize_ts": now_.isoformat(),
+                        "bar_finalize_delay_ms": bar_finalize_delay_ms,
+                        "open": bar1_time_finalized.open,
+                        "high": bar1_time_finalized.high,
+                        "low": bar1_time_finalized.low,
+                        "close": bar1_time_finalized.close,
+                        "volume": bar1_time_finalized.volume,
+                        "ema13": bar1_time_finalized.ema13,
+                        "rsi9": rsi9_for_time_finalized,
+                    },
+                )
+            bar3_time_finalized = rb3.force_finalize_completed_bucket(now_, bar_finalize_delay_ms)
 
             force_close_time_reached_top = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
             if force_close_time_reached_top:
@@ -7283,7 +7308,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         reason="FORCE_MARKET_CLOSE_1520",
                         ts=now_,
                         last_pred=last_pred,
-                        latest_snapshot=snap,
+                        latest_snapshot=last_snapshot,
                         use_market_order=True,
                     )
                 time.sleep(config["poll_interval_sec"])
@@ -7292,35 +7317,14 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             manual_position_clear_resume_check(client, config, storage, status, now_)
             recovery_flat_resume_check(client, config, storage, status, now_)
 
-            bar1_time_finalized = rb1.force_finalize_completed_bucket(now_, bar_finalize_delay_ms)
-            if bar1_time_finalized:
-                rsi9_for_time_finalized = rsi9_wilder([b.close for b in rb1.history], RSI9_PERIOD)
-                storage.log_structured(
-                    "INFO",
-                    "BAR_FINALIZED_BY_TIME_TRIGGER",
-                    {
-                        "bar_ts": bar1_time_finalized.ts.isoformat(),
-                        "finalize_ts": now_.isoformat(),
-                        "bar_finalize_delay_ms": bar_finalize_delay_ms,
-                        "open": bar1_time_finalized.open,
-                        "high": bar1_time_finalized.high,
-                        "low": bar1_time_finalized.low,
-                        "close": bar1_time_finalized.close,
-                        "volume": bar1_time_finalized.volume,
-                        "ema13": bar1_time_finalized.ema13,
-                        "rsi9": rsi9_for_time_finalized,
-                    },
-                )
-            bar3_time_finalized = rb3.force_finalize_completed_bucket(now_, bar_finalize_delay_ms)
-
-            bar1_updated = rb1.update(snap, bar_finalize_delay_ms)
+            bar1_updated = rb1.update(snap, bar_finalize_delay_ms) if snapshot_accepted else None
             bar1_new = bar1_time_finalized or bar1_updated
             if bar1_new:
                 storage.insert_bar("bars_1m", bar1_new)
             current_bar_bucket_1m = rb1.current_bucket
             current_bar_open_1m = rb1.rows[0].price if rb1.rows and rb1.rows[0].price is not None else None
             confirmed_bar1 = rb1.latest()
-            bar3_updated = rb3.update(snap, bar_finalize_delay_ms)
+            bar3_updated = rb3.update(snap, bar_finalize_delay_ms) if snapshot_accepted else None
             bar3_new = bar3_time_finalized or bar3_updated
             if bar3_new:
                 storage.insert_bar("bars_3m", bar3_new)
@@ -7346,7 +7350,29 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 status.midday_bar_finalize_done = True
 
             set_vwap_mode(adaptive.vwap_mode)
-            f = build_features(snap.ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
+            if not snapshot_accepted and bar1_new is None:
+                time.sleep(config["poll_interval_sec"])
+                continue
+            decision_snapshot: Optional[TickSnapshot] = snap if snapshot_accepted else None
+            if decision_snapshot is None and bar1_new is not None:
+                try:
+                    raw_decision_board = client.get_board(config["symbol"], config["exchange"])
+                    decision_snapshot = extract_snapshot(raw_decision_board)
+                    storage.log_structured(
+                        "INFO",
+                        "CLOCK_TRIGGER_DECISION_BOARD_SNAPSHOT_USED",
+                        {
+                            "bar_ts": bar1_new.ts.isoformat(),
+                            "snapshot_ts": decision_snapshot.ts.isoformat(),
+                            "snapshot_accepted": snapshot_accepted,
+                            "reason": "TIME_TRIGGER_FINALIZED_BAR_DECISION",
+                        },
+                    )
+                except Exception as e:
+                    decision_snapshot = last_snapshot
+                    storage.log("WARN", "CLOCK_TRIGGER_DECISION_BOARD_SNAPSHOT_FAILED", str(e))
+            feature_ts = snap.ts if snapshot_accepted else bar1_new.ts
+            f = build_features(feature_ts, tick_buf, rb1.latest(), rb1.prev(1), rb3.latest(), rb3.prev(1))
             if f is not None:
                 storage.insert_feature(f)
                 # 15:20強制決済は上位ブロックで処理済み。ここでは新規停止フラグとして扱わない。
@@ -7384,7 +7410,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         status.open_position,
                         status,
                         f,
-                        snap,
+                        decision_snapshot,
                         config,
                         storage=storage,
                         allow_new_entry=allow_new_entry,
@@ -7810,7 +7836,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         status.pending_entry_side = None
                                     else:
                                         status.live_state = "ENTRY_SENT"
-                                        entry_send_snapshot = snap
+                                        entry_send_snapshot = decision_snapshot or snap
                                         if long_rsi50_only and candidate_pos.strategy == LONG_RSI50_STRATEGY:
                                             pre_send_source = "current_snapshot"
                                             pre_send_reason = "CURRENT_SNAPSHOT"
@@ -7837,7 +7863,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                         {
                                                             "reference_bar_ts": p.ts.isoformat(),
                                                             "reference_close": rb1.latest().close if rb1.latest() is not None else None,
-                                                            "pre_signal_best_ask": snap.sell1_price if snap is not None else None,
+                                                            "pre_signal_best_ask": entry_send_snapshot.sell1_price if entry_send_snapshot is not None else None,
                                                             "pre_send_best_ask": None,
                                                             "entry_deviation_ticks": None,
                                                             "max_abs_deviation_ticks": entry_reference_close_guard_config(config).get("max_abs_deviation_ticks", 2),
@@ -7876,7 +7902,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                     {
                                                         "reference_bar_ts": reference_bar.ts.isoformat() if reference_bar is not None else p.ts.isoformat(),
                                                         "reference_close": reference_close,
-                                                        "pre_signal_best_ask": snap.sell1_price if snap is not None else None,
+                                                        "pre_signal_best_ask": entry_send_snapshot.sell1_price if entry_send_snapshot is not None else None,
                                                         "pre_send_best_ask": pre_send_best_ask,
                                                         "entry_deviation_ticks": deviation_ticks,
                                                         "max_abs_deviation_ticks": max_deviation_ticks,
@@ -8084,7 +8110,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 analysis_config=analysis_cfg,
                                 feature_metrics=metrics,
                                 config=config,
-                                latest_snapshot=snap,
+                                latest_snapshot=decision_snapshot or last_snapshot,
                             )
 
                         if config["live_mode"] and ex and ex_reason == "TAKE_PROFIT" and pos.take_profit_order_id and not live_tp_already_filled:
@@ -8213,7 +8239,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos,
                                         p,
                                         status,
-                                        latest_snapshot=snap,
+                                        latest_snapshot=decision_snapshot or last_snapshot,
                                         force_marketable_limit=(pos.strategy == "RSI9" or ex_reason in MA5_TRAILING_EXIT_REASONS or (pos.strategy == LONG_RSI50_STRATEGY and ex_reason == LONG_RSI50_EXIT_REASON)),
                                         force_market_order=False,
                                         exit_signal_ts=exit_signal_ts,
