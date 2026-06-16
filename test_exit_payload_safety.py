@@ -3,8 +3,10 @@ from datetime import datetime
 from monitor_1570_kabusapi0513_2lot_ready import (
     ApiHttpError,
     PositionState,
+    PredictionSnapshot,
     build_exit_order_payload,
     close_position_groups_from_managed_state,
+    execute_live_entry,
     entry_limit_price,
     TickSnapshot,
     Bar,
@@ -46,6 +48,19 @@ class FakeClient:
         return []
 
 
+class EntryFakeClient:
+    def __init__(self, board):
+        self.board = board
+        self.sent_payloads = []
+    def get_positions(self, symbol):
+        return []
+    def get_board(self, symbol, exchange):
+        return self.board
+    def send_order(self, payload):
+        self.sent_payloads.append(payload)
+        return {"OrderId": "entry-ok"}
+
+
 class Status:
     live_state = "OPEN"
     pending_exit = False
@@ -74,6 +89,45 @@ def base_config():
     }
 
 
+def entry_config():
+    cfg = base_config()
+    cfg.update(
+        {
+            "live_retry_max": 0,
+            "live_entry_timeout_sec": 0,
+            "order_qty": 2,
+            "entry_min_fill_qty": 2,
+            "entry_cash_margin": 2,
+            "entry_deliv_type": 0,
+            "entry_front_order_type": 10,
+            "entry_price": 0,
+            "strategy_mode": "long_rsi50_trend_hold_only",
+            "entry_execution": {
+                "enabled": True,
+                "mode": "limit_with_timeout",
+                "limit_mode": "marketable_best",
+                "timeout_sec": 0.5,
+                "max_reprice_attempts": 0,
+                "fallback_to_market": False,
+            },
+            "entry_reference_close_guard": {
+                "enabled": True,
+                "max_abs_deviation_ticks": 2,
+            },
+            "long_rsi50_trend_hold": {
+                "enabled": True,
+                "entry_rsi9_min": 50,
+                "exit_rsi9_max": 49,
+                "hard_stop_ticks": 20,
+                "use_ema13_trend_filter": True,
+                "ema13_lookback_bars": 4,
+                "ema13_min_rise_ticks": 5,
+            },
+        }
+    )
+    return cfg
+
+
 def base_position(exchange=27, qty=2):
     return PositionState(
         side="LONG",
@@ -92,6 +146,105 @@ def base_position(exchange=27, qty=2):
         managed_execution_ids=["E1"],
         managed_close_positions=[{"ExecutionID": "E1", "HoldID": "E1", "Qty": qty, "LeavesQty": qty, "HoldQty": 0, "Side": "2", "Symbol": "1570", "Exchange": exchange, "MarginTradeType": 3, "Price": 67040.0}],
     )
+
+
+def long_rsi50_entry_position():
+    return PositionState(
+        side="LONG",
+        strategy="LONG_RSI50_TREND_HOLD",
+        entry_ts=datetime(2026, 6, 12, 9, 1),
+        entry_price=67000.0,
+        entry_p_up_1m=0.5,
+        entry_p_up_3m=0.5,
+        stop_ticks=20,
+        take_ticks=0,
+        min_hold_sec=0,
+        max_hold_sec=3600,
+        entry_rule="long_rsi50_trend_hold",
+        hard_stop_ticks=20,
+    )
+
+
+def long_rsi50_pred():
+    return PredictionSnapshot(
+        ts=datetime(2026, 6, 12, 9, 0),
+        regime="LONG_RSI50_TREND_HOLD",
+        p_up_1m=0.5,
+        p_down_1m=0.5,
+        p_up_3m=0.5,
+        p_down_3m=0.5,
+        signal="LONG_CANDIDATE",
+        rsi9_value=55.0,
+        reason_1="LONG_RSI50_TREND_HOLD",
+        reason_2="rsi9=55.00",
+        reason_3="long_rsi50_trend_hold",
+    )
+
+
+def test_live_entry_final_pre_send_reference_close_guard_blocks_order():
+    cfg = entry_config()
+    client = EntryFakeClient(
+        {
+            "CurrentPrice": 67050,
+            "CurrentPriceTime": "2026-06-12T09:01:00+09:00",
+            "VWAP": 67000,
+            "Buy1": {"Price": 67040, "Qty": 10},
+            "Sell1": {"Price": 67050, "Qty": 10},
+        }
+    )
+    storage = FakeStorage()
+    result = execute_live_entry(
+        client,
+        cfg,
+        "LONG",
+        storage,
+        long_rsi50_entry_position(),
+        long_rsi50_pred(),
+        Status(),
+        latest_snapshot=TickSnapshot(datetime(2026, 6, 12, 9, 1), 67000, 1000, 66990, 67010, 10, 66990, 10),
+        entry_reference_bar=Bar(datetime(2026, 6, 12, 9, 0), 67000, 67000, 67000, 67000, 1000, 67000, ema13=67050),
+        entry_ema13_lookback_value=67000,
+        entry_ema13_delta_ticks=5,
+    )
+    assert result.ok is False
+    assert result.message == "FINAL_PRE_SEND_REFERENCE_CLOSE_DEVIATION_TOO_LARGE"
+    assert client.sent_payloads == []
+    assert any(e[1] == "LONG_RSI50_TREND_HOLD_ENTRY_BLOCKED_BY_REFERENCE_CLOSE_DEVIATION_FINAL_PRE_SEND" for e in storage.events)
+
+
+def test_live_entry_final_pre_send_reference_close_guard_allows_order():
+    cfg = entry_config()
+    client = EntryFakeClient(
+        {
+            "CurrentPrice": 67010,
+            "CurrentPriceTime": "2026-06-12T09:01:00+09:00",
+            "VWAP": 67000,
+            "Buy1": {"Price": 67000, "Qty": 10},
+            "Sell1": {"Price": 67020, "Qty": 10},
+        }
+    )
+    storage = FakeStorage()
+    result = execute_live_entry(
+        client,
+        cfg,
+        "LONG",
+        storage,
+        long_rsi50_entry_position(),
+        long_rsi50_pred(),
+        Status(),
+        latest_snapshot=TickSnapshot(datetime(2026, 6, 12, 9, 1), 67000, 1000, 66990, 67010, 10, 66990, 10),
+        entry_reference_bar=Bar(datetime(2026, 6, 12, 9, 0), 67000, 67000, 67000, 67000, 1000, 67000, ema13=67050),
+        entry_ema13_lookback_value=67000,
+        entry_ema13_delta_ticks=5,
+    )
+    assert result.ok is False  # fake client never creates a verified position, but send_order must be reached
+    assert client.sent_payloads
+    assert client.sent_payloads[0]["FrontOrderType"] == 20
+    assert client.sent_payloads[0]["Price"] == 67020
+    entry_requests = [e for e in storage.events if e[1] == "ENTRY_ORDER_REQUEST"]
+    assert entry_requests
+    assert entry_requests[0][2]["final_pre_send_best_ask"] == 67020
+    assert entry_requests[0][2]["final_pre_send_deviation_ticks"] == 2
 
 
 def test_fast_path_uses_actual_exchange_27_not_config_1():

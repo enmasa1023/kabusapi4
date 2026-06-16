@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib import error, request
 
 
@@ -53,7 +53,7 @@ API_PASSWORD_HARDCODED = "enmasa1023"  # ここにAPIパスワードを入れる
 
 TRADE_WINDOWS = [
     ("09:00:00", "11:25:00"),
-    ("12:35:00", "15:20:00"),
+    ("12:30:00", "15:20:00"),
 ]
 STOP_AFTER = "15:30:00"
 FORCE_CLOSE_AFTER = "15:20:00"
@@ -333,6 +333,8 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "margin_trade_type_short": config.get("margin_trade_type_short"),
         "force_close_after": config.get("force_close_after"),
         "new_entry_cutoff_time": config.get("new_entry_cutoff_time"),
+        "morning_trade_start": TRADE_WINDOWS[0][0] if TRADE_WINDOWS else "09:00:00",
+        "afternoon_trade_start": TRADE_WINDOWS[1][0] if len(TRADE_WINDOWS) > 1 else "12:30:00",
         "hard_stop_ticks": int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
         "strategy_mode": config.get("strategy_mode", "legacy"),
         "long_rsi50_trend_hold_enabled": bool(rsi50_cfg.get("enabled", False)),
@@ -5440,6 +5442,10 @@ def execute_live_entry(
     latest_snapshot: Optional[TickSnapshot] = None,
     target_total_qty_override: Optional[int] = None,
     qty_override: Optional[int] = None,
+    entry_reference_bar: Optional[Bar] = None,
+    market_snapshot_provider: Optional[Callable[[], Optional[TickSnapshot]]] = None,
+    entry_ema13_lookback_value: Optional[float] = None,
+    entry_ema13_delta_ticks: Optional[float] = None,
 ) -> LiveOrderResult:
     entry_exec = entry_execution_config(config)
     limit_entry = use_limit_entry(config)
@@ -5459,6 +5465,52 @@ def execute_live_entry(
     last = LiveOrderResult(False, "ENTRY_UNKNOWN_ERROR")
     entry_before_positions = fetch_positions(client, config, storage, reason="ENTRY_BEFORE_POSITIONS")
     for attempt in range(retries + 1):
+        final_pre_send_context: dict[str, Any] = {}
+        if (
+            is_long_rsi50_trend_hold_only(config)
+            and side == "LONG"
+            and candidate.strategy == LONG_RSI50_STRATEGY
+        ):
+            candidate_best_ask = latest_snapshot.sell1_price if latest_snapshot is not None else None
+            pre_send_snapshot = market_snapshot_provider() if market_snapshot_provider is not None else None
+            if pre_send_snapshot is None:
+                raw_board = client.get_board(str(config.get("symbol", SYMBOL_DEFAULT)), int(config.get("exchange", EXCHANGE_DEFAULT)))
+                pre_send_snapshot = extract_snapshot(raw_board)
+            latest_snapshot = pre_send_snapshot
+            reference_close = entry_reference_bar.close if entry_reference_bar is not None else None
+            reference_bar_ts = entry_reference_bar.ts if entry_reference_bar is not None else pred.ts
+            pre_send_best_ask = pre_send_snapshot.sell1_price if pre_send_snapshot is not None else None
+            deviation_ticks = reference_close_deviation_ticks(pre_send_best_ask, reference_close)
+            guard_cfg = entry_reference_close_guard_config(config)
+            max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 2))
+            final_pre_send_context = {
+                "reference_bar_ts": reference_bar_ts.isoformat(),
+                "reference_close": reference_close,
+                "candidate_best_ask": candidate_best_ask,
+                "final_pre_send_best_ask": pre_send_best_ask,
+                "final_pre_send_deviation_ticks": deviation_ticks,
+                "entry_reference_close_guard_max_abs_deviation_ticks": max_deviation_ticks,
+            }
+            if bool(guard_cfg.get("enabled", True)) and (deviation_ticks is None or deviation_ticks > max_deviation_ticks):
+                storage.log_structured(
+                    "WARN",
+                    "LONG_RSI50_TREND_HOLD_ENTRY_BLOCKED_BY_REFERENCE_CLOSE_DEVIATION_FINAL_PRE_SEND",
+                    {
+                        "reference_bar_ts": reference_bar_ts.isoformat(),
+                        "reference_close": reference_close,
+                        "candidate_best_ask": candidate_best_ask,
+                        "pre_send_best_ask": pre_send_best_ask,
+                        "entry_deviation_ticks": deviation_ticks,
+                        "max_abs_deviation_ticks": max_deviation_ticks,
+                        "rsi9": pred.rsi9_value,
+                        "ema13": entry_reference_bar.ema13 if entry_reference_bar is not None else None,
+                        "ema13_lookback_value": entry_ema13_lookback_value,
+                        "ema13_delta_ticks": entry_ema13_delta_ticks,
+                        "block_reason": "FINAL_PRE_SEND_REFERENCE_CLOSE_DEVIATION_TOO_LARGE",
+                    },
+                    mirror_message=f"best_ask={pre_send_best_ask} reference_close={reference_close} deviation_ticks={deviation_ticks}",
+                )
+                return LiveOrderResult(False, "FINAL_PRE_SEND_REFERENCE_CLOSE_DEVIATION_TOO_LARGE", recoverable=True)
         limit_price = None
         front_order_type = None
         if limit_entry:
@@ -5487,6 +5539,7 @@ def execute_live_entry(
             "ENTRY_ORDER_REQUEST",
             {
                 **context,
+                **final_pre_send_context,
                 "attempt": attempt + 1,
                 "request_json": payload,
                 "limit_price": limit_price,
@@ -7122,6 +7175,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
         try:
             raw = None
             snap: Optional[TickSnapshot] = None
+            final_snapshot_source = "rest"
             if market_data_mode == "websocket" and ws_feed is not None:
                 ws_snap = ws_feed.latest_snapshot()
                 usable_ws, ws_reason, ws_age_sec = websocket_snapshot_freshness(
@@ -7141,6 +7195,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 }
                 if usable_ws:
                     snap = ws_snap
+                    final_snapshot_source = "websocket"
                     storage.log_structured("INFO", "WS_SNAPSHOT_USED", ws_payload)
                 else:
                     if ws_reason == "WS_SNAPSHOT_DUPLICATE":
@@ -7155,6 +7210,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             if snap is None:
                 raw = client.get_board(config["symbol"], config["exchange"])
                 snap = extract_snapshot(raw)
+                final_snapshot_source = "rest"
                 storage.log_structured(
                     "INFO",
                     "REST_SNAPSHOT_USED",
@@ -7167,6 +7223,33 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         "reason": "REST_MODE" if market_data_mode != "websocket" else "WS_FALLBACK",
                     },
                 )
+            if last_processed_snapshot_ts is not None and snap.ts <= last_processed_snapshot_ts:
+                storage.log_structured(
+                    "WARN",
+                    "FINAL_SNAPSHOT_DUPLICATE_OR_OLD_SKIPPED",
+                    {
+                        "source": final_snapshot_source,
+                        "snapshot_ts": snap.ts.isoformat(),
+                        "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat(),
+                        "now_ts": now_.isoformat(),
+                        "reason": "FINAL_SNAPSHOT_TS_NOT_NEWER",
+                    },
+                )
+                time.sleep(config["poll_interval_sec"])
+                continue
+            storage.log_structured(
+                "INFO",
+                "FINAL_SNAPSHOT_ACCEPTED",
+                {
+                    "source": final_snapshot_source,
+                    "snapshot_ts": snap.ts.isoformat(),
+                    "last_processed_snapshot_ts_before": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                    "last_processed_snapshot_ts_after": snap.ts.isoformat(),
+                    "price": snap.price,
+                    "sell1_price": snap.sell1_price,
+                    "buy1_price": snap.buy1_price,
+                },
+            )
             last_processed_snapshot_ts = snap.ts
             last_snapshot = snap
             tick_buf.append(snap)
@@ -7810,7 +7893,45 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 status.pending_entry_ts = None
                                                 status.live_state = "FLAT"
                                                 continue
-                                        result = execute_live_entry(client, config, side, storage, candidate_pos, p, status, latest_snapshot=entry_send_snapshot)
+                                        reference_bar_for_entry = rb1.latest()
+                                        lookback_bars_for_entry = int(long_rsi50_trend_hold_config(config).get("ema13_lookback_bars", 4))
+                                        ema13_lookback_for_entry_bar = rb1.prev(lookback_bars_for_entry)
+                                        ema13_lookback_for_entry = ema13_lookback_for_entry_bar.ema13 if ema13_lookback_for_entry_bar is not None else None
+                                        ema13_delta_for_entry_ticks = (
+                                            price_to_ticks(reference_bar_for_entry.ema13 - ema13_lookback_for_entry, reference_bar_for_entry.close)
+                                            if reference_bar_for_entry is not None
+                                            and reference_bar_for_entry.ema13 is not None
+                                            and ema13_lookback_for_entry is not None
+                                            else None
+                                        )
+
+                                        def final_pre_send_ws_snapshot_provider() -> Optional[TickSnapshot]:
+                                            if market_data_mode != "websocket" or ws_feed is None:
+                                                return None
+                                            ws_pre_send = ws_feed.latest_snapshot()
+                                            usable_pre_send_ws, _reason, _age = websocket_snapshot_freshness(
+                                                ws_pre_send,
+                                                ws_feed.available,
+                                                now_jst(),
+                                                max_ws_snapshot_age_sec,
+                                                None,
+                                            )
+                                            return ws_pre_send if usable_pre_send_ws else None
+
+                                        result = execute_live_entry(
+                                            client,
+                                            config,
+                                            side,
+                                            storage,
+                                            candidate_pos,
+                                            p,
+                                            status,
+                                            latest_snapshot=entry_send_snapshot,
+                                            entry_reference_bar=reference_bar_for_entry,
+                                            market_snapshot_provider=final_pre_send_ws_snapshot_provider,
+                                            entry_ema13_lookback_value=ema13_lookback_for_entry,
+                                            entry_ema13_delta_ticks=ema13_delta_for_entry_ticks,
+                                        )
                                         verify_result = verify_entry_position_after_order(
                                             client,
                                             config,

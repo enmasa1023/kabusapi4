@@ -135,6 +135,8 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["big_trend_start_score_enabled"] is False
     assert payload["hold_score_extension_enabled"] is False
     assert payload["new_entry_cutoff_time"] == "15:10:00"
+    assert payload["morning_trade_start"] == "09:00:00"
+    assert payload["afternoon_trade_start"] == "12:30:00"
 
 
 def test_short_b_drop_ma75_down_blocked_in_bullish_pullback_structure():
@@ -486,6 +488,7 @@ def test_long_rsi50_trend_hold_allows_0900_0915_window(monkeypatch):
     assert pred.reason_3 == "long_rsi50_trend_hold"
     assert time_in_windows("09:00:00", TRADE_WINDOWS) is True
     assert time_in_windows("09:01:00", TRADE_WINDOWS) is True
+    assert time_in_windows("12:30:00", TRADE_WINDOWS) is True
 
 
 def test_long_rsi50_mode_ignores_existing_feature_candidates():
