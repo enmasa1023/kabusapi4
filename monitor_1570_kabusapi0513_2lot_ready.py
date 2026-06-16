@@ -20,6 +20,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -51,7 +52,7 @@ API_PASSWORD_HARDCODED = "enmasa1023"  # ここにAPIパスワードを入れる
 
 
 TRADE_WINDOWS = [
-    ("09:03:00", "11:25:00"),
+    ("09:00:00", "11:25:00"),
     ("12:35:00", "15:20:00"),
 ]
 STOP_AFTER = "15:30:00"
@@ -175,6 +176,12 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
     "entry_execution": {},
     "take_profit_execution": {"enabled": True, "fallback_market_after_signal_sec": 180.0},
     "scalping": {"enabled": SCALPING_ENABLED},
+    "market_data_source": {
+        "mode": "websocket",
+        "fallback_to_rest": True,
+        "bar_finalize_delay_ms": 300,
+        "rest_polling_when_ws_unavailable": True,
+    },
     "rsi70_drop_long_watch": {
         "enabled": True,
         "watch_minutes": 10,
@@ -208,6 +215,11 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "use_ema13_trend_filter": True,
         "ema13_period": 13,
         "ema13_lookback_bars": 4,
+        "ema13_min_rise_ticks": 5,
+    },
+    "entry_reference_close_guard": {
+        "enabled": True,
+        "max_abs_deviation_ticks": 2,
     },
     "scalp_feature_entries": SCALP_FEATURE_RULE_DEFAULTS,
     "big_trend_start_score": {
@@ -304,6 +316,8 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
     rsi70_cfg = config.get("rsi70_drop_long_watch", {}) if isinstance(config.get("rsi70_drop_long_watch"), dict) else {}
     analysis_cfg = config.get("analysis_signals", {}) if isinstance(config.get("analysis_signals"), dict) else {}
     rsi50_cfg = long_rsi50_trend_hold_config(config)
+    market_data_cfg = config.get("market_data_source", {}) if isinstance(config.get("market_data_source"), dict) else {}
+    reference_guard_cfg = config.get("entry_reference_close_guard", {}) if isinstance(config.get("entry_reference_close_guard"), dict) else {}
     return {
         "config_path": config.get("config_path"),
         "config_file_loaded": bool(config.get("config_file_loaded")),
@@ -326,6 +340,12 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "long_rsi50_trend_hold_use_ema13_trend_filter": bool(rsi50_cfg.get("use_ema13_trend_filter", True)),
         "long_rsi50_trend_hold_ema13_period": int(rsi50_cfg.get("ema13_period", 13)),
         "long_rsi50_trend_hold_ema13_lookback_bars": int(rsi50_cfg.get("ema13_lookback_bars", 4)),
+        "long_rsi50_trend_hold_ema13_min_rise_ticks": float(rsi50_cfg.get("ema13_min_rise_ticks", 5)),
+        "market_data_source_mode": str(market_data_cfg.get("mode", "rest")),
+        "market_data_source_fallback_to_rest": bool(market_data_cfg.get("fallback_to_rest", True)),
+        "bar_finalize_delay_ms": int(market_data_cfg.get("bar_finalize_delay_ms", 0)),
+        "entry_reference_close_guard_enabled": bool(reference_guard_cfg.get("enabled", True)),
+        "entry_reference_close_guard_max_abs_deviation_ticks": float(reference_guard_cfg.get("max_abs_deviation_ticks", 2)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
@@ -1571,6 +1591,90 @@ def extract_snapshot(raw: dict[str, Any]) -> TickSnapshot:
     )
 
 
+class WebSocketMarketDataFeed:
+    """Best-effort kabu Station WebSocket feed with REST-compatible snapshots.
+
+    The monitor remains operational without the optional websocket-client
+    package or when the socket is disconnected; callers can fall back to REST.
+    """
+
+    def __init__(self, base_url: str, storage: Optional[Storage] = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.storage = storage
+        self._latest: Optional[TickSnapshot] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self.available = False
+        self.last_error = ""
+
+    def _websocket_url(self) -> str:
+        if self.base_url.startswith("https://"):
+            return "wss://" + self.base_url[len("https://"):] + "/websocket"
+        if self.base_url.startswith("http://"):
+            return "ws://" + self.base_url[len("http://"):] + "/websocket"
+        return self.base_url.rstrip("/") + "/websocket"
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="kabu-ws-market-data", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def latest_snapshot(self) -> Optional[TickSnapshot]:
+        with self._lock:
+            return self._latest
+
+    def _run(self) -> None:
+        try:
+            import importlib
+
+            websocket_mod = importlib.import_module("websocket")
+            ws_app_cls = getattr(websocket_mod, "WebSocketApp")
+        except Exception as e:
+            self.available = False
+            self.last_error = f"WEBSOCKET_MODULE_UNAVAILABLE:{e}"
+            if self.storage is not None:
+                self.storage.log("WARN", "WEBSOCKET_MARKET_DATA_UNAVAILABLE", self.last_error)
+            return
+
+        def on_message(_ws: Any, message: str) -> None:
+            try:
+                raw = json.loads(message)
+                snap = extract_snapshot(raw)
+                with self._lock:
+                    self._latest = snap
+                self.available = True
+            except Exception as e:
+                self.last_error = f"WEBSOCKET_MESSAGE_PARSE_FAILED:{e}"
+
+        def on_error(_ws: Any, error_obj: Any) -> None:
+            self.available = False
+            self.last_error = str(error_obj)
+            if self.storage is not None:
+                self.storage.log("WARN", "WEBSOCKET_MARKET_DATA_ERROR", self.last_error)
+
+        def on_close(_ws: Any, *_args: Any) -> None:
+            self.available = False
+            if self.storage is not None:
+                self.storage.log("WARN", "WEBSOCKET_MARKET_DATA_CLOSED", "fallback_to_rest_if_enabled")
+
+        while not self._stop.is_set():
+            try:
+                ws = ws_app_cls(self._websocket_url(), on_message=on_message, on_error=on_error, on_close=on_close)
+                ws.run_forever()
+            except Exception as e:
+                self.available = False
+                self.last_error = str(e)
+                if self.storage is not None:
+                    self.storage.log("WARN", "WEBSOCKET_MARKET_DATA_RECONNECT", self.last_error)
+            if not self._stop.is_set():
+                time.sleep(1.0)
+
+
 def calc_spread_ticks(s: TickSnapshot) -> Optional[float]:
     if s.sell1_price is None or s.buy1_price is None or s.price is None:
         return None
@@ -1760,6 +1864,11 @@ def is_long_rsi50_trend_hold_only(config: dict[str, Any]) -> bool:
         str(config.get("strategy_mode", "legacy")) == STRATEGY_MODE_LONG_RSI50_ONLY
         and bool(long_rsi50_trend_hold_config(config).get("enabled", True))
     )
+
+
+def entry_reference_close_guard_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("entry_reference_close_guard", {}) if isinstance(config.get("entry_reference_close_guard"), dict) else {}
+    return deep_merge_dict(NESTED_CONFIG_DEFAULTS["entry_reference_close_guard"], raw)
 
 
 def scalp_feature_ticks(config: dict[str, Any], rule_name: str) -> tuple[int, int]:
@@ -3047,6 +3156,7 @@ def build_long_rsi50_trend_hold_prediction(
     entry_rsi9_min = float(cfg.get("entry_rsi9_min", 50))
     use_ema13_filter = bool(cfg.get("use_ema13_trend_filter", True))
     ema13_lookback_bars = int(cfg.get("ema13_lookback_bars", 4))
+    ema13_min_rise_ticks = float(cfg.get("ema13_min_rise_ticks", 5))
     ema13_now = bar1.ema13
     ema13_lookback_value = None
     if len(history) >= ema13_lookback_bars + 1:
@@ -3056,15 +3166,33 @@ def build_long_rsi50_trend_hold_prediction(
         if ema13_now is not None and ema13_lookback_value is not None
         else None
     )
+    ema13_delta_ticks = (
+        price_to_ticks(ema13_delta, bar1.close)
+        if ema13_delta is not None
+        else None
+    )
     ema13_block_reason = ""
     if use_ema13_filter:
         if ema13_now is None:
             ema13_block_reason = "EMA13_MISSING"
         elif ema13_lookback_value is None:
             ema13_block_reason = "EMA13_LOOKBACK_MISSING"
-        elif ema13_now <= ema13_lookback_value:
-            ema13_block_reason = "EMA13_NOT_RISING"
+        elif ema13_delta_ticks is None or ema13_delta_ticks < ema13_min_rise_ticks:
+            ema13_block_reason = "EMA13_RISE_TICKS_TOO_SMALL"
     ema13_ok = (not use_ema13_filter) or not ema13_block_reason
+    guard_cfg = entry_reference_close_guard_config(config)
+    reference_guard_enabled = bool(guard_cfg.get("enabled", True))
+    max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 2))
+    best_ask = latest_snapshot.sell1_price if latest_snapshot is not None else None
+    entry_deviation_ticks = (
+        abs(price_to_ticks(best_ask - bar1.close, bar1.close))
+        if best_ask is not None
+        else None
+    )
+    reference_close_ok = (
+        (not reference_guard_enabled)
+        or (entry_deviation_ticks is not None and entry_deviation_ticks <= max_deviation_ticks)
+    )
     # long_rsi50_trend_hold_only intentionally does not apply the legacy
     # 09:00-09:15 no-entry window.  It only respects the configured
     # new_entry_cutoff_time and the generic safety/pending/live-state guards.
@@ -3088,6 +3216,7 @@ def build_long_rsi50_trend_hold_prediction(
         and can_enter_ok
         and rsi_now >= entry_rsi9_min
         and ema13_ok
+        and reference_close_ok
     )
     signal = "LONG_CANDIDATE" if entry_ok else "NO_ACTION"
     reason_3 = LONG_RSI50_ENTRY_RULE if entry_ok else "none"
@@ -3105,8 +3234,15 @@ def build_long_rsi50_trend_hold_prediction(
                 "ema13": ema13_now,
                 "ema13_lookback_value": ema13_lookback_value,
                 "ema13_lookback_bars": ema13_lookback_bars,
-                "ema13_delta": ema13_delta,
+                "ema13_delta_price": ema13_delta,
+                "ema13_delta_ticks": ema13_delta_ticks,
+                "ema13_min_rise_ticks": ema13_min_rise_ticks,
                 "use_ema13_trend_filter": use_ema13_filter,
+                "reference_bar_ts": bar1.ts.isoformat(),
+                "reference_close": bar1.close,
+                "entry_deviation_ticks": entry_deviation_ticks,
+                "entry_reference_close_guard_enabled": reference_guard_enabled,
+                "entry_reference_close_guard_max_abs_deviation_ticks": max_deviation_ticks,
                 "entry_rule": LONG_RSI50_ENTRY_RULE,
                 "strategy": LONG_RSI50_STRATEGY,
                 "position_state": position_state_payload(open_pos),
@@ -3131,11 +3267,37 @@ def build_long_rsi50_trend_hold_prediction(
                 "ema13": ema13_now,
                 "ema13_lookback_value": ema13_lookback_value,
                 "ema13_lookback_bars": ema13_lookback_bars,
-                "ema13_delta": ema13_delta,
+                "ema13_delta_price": ema13_delta,
+                "ema13_delta_ticks": ema13_delta_ticks,
+                "ema13_min_rise_ticks": ema13_min_rise_ticks,
                 "use_ema13_trend_filter": use_ema13_filter,
                 "block_reason": ema13_block_reason,
                 "entry_rule": LONG_RSI50_ENTRY_RULE,
                 "strategy": LONG_RSI50_STRATEGY,
+            },
+        )
+    elif (
+        storage is not None
+        and rsi_now >= entry_rsi9_min
+        and ema13_ok
+        and reference_guard_enabled
+        and not reference_close_ok
+    ):
+        storage.log_structured(
+            "INFO",
+            "LONG_RSI50_TREND_HOLD_ENTRY_BLOCKED_BY_REFERENCE_CLOSE_DEVIATION",
+            {
+                "ts": feature.ts.isoformat(),
+                "reference_bar_ts": bar1.ts.isoformat(),
+                "reference_close": bar1.close,
+                "best_ask": best_ask,
+                "entry_deviation_ticks": entry_deviation_ticks,
+                "max_abs_deviation_ticks": max_deviation_ticks,
+                "rsi9": rsi_now,
+                "ema13": ema13_now,
+                "ema13_lookback_value": ema13_lookback_value,
+                "ema13_delta_ticks": ema13_delta_ticks,
+                "block_reason": "REFERENCE_CLOSE_DEVIATION_TOO_LARGE",
             },
         )
     elif storage is not None and bar1.ts == feature.ts.replace(second=0, microsecond=0):
@@ -3150,9 +3312,17 @@ def build_long_rsi50_trend_hold_prediction(
                 "ema13": ema13_now,
                 "ema13_lookback_value": ema13_lookback_value,
                 "ema13_lookback_bars": ema13_lookback_bars,
-                "ema13_delta": ema13_delta,
+                "ema13_delta_price": ema13_delta,
+                "ema13_delta_ticks": ema13_delta_ticks,
+                "ema13_min_rise_ticks": ema13_min_rise_ticks,
                 "use_ema13_trend_filter": use_ema13_filter,
                 "ema13_block_reason": ema13_block_reason,
+                "reference_bar_ts": bar1.ts.isoformat(),
+                "reference_close": bar1.close,
+                "best_ask": best_ask,
+                "entry_deviation_ticks": entry_deviation_ticks,
+                "entry_reference_close_guard_enabled": reference_guard_enabled,
+                "entry_reference_close_guard_max_abs_deviation_ticks": max_deviation_ticks,
                 "signal": signal,
                 "allow_new_entry": allow_new_entry,
                 "new_entry_cutoff_reached": new_entry_cutoff_reached,
@@ -6857,6 +7027,23 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     last_pred: Optional[PredictionSnapshot] = None
     last_gate: Optional[GateDecision] = None
     last_snapshot: Optional[TickSnapshot] = None
+    market_data_cfg = config.get("market_data_source", {}) if isinstance(config.get("market_data_source"), dict) else {}
+    market_data_mode = str(market_data_cfg.get("mode", "rest")).lower()
+    ws_fallback_to_rest = bool(market_data_cfg.get("fallback_to_rest", True))
+    ws_feed: Optional[WebSocketMarketDataFeed] = None
+    if market_data_mode == "websocket":
+        ws_feed = WebSocketMarketDataFeed(str(config.get("base_url", API_BASE_DEFAULT)), storage)
+        ws_feed.start()
+        storage.log_structured(
+            "INFO",
+            "WEBSOCKET_MARKET_DATA_START",
+            {
+                "mode": market_data_mode,
+                "fallback_to_rest": ws_fallback_to_rest,
+                "bar_finalize_delay_ms": int(market_data_cfg.get("bar_finalize_delay_ms", 300)),
+                "rest_polling_when_ws_unavailable": bool(market_data_cfg.get("rest_polling_when_ws_unavailable", True)),
+            },
+        )
     mfe_ticks = 0.0
     mae_ticks = 0.0
 
@@ -6872,8 +7059,17 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred, latest_snapshot=last_snapshot, use_market_order=True)
             break
         try:
-            raw = client.get_board(config["symbol"], config["exchange"])
-            snap = extract_snapshot(raw)
+            raw = None
+            snap = ws_feed.latest_snapshot() if ws_feed is not None else None
+            if snap is None:
+                if market_data_mode == "websocket" and not ws_fallback_to_rest:
+                    storage.log("WARN", "WEBSOCKET_MARKET_DATA_WAIT", "no websocket snapshot and REST fallback disabled")
+                    time.sleep(config["poll_interval_sec"])
+                    continue
+                raw = client.get_board(config["symbol"], config["exchange"])
+                snap = extract_snapshot(raw)
+                if market_data_mode == "websocket":
+                    storage.log("WARN", "WEBSOCKET_MARKET_DATA_FALLBACK_REST", ws_feed.last_error if ws_feed is not None else "ws_feed_not_started")
             last_snapshot = snap
             tick_buf.append(snap)
             spread_ticks = calc_spread_ticks(snap)
@@ -7905,7 +8101,7 @@ def main() -> None:
     config = build_runtime_config(cfg, args)
     afternoon_trade_start = str(cfg.get("afternoon_trade_start", "12:30:00"))
     globals()["TRADE_WINDOWS"] = [
-        ("09:03:00", "11:25:00"),
+        ("09:00:00", "11:25:00"),
         (afternoon_trade_start, "15:20:00"),
     ]
 

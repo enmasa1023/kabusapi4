@@ -18,6 +18,8 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     TickSnapshot,
     PositionState,
     HARD_STOP_TICKS,
+    TRADE_WINDOWS,
+    time_in_windows,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -88,6 +90,12 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["long_rsi50_trend_hold"]["use_ema13_trend_filter"] is True
     assert runtime["long_rsi50_trend_hold"]["ema13_period"] == 13
     assert runtime["long_rsi50_trend_hold"]["ema13_lookback_bars"] == 4
+    assert runtime["long_rsi50_trend_hold"]["ema13_min_rise_ticks"] == 5
+    assert runtime["market_data_source"]["mode"] == "websocket"
+    assert runtime["market_data_source"]["fallback_to_rest"] is True
+    assert runtime["market_data_source"]["bar_finalize_delay_ms"] == 300
+    assert runtime["entry_reference_close_guard"]["enabled"] is True
+    assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 2
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
     assert runtime["entry_execution"]["fallback_to_market"] is False
     assert runtime["feature_entries"]["enabled"] is False
@@ -108,6 +116,12 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["long_rsi50_trend_hold_use_ema13_trend_filter"] is True
     assert payload["long_rsi50_trend_hold_ema13_period"] == 13
     assert payload["long_rsi50_trend_hold_ema13_lookback_bars"] == 4
+    assert payload["long_rsi50_trend_hold_ema13_min_rise_ticks"] == 5
+    assert payload["market_data_source_mode"] == "websocket"
+    assert payload["market_data_source_fallback_to_rest"] is True
+    assert payload["bar_finalize_delay_ms"] == 300
+    assert payload["entry_reference_close_guard_enabled"] is True
+    assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 2
     assert payload["feature_entries_enabled"] is False
     assert payload["feature_long_rsi_pullback_scalp"] is False
     assert payload["feature_short_extended_ma5_fail_scalp"] is False
@@ -306,7 +320,7 @@ def test_short_extended_ma5_fail_scalp_blocks_ma5_above_or_gap_insufficient_or_o
 def _rsi50_history(ts):
     bars = []
     for i in range(15):
-        bars.append(_bar(ts - timedelta(minutes=14 - i), 67000 + i, 67000, 67000, 67000, 67000, ema13=100.0 + i))
+        bars.append(_bar(ts - timedelta(minutes=14 - i), 67000 + i, 67000, 67000, 67000, 67000, ema13=67000.0 + i * 20.0))
     return bars
 
 
@@ -372,6 +386,47 @@ def test_long_rsi50_trend_hold_blocks_when_ema13_not_rising(monkeypatch):
     assert pred.signal == "NO_ACTION"
 
 
+def test_long_rsi50_trend_hold_requires_ema13_rise_5_ticks(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    status = MonitorStatus()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    snap = TickSnapshot(ts, 67000, 1000, 66900, 67010, 10, 67000, 10)
+    history = _rsi50_history(ts)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 55.0)
+
+    history[-5].ema13 = 67000.0
+    history[-1].ema13 = 67049.9
+    pred_short = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred_short.signal == "NO_ACTION"
+
+    history[-1].ema13 = 67050.0
+    pred_ok = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
+    assert pred_ok.signal == "LONG_CANDIDATE"
+    assert pred_ok.reason_3 == "long_rsi50_trend_hold"
+
+
+def test_long_rsi50_trend_hold_reference_close_guard(monkeypatch):
+    import monitor_1570_kabusapi0513_2lot_ready as m
+
+    ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
+    cfg = _base_runtime_config()
+    status = MonitorStatus()
+    feature = _feature(ts, 67000, 66900, "trend_up")
+    history = _rsi50_history(ts)
+    monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 55.0)
+
+    snap_within = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 20, 10, 67000, 10)
+    pred_within = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap_within, cfg, allow_new_entry=True)
+    assert pred_within.signal == "LONG_CANDIDATE"
+
+    snap_far = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 30, 10, 67000, 10)
+    pred_far = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap_far, cfg, allow_new_entry=True)
+    assert pred_far.signal == "NO_ACTION"
+
+
 def test_long_rsi50_trend_hold_allows_0900_0915_window(monkeypatch):
     import monitor_1570_kabusapi0513_2lot_ready as m
 
@@ -385,6 +440,8 @@ def test_long_rsi50_trend_hold_allows_0900_0915_window(monkeypatch):
     pred = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
     assert pred.signal == "LONG_CANDIDATE"
     assert pred.reason_3 == "long_rsi50_trend_hold"
+    assert time_in_windows("09:00:00", TRADE_WINDOWS) is True
+    assert time_in_windows("09:01:00", TRADE_WINDOWS) is True
 
 
 def test_long_rsi50_mode_ignores_existing_feature_candidates():

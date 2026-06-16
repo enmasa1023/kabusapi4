@@ -86,6 +86,12 @@
     "enabled": true,
     "fallback_market_after_signal_sec": 180.0
   },
+  "market_data_source": {
+    "mode": "websocket",
+    "fallback_to_rest": true,
+    "bar_finalize_delay_ms": 300,
+    "rest_polling_when_ws_unavailable": true
+  },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "15:10:00",
   "strategy_mode": "long_rsi50_trend_hold_only",
@@ -100,7 +106,12 @@
     "use_ma5_trailing": false,
     "use_ema13_trend_filter": true,
     "ema13_period": 13,
-    "ema13_lookback_bars": 4
+    "ema13_lookback_bars": 4,
+    "ema13_min_rise_ticks": 5
+  },
+  "entry_reference_close_guard": {
+    "enabled": true,
+    "max_abs_deviation_ticks": 2
   },
   "rsi70_drop_long_watch": {
     "enabled": false,
