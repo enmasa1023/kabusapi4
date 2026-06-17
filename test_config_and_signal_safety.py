@@ -91,13 +91,13 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["long_rsi50_trend_hold"]["use_ema13_trend_filter"] is True
     assert runtime["long_rsi50_trend_hold"]["ema13_period"] == 13
     assert runtime["long_rsi50_trend_hold"]["ema13_lookback_bars"] == 4
-    assert runtime["long_rsi50_trend_hold"]["ema13_min_rise_ticks"] == 5
+    assert runtime["long_rsi50_trend_hold"]["ema13_min_rise_ticks"] == 3
     assert runtime["market_data_source"]["mode"] == "websocket"
     assert runtime["market_data_source"]["fallback_to_rest"] is True
     assert runtime["market_data_source"]["bar_finalize_delay_ms"] == 300
     assert runtime["market_data_source"]["max_ws_snapshot_age_sec"] == 3.0
     assert runtime["entry_reference_close_guard"]["enabled"] is True
-    assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 2
+    assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 4
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
     assert runtime["entry_execution"]["fallback_to_market"] is False
     assert runtime["feature_entries"]["enabled"] is False
@@ -118,13 +118,13 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["long_rsi50_trend_hold_use_ema13_trend_filter"] is True
     assert payload["long_rsi50_trend_hold_ema13_period"] == 13
     assert payload["long_rsi50_trend_hold_ema13_lookback_bars"] == 4
-    assert payload["long_rsi50_trend_hold_ema13_min_rise_ticks"] == 5
+    assert payload["long_rsi50_trend_hold_ema13_min_rise_ticks"] == 3
     assert payload["market_data_source_mode"] == "websocket"
     assert payload["market_data_source_fallback_to_rest"] is True
     assert payload["bar_finalize_delay_ms"] == 300
     assert payload["market_data_source_max_ws_snapshot_age_sec"] == 3.0
     assert payload["entry_reference_close_guard_enabled"] is True
-    assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 2
+    assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 4
     assert payload["feature_entries_enabled"] is False
     assert payload["feature_long_rsi_pullback_scalp"] is False
     assert payload["feature_short_extended_ma5_fail_scalp"] is False
@@ -432,7 +432,7 @@ def test_long_rsi50_trend_hold_blocks_when_ema13_not_rising(monkeypatch):
     assert pred.signal == "NO_ACTION"
 
 
-def test_long_rsi50_trend_hold_requires_ema13_rise_5_ticks(monkeypatch):
+def test_long_rsi50_trend_hold_requires_ema13_rise_3_ticks(monkeypatch):
     import monitor_1570_kabusapi0513_2lot_ready as m
 
     ts = datetime(2026, 6, 12, 10, 0, tzinfo=JST)
@@ -444,11 +444,11 @@ def test_long_rsi50_trend_hold_requires_ema13_rise_5_ticks(monkeypatch):
     monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 55.0)
 
     history[-5].ema13 = 67000.0
-    history[-1].ema13 = 67049.9
+    history[-1].ema13 = 67029.9
     pred_short = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
     assert pred_short.signal == "NO_ACTION"
 
-    history[-1].ema13 = 67050.0
+    history[-1].ema13 = 67030.0
     pred_ok = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap, cfg, allow_new_entry=True)
     assert pred_ok.signal == "LONG_CANDIDATE"
     assert pred_ok.reason_3 == "long_rsi50_trend_hold"
@@ -464,11 +464,11 @@ def test_long_rsi50_trend_hold_reference_close_guard(monkeypatch):
     history = _rsi50_history(ts)
     monkeypatch.setattr(m, "rsi9_wilder", lambda closes, period: 55.0)
 
-    snap_within = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 20, 10, 67000, 10)
+    snap_within = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 40, 10, 67000, 10)
     pred_within = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap_within, cfg, allow_new_entry=True)
     assert pred_within.signal == "LONG_CANDIDATE"
 
-    snap_far = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 30, 10, 67000, 10)
+    snap_far = TickSnapshot(ts, 67000, 1000, 66900, history[-1].close + 50, 10, 67000, 10)
     pred_far = build_long_rsi50_trend_hold_prediction(history[-1], history, None, status, feature, snap_far, cfg, allow_new_entry=True)
     assert pred_far.signal == "NO_ACTION"
 

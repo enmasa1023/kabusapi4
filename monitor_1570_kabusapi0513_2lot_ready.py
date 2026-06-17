@@ -216,11 +216,11 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "use_ema13_trend_filter": True,
         "ema13_period": 13,
         "ema13_lookback_bars": 4,
-        "ema13_min_rise_ticks": 5,
+        "ema13_min_rise_ticks": 3,
     },
     "entry_reference_close_guard": {
         "enabled": True,
-        "max_abs_deviation_ticks": 2,
+        "max_abs_deviation_ticks": 4,
     },
     "scalp_feature_entries": SCALP_FEATURE_RULE_DEFAULTS,
     "big_trend_start_score": {
@@ -343,13 +343,13 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "long_rsi50_trend_hold_use_ema13_trend_filter": bool(rsi50_cfg.get("use_ema13_trend_filter", True)),
         "long_rsi50_trend_hold_ema13_period": int(rsi50_cfg.get("ema13_period", 13)),
         "long_rsi50_trend_hold_ema13_lookback_bars": int(rsi50_cfg.get("ema13_lookback_bars", 4)),
-        "long_rsi50_trend_hold_ema13_min_rise_ticks": float(rsi50_cfg.get("ema13_min_rise_ticks", 5)),
+        "long_rsi50_trend_hold_ema13_min_rise_ticks": float(rsi50_cfg.get("ema13_min_rise_ticks", 3)),
         "market_data_source_mode": str(market_data_cfg.get("mode", "rest")),
         "market_data_source_fallback_to_rest": bool(market_data_cfg.get("fallback_to_rest", True)),
         "bar_finalize_delay_ms": int(market_data_cfg.get("bar_finalize_delay_ms", 0)),
         "market_data_source_max_ws_snapshot_age_sec": float(market_data_cfg.get("max_ws_snapshot_age_sec", 3.0)),
         "entry_reference_close_guard_enabled": bool(reference_guard_cfg.get("enabled", True)),
-        "entry_reference_close_guard_max_abs_deviation_ticks": float(reference_guard_cfg.get("max_abs_deviation_ticks", 2)),
+        "entry_reference_close_guard_max_abs_deviation_ticks": float(reference_guard_cfg.get("max_abs_deviation_ticks", 4)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
         "feature_long_vwap_volume_momentum": bool(feature_cfg.get("long_vwap_volume_momentum", False)),
         "feature_short_vwap_extended_fail": bool(feature_cfg.get("short_vwap_extended_fail", False)),
@@ -3219,7 +3219,7 @@ def build_long_rsi50_trend_hold_prediction(
     entry_rsi9_min = float(cfg.get("entry_rsi9_min", 50))
     use_ema13_filter = bool(cfg.get("use_ema13_trend_filter", True))
     ema13_lookback_bars = int(cfg.get("ema13_lookback_bars", 4))
-    ema13_min_rise_ticks = float(cfg.get("ema13_min_rise_ticks", 5))
+    ema13_min_rise_ticks = float(cfg.get("ema13_min_rise_ticks", 3))
     ema13_now = bar1.ema13
     ema13_lookback_value = None
     if len(history) >= ema13_lookback_bars + 1:
@@ -3245,7 +3245,7 @@ def build_long_rsi50_trend_hold_prediction(
     ema13_ok = (not use_ema13_filter) or not ema13_block_reason
     guard_cfg = entry_reference_close_guard_config(config)
     reference_guard_enabled = bool(guard_cfg.get("enabled", True))
-    max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 2))
+    max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 4))
     best_ask = latest_snapshot.sell1_price if latest_snapshot is not None else None
     entry_deviation_ticks = reference_close_deviation_ticks(best_ask, bar1.close)
     reference_close_ok = (
@@ -5482,7 +5482,7 @@ def execute_live_entry(
             pre_send_best_ask = pre_send_snapshot.sell1_price if pre_send_snapshot is not None else None
             deviation_ticks = reference_close_deviation_ticks(pre_send_best_ask, reference_close)
             guard_cfg = entry_reference_close_guard_config(config)
-            max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 2))
+            max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 4))
             final_pre_send_context = {
                 "reference_bar_ts": reference_bar_ts.isoformat(),
                 "reference_close": reference_close,
@@ -7866,7 +7866,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                             "pre_signal_best_ask": entry_send_snapshot.sell1_price if entry_send_snapshot is not None else None,
                                                             "pre_send_best_ask": None,
                                                             "entry_deviation_ticks": None,
-                                                            "max_abs_deviation_ticks": entry_reference_close_guard_config(config).get("max_abs_deviation_ticks", 2),
+                                                            "max_abs_deviation_ticks": entry_reference_close_guard_config(config).get("max_abs_deviation_ticks", 4),
                                                             "rsi9": p.rsi9_value,
                                                             "ema13": rb1.latest().ema13 if rb1.latest() is not None else None,
                                                             "ema13_lookback_value": rb1.prev(int(long_rsi50_trend_hold_config(config).get("ema13_lookback_bars", 4))).ema13 if rb1.prev(int(long_rsi50_trend_hold_config(config).get("ema13_lookback_bars", 4))) is not None else None,
@@ -7884,7 +7884,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                             pre_send_best_ask = entry_send_snapshot.sell1_price if entry_send_snapshot is not None else None
                                             deviation_ticks = reference_close_deviation_ticks(pre_send_best_ask, reference_close)
                                             guard_cfg = entry_reference_close_guard_config(config)
-                                            max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 2))
+                                            max_deviation_ticks = float(guard_cfg.get("max_abs_deviation_ticks", 4))
                                             guard_enabled = bool(guard_cfg.get("enabled", True))
                                             lookback_bars = int(long_rsi50_trend_hold_config(config).get("ema13_lookback_bars", 4))
                                             ema13_now = reference_bar.ema13 if reference_bar is not None else None

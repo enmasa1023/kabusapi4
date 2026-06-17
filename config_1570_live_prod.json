@@ -108,11 +108,11 @@
     "use_ema13_trend_filter": true,
     "ema13_period": 13,
     "ema13_lookback_bars": 4,
-    "ema13_min_rise_ticks": 5
+    "ema13_min_rise_ticks": 3
   },
   "entry_reference_close_guard": {
     "enabled": true,
-    "max_abs_deviation_ticks": 2
+    "max_abs_deviation_ticks": 4
   },
   "rsi70_drop_long_watch": {
     "enabled": false,

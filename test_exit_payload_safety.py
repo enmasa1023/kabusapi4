@@ -112,7 +112,7 @@ def entry_config():
             },
             "entry_reference_close_guard": {
                 "enabled": True,
-                "max_abs_deviation_ticks": 2,
+                "max_abs_deviation_ticks": 4,
             },
             "long_rsi50_trend_hold": {
                 "enabled": True,
@@ -121,7 +121,7 @@ def entry_config():
                 "hard_stop_ticks": 20,
                 "use_ema13_trend_filter": True,
                 "ema13_lookback_bars": 4,
-                "ema13_min_rise_ticks": 5,
+                "ema13_min_rise_ticks": 3,
             },
         }
     )
@@ -245,6 +245,7 @@ def test_live_entry_final_pre_send_reference_close_guard_allows_order():
     assert entry_requests
     assert entry_requests[0][2]["final_pre_send_best_ask"] == 67020
     assert entry_requests[0][2]["final_pre_send_deviation_ticks"] == 2
+    assert entry_requests[0][2]["entry_reference_close_guard_max_abs_deviation_ticks"] == 4
 
 
 def test_fast_path_uses_actual_exchange_27_not_config_1():
