@@ -182,6 +182,7 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "bar_finalize_delay_ms": 300,
         "rest_polling_when_ws_unavailable": True,
         "max_ws_snapshot_age_sec": 3.0,
+        "rest_fallback_min_interval_sec": 2.0,
         "ws_queue_maxlen": 5000,
         "websocket_loop_sleep_sec": 0.1,
         "persist_raw_ws_snapshots": False,
@@ -354,6 +355,7 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "market_data_source_fallback_to_rest": bool(market_data_cfg.get("fallback_to_rest", True)),
         "bar_finalize_delay_ms": int(market_data_cfg.get("bar_finalize_delay_ms", 0)),
         "market_data_source_max_ws_snapshot_age_sec": float(market_data_cfg.get("max_ws_snapshot_age_sec", 3.0)),
+        "market_data_source_rest_fallback_min_interval_sec": float(market_data_cfg.get("rest_fallback_min_interval_sec", 2.0)),
         "market_data_source_ws_queue_maxlen": int(market_data_cfg.get("ws_queue_maxlen", 5000)),
         "market_data_source_websocket_loop_sleep_sec": float(market_data_cfg.get("websocket_loop_sleep_sec", 0.1)),
         "market_data_source_persist_raw_ws_snapshots": bool(market_data_cfg.get("persist_raw_ws_snapshots", False)),
@@ -7213,12 +7215,15 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     last_snapshot: Optional[TickSnapshot] = None
     last_processed_snapshot_ts: Optional[datetime] = None
     last_processed_ws_seq: Optional[int] = None
+    last_rest_fallback_ts: Optional[datetime] = None
     next_ws_queue_empty_log = start_ts
+    next_ws_fallback_log = start_ts
     next_ws_loop_metrics_log = start_ts
     market_data_cfg = config.get("market_data_source", {}) if isinstance(config.get("market_data_source"), dict) else {}
     market_data_mode = str(market_data_cfg.get("mode", "rest")).lower()
     ws_fallback_to_rest = bool(market_data_cfg.get("fallback_to_rest", True))
     max_ws_snapshot_age_sec = float(market_data_cfg.get("max_ws_snapshot_age_sec", 3.0))
+    rest_fallback_min_interval_sec = float(market_data_cfg.get("rest_fallback_min_interval_sec", config.get("poll_interval_sec", 2.0)))
     bar_finalize_delay_ms = int(market_data_cfg.get("bar_finalize_delay_ms", 300))
     ws_queue_maxlen = int(market_data_cfg.get("ws_queue_maxlen", 5000))
     websocket_loop_sleep_sec = float(market_data_cfg.get("websocket_loop_sleep_sec", 0.1))
@@ -7239,6 +7244,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 "bar_finalize_delay_ms": bar_finalize_delay_ms,
                 "rest_polling_when_ws_unavailable": bool(market_data_cfg.get("rest_polling_when_ws_unavailable", True)),
                 "max_ws_snapshot_age_sec": max_ws_snapshot_age_sec,
+                "rest_fallback_min_interval_sec": rest_fallback_min_interval_sec,
                 "ws_queue_maxlen": ws_queue_maxlen,
                 "websocket_loop_sleep_sec": websocket_loop_sleep_sec,
                 "persist_raw_ws_snapshots": persist_raw_ws_snapshots,
@@ -7325,7 +7331,8 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     queue_empty_reason = ws_reason
                     if ws_feed.available and ws_snap is not None and ws_reason in {"OK", "WS_SNAPSHOT_DUPLICATE"}:
                         queue_empty_reason = "WS_QUEUE_EMPTY_BUT_WS_AVAILABLE"
-                    if debug_ws_snapshot_events or now_ >= next_ws_queue_empty_log or queue_empty_reason in {"WS_UNAVAILABLE", "WS_SNAPSHOT_STALE"}:
+                    log_queue_empty_now = debug_ws_snapshot_events or now_ >= next_ws_queue_empty_log
+                    if log_queue_empty_now or (queue_empty_reason in {"WS_UNAVAILABLE", "WS_SNAPSHOT_STALE"} and now_ >= next_ws_fallback_log):
                         storage.log_structured(
                             "INFO" if queue_empty_reason in {"WS_SNAPSHOT_DUPLICATE", "WS_QUEUE_EMPTY_BUT_WS_AVAILABLE"} else "WARN",
                             "WS_QUEUE_EMPTY",
@@ -7344,7 +7351,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             },
                         )
                         next_ws_queue_empty_log = now_ + timedelta(seconds=5)
-                    if ws_reason == "WS_SNAPSHOT_STALE":
+                    rest_fallback_due = ws_fallback_to_rest and queue_empty_reason in {"WS_UNAVAILABLE", "WS_SNAPSHOT_STALE"}
+                    rest_fallback_interval_ok = (
+                        last_rest_fallback_ts is None
+                        or (now_ - last_rest_fallback_ts).total_seconds() >= rest_fallback_min_interval_sec
+                    )
+                    should_rest_fallback = rest_fallback_due and rest_fallback_interval_ok
+                    log_fallback_detail_now = (
+                        debug_ws_snapshot_events
+                        or should_rest_fallback
+                        or now_ >= next_ws_fallback_log
+                    )
+                    if ws_reason == "WS_SNAPSHOT_STALE" and log_fallback_detail_now:
                         storage.log_structured(
                             "WARN",
                             "WS_SNAPSHOT_STALE_FALLBACK_TO_REST",
@@ -7353,11 +7371,15 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 "now_ts": now_.isoformat(),
                                 "age_sec": ws_age_sec,
                                 "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                                "fallback_to_rest": ws_fallback_to_rest,
+                                "fallback_to_rest": should_rest_fallback,
                                 "reason": ws_reason,
+                                "rate_limited": rest_fallback_due and not rest_fallback_interval_ok,
+                                "rest_fallback_min_interval_sec": rest_fallback_min_interval_sec,
+                                "last_rest_fallback_ts": last_rest_fallback_ts.isoformat() if last_rest_fallback_ts is not None else None,
                             },
                         )
-                    elif ws_reason == "WS_SNAPSHOT_DUPLICATE":
+                        next_ws_fallback_log = now_ + timedelta(seconds=5)
+                    elif ws_reason == "WS_SNAPSHOT_DUPLICATE" and (debug_ws_snapshot_events or log_queue_empty_now):
                         storage.log_structured(
                             "INFO",
                             "WS_SNAPSHOT_DUPLICATE_SKIPPED",
@@ -7370,7 +7392,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 "reason": ws_reason,
                             },
                         )
-                    else:
+                    elif ws_reason not in {"WS_SNAPSHOT_STALE", "WS_SNAPSHOT_DUPLICATE"} and log_fallback_detail_now:
                         storage.log_structured(
                             "WARN",
                             "WS_UNAVAILABLE_FALLBACK_TO_REST",
@@ -7379,14 +7401,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 "now_ts": now_.isoformat(),
                                 "age_sec": ws_age_sec,
                                 "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                                "fallback_to_rest": ws_fallback_to_rest,
+                                "fallback_to_rest": should_rest_fallback,
                                 "reason": ws_reason,
+                                "rate_limited": rest_fallback_due and not rest_fallback_interval_ok,
+                                "rest_fallback_min_interval_sec": rest_fallback_min_interval_sec,
+                                "last_rest_fallback_ts": last_rest_fallback_ts.isoformat() if last_rest_fallback_ts is not None else None,
                             },
                         )
-                    should_rest_fallback = ws_fallback_to_rest and queue_empty_reason in {"WS_UNAVAILABLE", "WS_SNAPSHOT_STALE"}
+                        next_ws_fallback_log = now_ + timedelta(seconds=5)
                     if not should_rest_fallback:
                         snapshots_to_process = []
                     else:
+                        last_rest_fallback_ts = now_
                         raw = client.get_board(config["symbol"], config["exchange"])
                         rest_snap = extract_snapshot(raw)
                         snapshots_to_process = [rest_snap]

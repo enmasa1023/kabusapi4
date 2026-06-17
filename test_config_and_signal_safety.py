@@ -97,6 +97,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["market_data_source"]["fallback_to_rest"] is True
     assert runtime["market_data_source"]["bar_finalize_delay_ms"] == 300
     assert runtime["market_data_source"]["max_ws_snapshot_age_sec"] == 3.0
+    assert runtime["market_data_source"]["rest_fallback_min_interval_sec"] == 2.0
     assert runtime["market_data_source"]["ws_queue_maxlen"] == 5000
     assert runtime["market_data_source"]["websocket_loop_sleep_sec"] == 0.1
     assert runtime["market_data_source"]["persist_raw_ws_snapshots"] is False
@@ -130,6 +131,7 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["market_data_source_fallback_to_rest"] is True
     assert payload["bar_finalize_delay_ms"] == 300
     assert payload["market_data_source_max_ws_snapshot_age_sec"] == 3.0
+    assert payload["market_data_source_rest_fallback_min_interval_sec"] == 2.0
     assert payload["market_data_source_ws_queue_maxlen"] == 5000
     assert payload["market_data_source_websocket_loop_sleep_sec"] == 0.1
     assert payload["market_data_source_persist_raw_ws_snapshots"] is False
