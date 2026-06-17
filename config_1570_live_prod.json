@@ -91,7 +91,11 @@
     "fallback_to_rest": true,
     "bar_finalize_delay_ms": 300,
     "rest_polling_when_ws_unavailable": true,
-    "max_ws_snapshot_age_sec": 3.0
+    "max_ws_snapshot_age_sec": 3.0,
+    "ws_queue_maxlen": 5000,
+    "websocket_loop_sleep_sec": 0.1,
+    "persist_raw_ws_snapshots": false,
+    "persist_raw_ws_snapshot_every_n": 0
   },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "15:10:00",

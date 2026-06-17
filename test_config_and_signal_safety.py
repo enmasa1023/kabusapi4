@@ -21,6 +21,7 @@ from monitor_1570_kabusapi0513_2lot_ready import (
     TRADE_WINDOWS,
     time_in_windows,
     websocket_snapshot_freshness,
+    WebSocketMarketDataFeed,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -96,6 +97,10 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["market_data_source"]["fallback_to_rest"] is True
     assert runtime["market_data_source"]["bar_finalize_delay_ms"] == 300
     assert runtime["market_data_source"]["max_ws_snapshot_age_sec"] == 3.0
+    assert runtime["market_data_source"]["ws_queue_maxlen"] == 5000
+    assert runtime["market_data_source"]["websocket_loop_sleep_sec"] == 0.1
+    assert runtime["market_data_source"]["persist_raw_ws_snapshots"] is False
+    assert runtime["market_data_source"]["persist_raw_ws_snapshot_every_n"] == 0
     assert runtime["entry_reference_close_guard"]["enabled"] is True
     assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 4
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
@@ -123,6 +128,10 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["market_data_source_fallback_to_rest"] is True
     assert payload["bar_finalize_delay_ms"] == 300
     assert payload["market_data_source_max_ws_snapshot_age_sec"] == 3.0
+    assert payload["market_data_source_ws_queue_maxlen"] == 5000
+    assert payload["market_data_source_websocket_loop_sleep_sec"] == 0.1
+    assert payload["market_data_source_persist_raw_ws_snapshots"] is False
+    assert payload["market_data_source_persist_raw_ws_snapshot_every_n"] == 0
     assert payload["entry_reference_close_guard_enabled"] is True
     assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 4
     assert payload["feature_entries_enabled"] is False
@@ -399,6 +408,35 @@ def test_websocket_snapshot_freshness_rejects_stale_and_duplicate():
     assert reason_unavailable == "WS_UNAVAILABLE"
 
 
+def test_websocket_market_data_feed_drains_queue_in_timestamp_order():
+    base_ts = datetime(2026, 6, 12, 9, 0, 0, tzinfo=JST)
+    feed = WebSocketMarketDataFeed("http://localhost:18080/kabusapi", queue_maxlen=10)
+    snaps = [
+        TickSnapshot(base_ts + timedelta(seconds=2), 67020, 1002, 67000, 67030, 10, 67020, 10),
+        TickSnapshot(base_ts + timedelta(seconds=1), 67010, 1001, 67000, 67020, 10, 67010, 10),
+        TickSnapshot(base_ts, 67000, 1000, 66990, 67010, 10, 66990, 10),
+    ]
+    with feed._lock:
+        for snap in snaps:
+            feed._queue.append(snap)
+            feed._received_count += 1
+            feed._latest = snap
+            feed._last_received_ts = snap.ts
+            feed._last_enqueued_snapshot_ts = snap.ts
+
+    drained = feed.drain_snapshots_after(None)
+    assert [snap.ts for snap in drained] == sorted(snap.ts for snap in snaps)
+    assert [snap.price for snap in drained] == [67000, 67010, 67020]
+    assert feed.metrics()["queue_len"] == 0
+    assert feed.metrics()["drained_count_total"] == 3
+
+    with feed._lock:
+        for snap in snaps:
+            feed._queue.append(snap)
+    drained_after = feed.drain_snapshots_after(base_ts + timedelta(seconds=1))
+    assert [snap.ts for snap in drained_after] == [base_ts + timedelta(seconds=2)]
+
+
 def test_rolling_bars_time_trigger_finalizes_after_delay():
     rb = RollingBars(1)
     tick_ts = datetime(2026, 6, 12, 9, 0, 10, tzinfo=JST)
@@ -415,6 +453,21 @@ def test_rolling_bars_time_trigger_finalizes_after_delay():
     assert finalized.close == 67000
     assert rb.current_bucket == datetime(2026, 6, 12, 9, 1, tzinfo=JST)
     assert rb.rows and rb.rows[0].price == 67020
+
+
+def test_rolling_bars_ohlc_from_multiple_snapshots():
+    rb = RollingBars(1)
+    base_ts = datetime(2026, 6, 12, 9, 0, tzinfo=JST)
+    rb.update(TickSnapshot(base_ts + timedelta(seconds=1), 67000, 1000, 66990, 67010, 10, 66990, 10))
+    rb.update(TickSnapshot(base_ts + timedelta(seconds=10), 67050, 1001, 67040, 67060, 10, 67040, 10))
+    rb.update(TickSnapshot(base_ts + timedelta(seconds=20), 66980, 1002, 66970, 66990, 10, 66970, 10))
+    finalized = rb.update(TickSnapshot(base_ts + timedelta(minutes=1, seconds=1), 67020, 1003, 67010, 67030, 10, 67010, 10))
+    assert finalized is not None
+    assert finalized.open == 67000
+    assert finalized.high == 67050
+    assert finalized.low == 66980
+    assert finalized.close == 66980
+    assert rb.history[-1] is finalized
 
 
 def test_long_rsi50_trend_hold_blocks_when_ema13_not_rising(monkeypatch):

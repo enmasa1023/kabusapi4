@@ -182,6 +182,10 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "bar_finalize_delay_ms": 300,
         "rest_polling_when_ws_unavailable": True,
         "max_ws_snapshot_age_sec": 3.0,
+        "ws_queue_maxlen": 5000,
+        "websocket_loop_sleep_sec": 0.1,
+        "persist_raw_ws_snapshots": False,
+        "persist_raw_ws_snapshot_every_n": 0,
     },
     "rsi70_drop_long_watch": {
         "enabled": True,
@@ -348,6 +352,10 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "market_data_source_fallback_to_rest": bool(market_data_cfg.get("fallback_to_rest", True)),
         "bar_finalize_delay_ms": int(market_data_cfg.get("bar_finalize_delay_ms", 0)),
         "market_data_source_max_ws_snapshot_age_sec": float(market_data_cfg.get("max_ws_snapshot_age_sec", 3.0)),
+        "market_data_source_ws_queue_maxlen": int(market_data_cfg.get("ws_queue_maxlen", 5000)),
+        "market_data_source_websocket_loop_sleep_sec": float(market_data_cfg.get("websocket_loop_sleep_sec", 0.1)),
+        "market_data_source_persist_raw_ws_snapshots": bool(market_data_cfg.get("persist_raw_ws_snapshots", False)),
+        "market_data_source_persist_raw_ws_snapshot_every_n": int(market_data_cfg.get("persist_raw_ws_snapshot_every_n", 0)),
         "entry_reference_close_guard_enabled": bool(reference_guard_cfg.get("enabled", True)),
         "entry_reference_close_guard_max_abs_deviation_ticks": float(reference_guard_cfg.get("max_abs_deviation_ticks", 4)),
         "feature_entries_enabled": bool(feature_cfg.get("enabled", False)),
@@ -1638,10 +1646,18 @@ class WebSocketMarketDataFeed:
     package or when the socket is disconnected; callers can fall back to REST.
     """
 
-    def __init__(self, base_url: str, storage: Optional[Storage] = None) -> None:
+    def __init__(self, base_url: str, storage: Optional[Storage] = None, queue_maxlen: int = 5000) -> None:
         self.base_url = base_url.rstrip("/")
         self.storage = storage
         self._latest: Optional[TickSnapshot] = None
+        self._queue: deque[TickSnapshot] = deque(maxlen=max(int(queue_maxlen), 1))
+        self._queue_maxlen = max(int(queue_maxlen), 1)
+        self._received_count = 0
+        self._drained_count = 0
+        self._dropped_count = 0
+        self._last_received_ts: Optional[datetime] = None
+        self._last_enqueued_snapshot_ts: Optional[datetime] = None
+        self._data_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -1668,6 +1684,39 @@ class WebSocketMarketDataFeed:
         with self._lock:
             return self._latest
 
+    def wait_for_data(self, timeout_sec: float) -> bool:
+        got_data = self._data_event.wait(max(float(timeout_sec), 0.0))
+        if got_data:
+            self._data_event.clear()
+        return got_data
+
+    def drain_snapshots_after(self, last_processed_snapshot_ts: Optional[datetime]) -> list[TickSnapshot]:
+        with self._lock:
+            queued = list(self._queue)
+            self._queue.clear()
+        if not queued:
+            return []
+        drained: list[TickSnapshot] = []
+        for snap in sorted(queued, key=lambda s: s.ts):
+            if last_processed_snapshot_ts is not None and snap.ts <= last_processed_snapshot_ts:
+                continue
+            drained.append(snap)
+        with self._lock:
+            self._drained_count += len(drained)
+        return drained
+
+    def metrics(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "queue_len": len(self._queue),
+                "queue_maxlen": self._queue_maxlen,
+                "received_count_total": self._received_count,
+                "drained_count_total": self._drained_count,
+                "dropped_count_total": self._dropped_count,
+                "last_received_ts": self._last_received_ts.isoformat() if self._last_received_ts else None,
+                "last_enqueued_snapshot_ts": self._last_enqueued_snapshot_ts.isoformat() if self._last_enqueued_snapshot_ts else None,
+            }
+
     def _run(self) -> None:
         try:
             import importlib
@@ -1685,9 +1734,17 @@ class WebSocketMarketDataFeed:
             try:
                 raw = json.loads(message)
                 snap = extract_snapshot(raw)
+                received_ts = now_jst()
                 with self._lock:
+                    if len(self._queue) >= self._queue_maxlen:
+                        self._dropped_count += 1
                     self._latest = snap
+                    self._queue.append(snap)
+                    self._received_count += 1
+                    self._last_received_ts = received_ts
+                    self._last_enqueued_snapshot_ts = snap.ts
                 self.available = True
+                self._data_event.set()
             except Exception as e:
                 self.last_error = f"WEBSOCKET_MESSAGE_PARSE_FAILED:{e}"
 
@@ -7143,9 +7200,13 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     ws_fallback_to_rest = bool(market_data_cfg.get("fallback_to_rest", True))
     max_ws_snapshot_age_sec = float(market_data_cfg.get("max_ws_snapshot_age_sec", 3.0))
     bar_finalize_delay_ms = int(market_data_cfg.get("bar_finalize_delay_ms", 300))
+    ws_queue_maxlen = int(market_data_cfg.get("ws_queue_maxlen", 5000))
+    websocket_loop_sleep_sec = float(market_data_cfg.get("websocket_loop_sleep_sec", 0.1))
+    persist_raw_ws_snapshots = bool(market_data_cfg.get("persist_raw_ws_snapshots", False))
+    persist_raw_ws_snapshot_every_n = int(market_data_cfg.get("persist_raw_ws_snapshot_every_n", 0))
     ws_feed: Optional[WebSocketMarketDataFeed] = None
     if market_data_mode == "websocket":
-        ws_feed = WebSocketMarketDataFeed(str(config.get("base_url", API_BASE_DEFAULT)), storage)
+        ws_feed = WebSocketMarketDataFeed(str(config.get("base_url", API_BASE_DEFAULT)), storage, queue_maxlen=ws_queue_maxlen)
         ws_feed.start()
         storage.log_structured(
             "INFO",
@@ -7156,8 +7217,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 "bar_finalize_delay_ms": bar_finalize_delay_ms,
                 "rest_polling_when_ws_unavailable": bool(market_data_cfg.get("rest_polling_when_ws_unavailable", True)),
                 "max_ws_snapshot_age_sec": max_ws_snapshot_age_sec,
+                "ws_queue_maxlen": ws_queue_maxlen,
+                "websocket_loop_sleep_sec": websocket_loop_sleep_sec,
+                "persist_raw_ws_snapshots": persist_raw_ws_snapshots,
+                "persist_raw_ws_snapshot_every_n": persist_raw_ws_snapshot_every_n,
             },
         )
+
+    def sleep_or_wait_for_market_data() -> None:
+        sleep_sec = float(config.get("poll_interval_sec", POLL_INTERVAL_SEC))
+        if market_data_mode == "websocket" and ws_feed is not None:
+            sleep_sec = min(sleep_sec, max(websocket_loop_sleep_sec, 0.01))
+            ws_feed.wait_for_data(sleep_sec)
+        else:
+            time.sleep(sleep_sec)
     mfe_ticks = 0.0
     mae_ticks = 0.0
 
@@ -7173,93 +7246,225 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             force_close_open_position(client, config, storage, status, "STOP_AFTER_SESSION", now_, last_pred, latest_snapshot=last_snapshot, use_market_order=True)
             break
         try:
-            raw = None
+            loop_start_monotonic = time.monotonic()
             snap: Optional[TickSnapshot] = None
+            snapshots_to_process: list[TickSnapshot] = []
             final_snapshot_source = "rest"
+            raw_snapshot_persistence_enabled = True
             if market_data_mode == "websocket" and ws_feed is not None:
-                ws_snap = ws_feed.latest_snapshot()
-                usable_ws, ws_reason, ws_age_sec = websocket_snapshot_freshness(
-                    ws_snap,
-                    ws_feed.available,
-                    now_,
-                    max_ws_snapshot_age_sec,
-                    last_processed_snapshot_ts,
-                )
-                ws_payload = {
-                    "snapshot_ts": ws_snap.ts.isoformat() if ws_snap is not None else None,
-                    "now_ts": now_.isoformat(),
-                    "age_sec": ws_age_sec,
-                    "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                    "fallback_to_rest": ws_fallback_to_rest,
-                    "reason": ws_reason,
-                }
-                if usable_ws:
-                    snap = ws_snap
-                    final_snapshot_source = "websocket"
-                    storage.log_structured("INFO", "WS_SNAPSHOT_USED", ws_payload)
+                drained_before_ts = last_processed_snapshot_ts
+                drained = ws_feed.drain_snapshots_after(last_processed_snapshot_ts)
+                if drained:
+                    final_snapshot_source = "websocket_queue"
+                    snapshots_to_process = drained
+                    raw_snapshot_persistence_enabled = persist_raw_ws_snapshots
+                    ws_metrics = ws_feed.metrics()
+                    last_processed_after_preview = drained[-1].ts if drained else last_processed_snapshot_ts
+                    storage.log_structured(
+                        "INFO",
+                        "WS_QUEUE_DRAINED",
+                        {
+                            "drained_count": len(drained),
+                            "queue_len_after": ws_metrics.get("queue_len"),
+                            "received_count_total": ws_metrics.get("received_count_total"),
+                            "drained_count_total": ws_metrics.get("drained_count_total"),
+                            "dropped_count_total": ws_metrics.get("dropped_count_total"),
+                            "first_snapshot_ts": drained[0].ts.isoformat(),
+                            "last_snapshot_ts": drained[-1].ts.isoformat(),
+                            "last_processed_snapshot_ts_before": drained_before_ts.isoformat() if drained_before_ts is not None else None,
+                            "last_processed_snapshot_ts_after": last_processed_after_preview.isoformat(),
+                            "oldest_snapshot_age_ms": max((now_ - drained[0].ts).total_seconds() * 1000.0, 0.0),
+                            "newest_snapshot_age_ms": max((now_ - drained[-1].ts).total_seconds() * 1000.0, 0.0),
+                        },
+                    )
+                    if int(ws_metrics.get("dropped_count_total") or 0) > 0:
+                        storage.log_structured(
+                            "WARN",
+                            "WS_QUEUE_OVERFLOW_WARN",
+                            {
+                                "queue_maxlen": ws_metrics.get("queue_maxlen"),
+                                "received_count_total": ws_metrics.get("received_count_total"),
+                                "dropped_count_total": ws_metrics.get("dropped_count_total"),
+                                "last_received_ts": ws_metrics.get("last_received_ts"),
+                            },
+                        )
                 else:
-                    if ws_reason == "WS_SNAPSHOT_DUPLICATE":
-                        storage.log_structured("INFO", "WS_SNAPSHOT_DUPLICATE_SKIPPED", ws_payload)
-                    elif ws_reason == "WS_SNAPSHOT_STALE":
-                        storage.log_structured("WARN", "WS_SNAPSHOT_STALE_FALLBACK_TO_REST", ws_payload)
+                    ws_snap = ws_feed.latest_snapshot()
+                    usable_ws, ws_reason, ws_age_sec = websocket_snapshot_freshness(
+                        ws_snap,
+                        ws_feed.available,
+                        now_,
+                        max_ws_snapshot_age_sec,
+                        last_processed_snapshot_ts,
+                    )
+                    ws_metrics = ws_feed.metrics()
+                    storage.log_structured(
+                        "INFO" if ws_reason == "WS_SNAPSHOT_DUPLICATE" else "WARN",
+                        "WS_QUEUE_EMPTY",
+                        {
+                            "now_ts": now_.isoformat(),
+                            "available": ws_feed.available,
+                            "fallback_to_rest": ws_fallback_to_rest,
+                            "last_error": ws_feed.last_error,
+                            "last_received_ts": ws_metrics.get("last_received_ts"),
+                            "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                            "reason": ws_reason,
+                            "snapshot_ts": ws_snap.ts.isoformat() if ws_snap is not None else None,
+                            "age_sec": ws_age_sec,
+                        },
+                    )
+                    if ws_reason == "WS_SNAPSHOT_STALE":
+                        storage.log_structured(
+                            "WARN",
+                            "WS_SNAPSHOT_STALE_FALLBACK_TO_REST",
+                            {
+                                "snapshot_ts": ws_snap.ts.isoformat() if ws_snap is not None else None,
+                                "now_ts": now_.isoformat(),
+                                "age_sec": ws_age_sec,
+                                "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                                "fallback_to_rest": ws_fallback_to_rest,
+                                "reason": ws_reason,
+                            },
+                        )
+                    elif ws_reason == "WS_SNAPSHOT_DUPLICATE":
+                        storage.log_structured(
+                            "INFO",
+                            "WS_SNAPSHOT_DUPLICATE_SKIPPED",
+                            {
+                                "snapshot_ts": ws_snap.ts.isoformat() if ws_snap is not None else None,
+                                "now_ts": now_.isoformat(),
+                                "age_sec": ws_age_sec,
+                                "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                                "fallback_to_rest": ws_fallback_to_rest,
+                                "reason": ws_reason,
+                            },
+                        )
                     else:
-                        storage.log_structured("WARN", "WS_UNAVAILABLE_FALLBACK_TO_REST", ws_payload)
+                        storage.log_structured(
+                            "WARN",
+                            "WS_UNAVAILABLE_FALLBACK_TO_REST",
+                            {
+                                "snapshot_ts": ws_snap.ts.isoformat() if ws_snap is not None else None,
+                                "now_ts": now_.isoformat(),
+                                "age_sec": ws_age_sec,
+                                "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                                "fallback_to_rest": ws_fallback_to_rest,
+                                "reason": ws_reason,
+                            },
+                        )
                     if not ws_fallback_to_rest:
-                        time.sleep(config["poll_interval_sec"])
-                        continue
-            if snap is None:
+                        snapshots_to_process = []
+                    else:
+                        raw = client.get_board(config["symbol"], config["exchange"])
+                        rest_snap = extract_snapshot(raw)
+                        snapshots_to_process = [rest_snap]
+                        final_snapshot_source = "rest"
+                        raw_snapshot_persistence_enabled = True
+                        storage.log_structured(
+                            "INFO",
+                            "REST_SNAPSHOT_USED",
+                            {
+                                "snapshot_ts": rest_snap.ts.isoformat(),
+                                "now_ts": now_.isoformat(),
+                                "age_sec": (now_ - rest_snap.ts).total_seconds(),
+                                "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
+                                "fallback_to_rest": True,
+                                "reason": "WS_QUEUE_EMPTY_FALLBACK",
+                            },
+                        )
+            if market_data_mode != "websocket" or ws_feed is None:
                 raw = client.get_board(config["symbol"], config["exchange"])
-                snap = extract_snapshot(raw)
+                rest_snap = extract_snapshot(raw)
+                snapshots_to_process = [rest_snap]
                 final_snapshot_source = "rest"
+                raw_snapshot_persistence_enabled = True
                 storage.log_structured(
                     "INFO",
                     "REST_SNAPSHOT_USED",
                     {
-                        "snapshot_ts": snap.ts.isoformat(),
+                        "snapshot_ts": rest_snap.ts.isoformat(),
                         "now_ts": now_.isoformat(),
-                        "age_sec": (now_ - snap.ts).total_seconds(),
+                        "age_sec": (now_ - rest_snap.ts).total_seconds(),
                         "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                        "fallback_to_rest": market_data_mode == "websocket",
-                        "reason": "REST_MODE" if market_data_mode != "websocket" else "WS_FALLBACK",
+                        "fallback_to_rest": False,
+                        "reason": "REST_MODE",
                     },
                 )
-            snapshot_accepted = True
-            if last_processed_snapshot_ts is not None and snap.ts <= last_processed_snapshot_ts:
-                snapshot_accepted = False
-                storage.log_structured(
-                    "WARN",
-                    "FINAL_SNAPSHOT_DUPLICATE_OR_OLD_SKIPPED",
-                    {
-                        "source": final_snapshot_source,
-                        "snapshot_ts": snap.ts.isoformat(),
-                        "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat(),
-                        "now_ts": now_.isoformat(),
-                        "reason": "FINAL_SNAPSHOT_TS_NOT_NEWER",
-                        "snapshot_accepted": False,
-                        "clock_driven_tasks_still_executed": True,
-                    },
-                )
-            else:
+
+            snapshot_accepted = False
+            bar1_queue_finalized: Optional[Bar] = None
+            bar3_queue_finalized: Optional[Bar] = None
+            accepted_count = 0
+            for snap_candidate in snapshots_to_process:
+                if last_processed_snapshot_ts is not None and snap_candidate.ts <= last_processed_snapshot_ts:
+                    storage.log_structured(
+                        "WARN",
+                        "FINAL_SNAPSHOT_DUPLICATE_OR_OLD_SKIPPED",
+                        {
+                            "source": final_snapshot_source,
+                            "snapshot_ts": snap_candidate.ts.isoformat(),
+                            "last_processed_snapshot_ts": last_processed_snapshot_ts.isoformat(),
+                            "now_ts": now_.isoformat(),
+                            "reason": "FINAL_SNAPSHOT_TS_NOT_NEWER",
+                            "snapshot_accepted": False,
+                            "clock_driven_tasks_still_executed": True,
+                        },
+                    )
+                    continue
                 storage.log_structured(
                     "INFO",
                     "FINAL_SNAPSHOT_ACCEPTED",
                     {
                         "source": final_snapshot_source,
-                        "snapshot_ts": snap.ts.isoformat(),
+                        "snapshot_ts": snap_candidate.ts.isoformat(),
                         "last_processed_snapshot_ts_before": last_processed_snapshot_ts.isoformat() if last_processed_snapshot_ts is not None else None,
-                        "last_processed_snapshot_ts_after": snap.ts.isoformat(),
+                        "last_processed_snapshot_ts_after": snap_candidate.ts.isoformat(),
                         "snapshot_accepted": True,
-                        "price": snap.price,
-                        "sell1_price": snap.sell1_price,
-                        "buy1_price": snap.buy1_price,
+                        "price": snap_candidate.price,
+                        "sell1_price": snap_candidate.sell1_price,
+                        "buy1_price": snap_candidate.buy1_price,
                     },
                 )
-                last_processed_snapshot_ts = snap.ts
-                last_snapshot = snap
-                tick_buf.append(snap)
-                spread_ticks = calc_spread_ticks(snap)
-                storage.insert_snapshot(snap, spread_ticks)
+                snapshot_accepted = True
+                accepted_count += 1
+                last_processed_snapshot_ts = snap_candidate.ts
+                last_snapshot = snap_candidate
+                snap = snap_candidate
+                tick_buf.append(snap_candidate)
+                spread_ticks = calc_spread_ticks(snap_candidate)
+                should_persist_raw = raw_snapshot_persistence_enabled
+                if final_snapshot_source == "websocket_queue" and persist_raw_ws_snapshot_every_n > 0:
+                    should_persist_raw = accepted_count % persist_raw_ws_snapshot_every_n == 0
+                if should_persist_raw:
+                    storage.insert_snapshot(snap_candidate, spread_ticks)
                 status.count += 1
+                updated_1m = rb1.update(snap_candidate, bar_finalize_delay_ms)
+                if updated_1m is not None:
+                    bar1_queue_finalized = updated_1m
+                    storage.insert_bar("bars_1m", updated_1m)
+                    if final_snapshot_source == "websocket_queue":
+                        storage.log_structured(
+                            "INFO",
+                            "WS_BAR_FINALIZED_FROM_QUEUE",
+                            {
+                                "bar_ts": updated_1m.ts.isoformat(),
+                                "finalize_ts": now_jst().isoformat(),
+                                "source": final_snapshot_source,
+                                "open": updated_1m.open,
+                                "high": updated_1m.high,
+                                "low": updated_1m.low,
+                                "close": updated_1m.close,
+                                "volume": updated_1m.volume,
+                                "ema13": updated_1m.ema13,
+                                "rsi9": rsi9_wilder([b.close for b in rb1.history], RSI9_PERIOD),
+                                "snapshots_consumed_for_bar": len(rb1.history),
+                                "bar_finalize_delay_ms": bar_finalize_delay_ms,
+                            },
+                        )
+                updated_3m = rb3.update(snap_candidate, bar_finalize_delay_ms)
+                if updated_3m is not None:
+                    bar3_queue_finalized = updated_3m
+                    storage.insert_bar("bars_3m", updated_3m)
 
             bar1_time_finalized = rb1.force_finalize_completed_bucket(now_, bar_finalize_delay_ms)
             if bar1_time_finalized:
@@ -7311,23 +7516,21 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                         latest_snapshot=last_snapshot,
                         use_market_order=True,
                     )
-                time.sleep(config["poll_interval_sec"])
+                sleep_or_wait_for_market_data()
                 continue
 
             manual_position_clear_resume_check(client, config, storage, status, now_)
             recovery_flat_resume_check(client, config, storage, status, now_)
 
-            bar1_updated = rb1.update(snap, bar_finalize_delay_ms) if snapshot_accepted else None
-            bar1_new = bar1_time_finalized or bar1_updated
-            if bar1_new:
-                storage.insert_bar("bars_1m", bar1_new)
+            bar1_new = bar1_time_finalized or bar1_queue_finalized
+            if bar1_time_finalized:
+                storage.insert_bar("bars_1m", bar1_time_finalized)
             current_bar_bucket_1m = rb1.current_bucket
             current_bar_open_1m = rb1.rows[0].price if rb1.rows and rb1.rows[0].price is not None else None
             confirmed_bar1 = rb1.latest()
-            bar3_updated = rb3.update(snap, bar_finalize_delay_ms) if snapshot_accepted else None
-            bar3_new = bar3_time_finalized or bar3_updated
-            if bar3_new:
-                storage.insert_bar("bars_3m", bar3_new)
+            bar3_new = bar3_time_finalized or bar3_queue_finalized
+            if bar3_time_finalized:
+                storage.insert_bar("bars_3m", bar3_time_finalized)
 
             midday_cancel_start = str(config.get("midday_order_cancel_start", MIDDAY_ORDER_CANCEL_START))
             midday_cancel_end = str(config.get("midday_order_cancel_end", MIDDAY_ORDER_CANCEL_END))
@@ -7351,7 +7554,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
 
             set_vwap_mode(adaptive.vwap_mode)
             if not snapshot_accepted and bar1_new is None:
-                time.sleep(config["poll_interval_sec"])
+                sleep_or_wait_for_market_data()
                 continue
             decision_snapshot: Optional[TickSnapshot] = snap if snapshot_accepted else None
             if decision_snapshot is None and bar1_new is not None:
@@ -8417,7 +8620,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                     seconds=max(float(config.get("console_status_interval_sec", CONSOLE_STATUS_INTERVAL_SEC)), 1.0)
                 )
 
-            time.sleep(config["poll_interval_sec"])
+            storage.log_structured(
+                "INFO",
+                "WS_LOW_LATENCY_LOOP_METRICS",
+                {
+                    "loop_ts": now_jst().isoformat(),
+                    "loop_sleep_sec": min(float(config.get("poll_interval_sec", POLL_INTERVAL_SEC)), max(websocket_loop_sleep_sec, 0.01)) if market_data_mode == "websocket" else float(config.get("poll_interval_sec", POLL_INTERVAL_SEC)),
+                    "drained_count": accepted_count if final_snapshot_source == "websocket_queue" else 0,
+                    "drain_to_bar_ms": (time.monotonic() - loop_start_monotonic) * 1000.0,
+                    "bar_to_signal_ms": None,
+                    "signal_to_order_send_ms": None,
+                    "final_snapshot_source": final_snapshot_source,
+                },
+            )
+            sleep_or_wait_for_market_data()
         except KeyboardInterrupt:
             storage.log("INFO", "STOP", "keyboard interrupt")
             force_close_open_position(client, config, storage, status, "KEYBOARD_INTERRUPT", now_jst(), last_pred, latest_snapshot=last_snapshot, use_market_order=True)
