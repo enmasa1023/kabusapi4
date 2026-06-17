@@ -101,6 +101,8 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert runtime["market_data_source"]["websocket_loop_sleep_sec"] == 0.1
     assert runtime["market_data_source"]["persist_raw_ws_snapshots"] is False
     assert runtime["market_data_source"]["persist_raw_ws_snapshot_every_n"] == 0
+    assert runtime["market_data_source"]["debug_ws_snapshot_events"] is False
+    assert runtime["market_data_source"]["log_final_snapshot_events"] is False
     assert runtime["entry_reference_close_guard"]["enabled"] is True
     assert runtime["entry_reference_close_guard"]["max_abs_deviation_ticks"] == 4
     assert runtime["entry_execution"]["limit_mode"] == "marketable_best"
@@ -132,6 +134,8 @@ def test_runtime_config_preserves_enabled_nested_settings():
     assert payload["market_data_source_websocket_loop_sleep_sec"] == 0.1
     assert payload["market_data_source_persist_raw_ws_snapshots"] is False
     assert payload["market_data_source_persist_raw_ws_snapshot_every_n"] == 0
+    assert payload["market_data_source_debug_ws_snapshot_events"] is False
+    assert payload["market_data_source_log_final_snapshot_events"] is False
     assert payload["entry_reference_close_guard_enabled"] is True
     assert payload["entry_reference_close_guard_max_abs_deviation_ticks"] == 4
     assert payload["feature_entries_enabled"] is False
@@ -437,6 +441,34 @@ def test_websocket_market_data_feed_drains_queue_in_timestamp_order():
     assert [snap.ts for snap in drained_after] == [base_ts + timedelta(seconds=2)]
 
 
+def test_websocket_market_data_feed_drains_same_timestamp_by_ws_seq():
+    base_ts = datetime(2026, 6, 12, 9, 0, 1, tzinfo=JST)
+    feed = WebSocketMarketDataFeed("http://localhost:18080/kabusapi", queue_maxlen=10)
+    first = TickSnapshot(base_ts, 67000, 1000, 66990, 67010, 10, 66990, 10, ws_seq=1)
+    second = TickSnapshot(base_ts, 67010, 1001, 67000, 67020, 10, 67000, 10, ws_seq=2)
+    with feed._lock:
+        feed._queue.append(first)
+        feed._queue.append(second)
+        feed._received_count = 2
+        feed._received_seq = 2
+        feed._latest = second
+
+    drained = feed.drain_snapshots_after(None, last_processed_ws_seq=None)
+    assert [snap.ws_seq for snap in drained] == [1, 2]
+    assert [snap.price for snap in drained] == [67000, 67010]
+    rb = RollingBars(1)
+    for snap in drained:
+        rb.update(snap)
+    assert len(rb.rows) == 2
+    assert [row.price for row in rb.rows] == [67000, 67010]
+
+    with feed._lock:
+        feed._queue.append(first)
+        feed._queue.append(second)
+    drained_after_first = feed.drain_snapshots_after(None, last_processed_ws_seq=1)
+    assert [snap.ws_seq for snap in drained_after_first] == [2]
+
+
 def test_rolling_bars_time_trigger_finalizes_after_delay():
     rb = RollingBars(1)
     tick_ts = datetime(2026, 6, 12, 9, 0, 10, tzinfo=JST)
@@ -467,6 +499,7 @@ def test_rolling_bars_ohlc_from_multiple_snapshots():
     assert finalized.high == 67050
     assert finalized.low == 66980
     assert finalized.close == 66980
+    assert finalized.snapshots_consumed == 3
     assert rb.history[-1] is finalized
 
 
