@@ -7,8 +7,8 @@
   "order_exchange": 9,
   "exit_order_exchange": 1,
   "margin_entry_exchange": 9,
-  "order_qty": 1,
-  "entry_min_fill_qty": 1,
+  "order_qty": 2,
+  "entry_min_fill_qty": 2,
   "account_type": 4,
   "margin_trade_type": 3,
   "margin_trade_type_long": 3,
@@ -80,10 +80,96 @@
     "log_execution_detail": true
   },
   "scalping": {
-    "enabled": true
+    "enabled": false
   },
   "take_profit_execution": {
     "enabled": true,
     "fallback_market_after_signal_sec": 180.0
-  }
+  },
+  "market_data_source": {
+    "mode": "websocket",
+    "fallback_to_rest": true,
+    "bar_finalize_delay_ms": 300,
+    "rest_polling_when_ws_unavailable": true,
+    "max_ws_snapshot_age_sec": 3.0,
+    "rest_fallback_min_interval_sec": 2.0,
+    "ws_queue_maxlen": 5000,
+    "websocket_loop_sleep_sec": 0.1,
+    "persist_raw_ws_snapshots": false,
+    "persist_raw_ws_snapshot_every_n": 0,
+    "debug_ws_snapshot_events": false,
+    "log_final_snapshot_events": false
+  },
+  "force_close_after": "15:20:00",
+  "new_entry_cutoff_time": "15:10:00",
+  "strategy_mode": "long_rsi50_trend_hold_only",
+  "long_rsi50_trend_hold": {
+    "enabled": true,
+    "entry_rsi9_min": 50,
+    "exit_rsi9_max": 49,
+    "hard_stop_ticks": 20,
+    "allow_short": false,
+    "allow_add_position": false,
+    "use_take_profit": false,
+    "use_ma5_trailing": false,
+    "use_ema13_trend_filter": true,
+    "ema13_period": 13,
+    "ema13_lookback_bars": 4,
+    "ema13_min_rise_ticks": 3
+  },
+  "entry_reference_close_guard": {
+    "enabled": true,
+    "max_abs_deviation_ticks": 4
+  },
+  "rsi70_drop_long_watch": {
+    "enabled": false,
+    "watch_minutes": 10,
+    "trigger_on_rsi_turn": true,
+    "trigger_on_ma5_recover": true,
+    "allow_same_bar_trigger": false
+  },
+  "feature_entries": {
+    "enabled": false,
+    "long_vwap_volume_momentum": false,
+    "short_vwap_extended_fail": false,
+    "long_rsi_pullback_scalp": false,
+    "short_extended_ma5_fail_scalp": false
+  },
+  "big_trend_start_score": {
+    "enabled": false,
+    "long_threshold": 8,
+    "short_threshold": 9
+  },
+  "hold_score_extension": {
+    "enabled": false,
+    "long_only": true,
+    "score_threshold": 8,
+    "release_threshold": 6,
+    "max_ma5_exit_skip_count": 1
+  },
+  "analysis_signals": {
+    "log_feature_candidates_when_disabled": true,
+    "log_big_trend_score_when_disabled": false,
+    "log_hold_score_when_disabled": true
+  },
+  "rsi17_drop_bullish_pullback_long_watch": {
+    "enabled": false,
+    "watch_minutes": 10,
+    "trigger_on_rsi_turn": true,
+    "trigger_on_ma5_recover": true,
+    "allow_same_bar_trigger": false
+  },
+  "scalp_feature_entries": {
+    "long_rsi_pullback_scalp": {
+      "enabled": true,
+      "take_ticks": 10,
+      "stop_ticks": 15
+    },
+    "short_extended_ma5_fail_scalp": {
+      "enabled": true,
+      "take_ticks": 15,
+      "stop_ticks": 20
+    }
+  },
+  "hard_stop_ticks": 20
 }
