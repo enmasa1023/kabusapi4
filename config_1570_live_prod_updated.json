@@ -102,7 +102,7 @@
   },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "15:10:00",
-  "strategy_mode": "long_rsi50_trend_hold_only",
+  "strategy_mode": "long_rsi50_and_rsi35",
   "long_rsi50_trend_hold": {
     "enabled": true,
     "entry_rsi9_min": 50,
@@ -115,7 +115,23 @@
     "use_ema13_trend_filter": true,
     "ema13_period": 13,
     "ema13_lookback_bars": 4,
-    "ema13_min_rise_ticks": 3
+    "ema13_min_rise_ticks": 3,
+    "use_rsi50_first_cross_filter": true,
+    "allow_morning_initial_rsi50_entry": true,
+    "morning_initial_rsi50_entry_cutoff_time": "09:05:00"
+  },
+  "long_rsi35_rebound": {
+    "enabled": true,
+    "entry_watch_rsi9_max": 35,
+    "entry_trigger": "rsi9_turn_up",
+    "exit_watch_rsi9_min": 50,
+    "exit_trigger": "rsi9_turn_down_after_50",
+    "hard_stop_ticks": 20,
+    "allow_add_position": false,
+    "add_position_rsi9_max": 19,
+    "entry_reference_close_guard_enabled": true,
+    "entry_reference_close_guard_max_abs_deviation_ticks": 4,
+    "exit_reference_close_guard_enabled": false
   },
   "entry_reference_close_guard": {
     "enabled": true,
