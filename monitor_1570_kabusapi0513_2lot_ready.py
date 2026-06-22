@@ -714,6 +714,8 @@ class TickSnapshot:
     sell3_qty: Optional[float] = None
     buy3_price: Optional[float] = None
     buy3_qty: Optional[float] = None
+    buy_depth_10: Optional[float] = None
+    sell_depth_10: Optional[float] = None
     raw_json: Optional[str] = None
     ws_seq: Optional[int] = None
 
@@ -1191,11 +1193,13 @@ class Storage:
               volume_price_efficiency_1m REAL, volume_price_efficiency_3m REAL, volume_price_efficiency_5m REAL,
               rsi9_slope_1m REAL, rsi9_slope_3m REAL, ma5_slope_3m REAL, ma25_slope_5m REAL, ema13_slope_4m REAL,
               close_above_ma5 INTEGER, close_above_ma25 INTEGER, close_above_ma75 INTEGER, close_above_vwap INTEGER,
-              spread_ticks REAL, obi_l1 REAL, obi_l3 REAL, obi_l10 REAL,
+              spread_ticks REAL, buy_depth_10 REAL, sell_depth_10 REAL,
+              obi_l1 REAL, obi_l3 REAL, obi_l10 REAL,
               obi_l3_delta_3m REAL, obi_l10_delta_3m REAL, microprice REAL, micro_gap_ticks REAL,
               raw_context_json TEXT
             )""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_structure_features_1m_ts ON market_structure_features_1m(ts)")
+            self._ensure_market_structure_feature_columns(cur)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS market_structure_signal_candidates(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1215,6 +1219,13 @@ class Storage:
             self._ensure_execution_fill_price_column(cur)
             self._ensure_paper_trade_exit_detail_columns(cur)
             con.commit()
+
+    def _ensure_market_structure_feature_columns(self, cur: sqlite3.Cursor) -> None:
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(market_structure_features_1m)").fetchall()]
+        wanted = {"buy_depth_10": "REAL", "sell_depth_10": "REAL"}
+        for name, typ in wanted.items():
+            if name not in cols:
+                cur.execute(f"ALTER TABLE market_structure_features_1m ADD COLUMN {name} {typ}")
 
     def _ensure_bar_ma13_column(self, cur: sqlite3.Cursor, table: str) -> None:
         cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -1761,6 +1772,9 @@ def extract_snapshot(raw: dict[str, Any]) -> TickSnapshot:
     except Exception:
         ts = now_jst()
 
+    buy_depth_10 = sum((d(g(f"Buy{i}.Qty")) or 0.0) for i in range(1, 11))
+    sell_depth_10 = sum((d(g(f"Sell{i}.Qty")) or 0.0) for i in range(1, 11))
+
     return TickSnapshot(
         ts=ts,
         price=d(raw.get("CurrentPrice")),
@@ -1778,6 +1792,8 @@ def extract_snapshot(raw: dict[str, Any]) -> TickSnapshot:
         sell3_qty=d(g("Sell3.Qty")),
         buy3_price=d(g("Buy3.Price")),
         buy3_qty=d(g("Buy3.Qty")),
+        buy_depth_10=buy_depth_10 if buy_depth_10 > 0 else None,
+        sell_depth_10=sell_depth_10 if sell_depth_10 > 0 else None,
         raw_json=json.dumps(raw, ensure_ascii=False),
     )
 
@@ -2014,6 +2030,8 @@ def _calc_board_context(snapshot: Optional[TickSnapshot], tick_ref: float, histo
     if snapshot is None:
         return {
             "spread_ticks": None,
+            "buy_depth_10": None,
+            "sell_depth_10": None,
             "obi_l1": None,
             "obi_l3": None,
             "obi_l10": None,
@@ -2024,12 +2042,14 @@ def _calc_board_context(snapshot: Optional[TickSnapshot], tick_ref: float, histo
         }
     spread_ticks = calc_spread_ticks(snapshot)
     obi_l1, obi_l3 = calc_obi(snapshot)
-    # kabu board levels currently retained in TickSnapshot are L1-L3, so L10 is
-    # stored as NULL rather than inventing depth that was not collected.
-    obi_l10 = None
+    # TickSnapshot keeps only aggregate L10 depth for DB-friendly feature storage;
+    # raw 10-level price/qty rows are not expanded into market_snapshots columns.
+    buy_depth_10 = snapshot.buy_depth_10
+    sell_depth_10 = snapshot.sell_depth_10
+    obi_l10 = ((buy_depth_10 - sell_depth_10) / (buy_depth_10 + sell_depth_10)) if buy_depth_10 is not None and sell_depth_10 is not None and (buy_depth_10 + sell_depth_10) > 0 else None
     prev3 = history_features[-3] if len(history_features) >= 3 else None
     obi_l3_delta_3m = obi_l3 - prev3.get("obi_l3") if prev3 and prev3.get("obi_l3") is not None else None
-    obi_l10_delta_3m = None
+    obi_l10_delta_3m = obi_l10 - prev3.get("obi_l10") if obi_l10 is not None and prev3 and prev3.get("obi_l10") is not None else None
     bid = snapshot.buy1_price
     ask = snapshot.sell1_price
     bid_qty = snapshot.buy1_qty or 0.0
@@ -2042,6 +2062,8 @@ def _calc_board_context(snapshot: Optional[TickSnapshot], tick_ref: float, histo
         micro_gap_ticks = (microprice - mid) / tick_size_for_1570(tick_ref)
     return {
         "spread_ticks": spread_ticks,
+        "buy_depth_10": buy_depth_10,
+        "sell_depth_10": sell_depth_10,
         "obi_l1": obi_l1,
         "obi_l3": obi_l3,
         "obi_l10": obi_l10,
