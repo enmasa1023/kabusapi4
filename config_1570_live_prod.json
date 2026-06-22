@@ -1,7 +1,7 @@
 {
   "api_password": "enmasa1023",
   "order_password": "47095095",
-  "live_mode": true,
+  "live_mode": false,
   "symbol": "1570",
   "exchange": 1,
   "order_exchange": 9,
@@ -68,7 +68,7 @@
     }
   },
   "entry_execution": {
-    "enabled": true,
+    "enabled": false,
     "mode": "limit_with_timeout",
     "limit_mode": "marketable_best",
     "timeout_sec": 2.0,
@@ -95,16 +95,16 @@
     "rest_fallback_min_interval_sec": 2.0,
     "ws_queue_maxlen": 5000,
     "websocket_loop_sleep_sec": 0.1,
-    "persist_raw_ws_snapshots": false,
-    "persist_raw_ws_snapshot_every_n": 0,
+    "persist_raw_ws_snapshots": true,
+    "persist_raw_ws_snapshot_every_n": 1,
     "debug_ws_snapshot_events": false,
     "log_final_snapshot_events": false
   },
   "force_close_after": "15:20:00",
   "new_entry_cutoff_time": "15:10:00",
-  "strategy_mode": "long_rsi50_trend_hold_only",
+  "strategy_mode": "data_collection_only",
   "long_rsi50_trend_hold": {
-    "enabled": true,
+    "enabled": false,
     "entry_rsi9_min": 50,
     "exit_rsi9_max": 49,
     "hard_stop_ticks": 20,
@@ -171,5 +171,41 @@
       "stop_ticks": 20
     }
   },
-  "hard_stop_ticks": 20
+  "hard_stop_ticks": 20,
+  "data_collection_only": {
+    "enabled": true,
+    "disable_all_orders": true,
+    "disable_paper_trades": true,
+    "log_signal_candidates": true,
+    "log_order_block_events": true,
+    "allow_market_data_collection": true,
+    "allow_position_polling": true,
+    "allow_order_polling": false
+  },
+  "market_structure_features": {
+    "enabled": true,
+    "save_every_1m_bar": true,
+    "save_signal_candidates": true,
+    "lookback_minutes": [
+      3,
+      5,
+      10,
+      20,
+      30,
+      60
+    ],
+    "opening_range_minutes": [
+      5,
+      10
+    ],
+    "afternoon_open_range_minutes": [
+      5,
+      10
+    ],
+    "volume_median_lookback_minutes": 20,
+    "volume_z_lookback_minutes": 20
+  },
+  "long_rsi35_rebound": {
+    "enabled": false
+  }
 }

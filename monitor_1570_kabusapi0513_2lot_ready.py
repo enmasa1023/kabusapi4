@@ -190,6 +190,26 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "debug_ws_snapshot_events": False,
         "log_final_snapshot_events": False,
     },
+    "data_collection_only": {
+        "enabled": False,
+        "disable_all_orders": True,
+        "disable_paper_trades": True,
+        "log_signal_candidates": True,
+        "log_order_block_events": True,
+        "allow_market_data_collection": True,
+        "allow_position_polling": True,
+        "allow_order_polling": False,
+    },
+    "market_structure_features": {
+        "enabled": False,
+        "save_every_1m_bar": True,
+        "save_signal_candidates": True,
+        "lookback_minutes": [3, 5, 10, 20, 30, 60],
+        "opening_range_minutes": [5, 10],
+        "afternoon_open_range_minutes": [5, 10],
+        "volume_median_lookback_minutes": 20,
+        "volume_z_lookback_minutes": 20,
+    },
     "rsi70_drop_long_watch": {
         "enabled": True,
         "watch_minutes": 10,
@@ -224,6 +244,17 @@ NESTED_CONFIG_DEFAULTS: dict[str, dict[str, Any]] = {
         "ema13_period": 13,
         "ema13_lookback_bars": 4,
         "ema13_min_rise_ticks": 3,
+    },
+    "long_rsi35_rebound": {
+        "enabled": False,
+        "entry_watch_rsi9_max": 35,
+        "exit_watch_rsi9_min": 50,
+        "hard_stop_ticks": 20,
+        "allow_add_position": False,
+        "add_position_rsi9_max": 19,
+        "entry_reference_close_guard_enabled": True,
+        "entry_reference_close_guard_max_abs_deviation_ticks": 4,
+        "exit_reference_close_guard_enabled": False,
     },
     "entry_reference_close_guard": {
         "enabled": True,
@@ -312,6 +343,8 @@ def build_runtime_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[
     for key, defaults in NESTED_CONFIG_DEFAULTS.items():
         raw_value = cfg.get(key, {})
         runtime_config[key] = deep_merge_dict(defaults, raw_value if isinstance(raw_value, dict) else {})
+    if is_data_collection_only(runtime_config):
+        runtime_config["live_mode"] = False
     return runtime_config
 
 
@@ -326,6 +359,9 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
     rsi50_cfg = long_rsi50_trend_hold_config(config)
     market_data_cfg = config.get("market_data_source", {}) if isinstance(config.get("market_data_source"), dict) else {}
     reference_guard_cfg = config.get("entry_reference_close_guard", {}) if isinstance(config.get("entry_reference_close_guard"), dict) else {}
+    data_collection_cfg = data_collection_only_config(config)
+    market_structure_cfg = market_structure_features_config(config)
+    entry_execution_cfg = entry_execution_config(config)
     return {
         "config_path": config.get("config_path"),
         "config_file_loaded": bool(config.get("config_file_loaded")),
@@ -344,6 +380,13 @@ def startup_config_effective_payload(config: dict[str, Any]) -> dict[str, Any]:
         "afternoon_trade_start": TRADE_WINDOWS[1][0] if len(TRADE_WINDOWS) > 1 else "12:30:00",
         "hard_stop_ticks": int(config.get("hard_stop_ticks", HARD_STOP_TICKS)),
         "strategy_mode": config.get("strategy_mode", "legacy"),
+        "data_collection_only_enabled": bool(data_collection_cfg.get("enabled", False)),
+        "data_collection_only_disable_all_orders": bool(data_collection_cfg.get("disable_all_orders", True)),
+        "data_collection_only_disable_paper_trades": bool(data_collection_cfg.get("disable_paper_trades", True)),
+        "entry_execution_enabled": bool(entry_execution_cfg.get("enabled", False)),
+        "market_structure_features_enabled": bool(market_structure_cfg.get("enabled", False)),
+        "market_structure_features_save_every_1m_bar": bool(market_structure_cfg.get("save_every_1m_bar", True)),
+        "market_structure_features_save_signal_candidates": bool(market_structure_cfg.get("save_signal_candidates", True)),
         "long_rsi50_trend_hold_enabled": bool(rsi50_cfg.get("enabled", False)),
         "long_rsi50_trend_hold_entry_rsi9_min": float(rsi50_cfg.get("entry_rsi9_min", 50)),
         "long_rsi50_trend_hold_exit_rsi9_max": float(rsi50_cfg.get("exit_rsi9_max", 49)),
@@ -1107,6 +1150,66 @@ class Storage:
               p_up_1m REAL, p_down_1m REAL, p_up_3m REAL, p_down_3m REAL,
               raw_features_json TEXT
             )""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_structure_features_1m(
+              ts TEXT PRIMARY KEY,
+              symbol TEXT,
+              session TEXT,
+              open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
+              ma5 REAL, ma13 REAL, ema13 REAL, ma25 REAL, ma75 REAL, rsi9 REAL,
+              high_prev_3m REAL, low_prev_3m REAL, high_prev_5m REAL, low_prev_5m REAL,
+              high_prev_10m REAL, low_prev_10m REAL, high_prev_20m REAL, low_prev_20m REAL,
+              high_prev_30m REAL, low_prev_30m REAL, high_prev_60m REAL, low_prev_60m REAL,
+              break_high_3m INTEGER, break_low_3m INTEGER, break_high_5m INTEGER, break_low_5m INTEGER,
+              break_high_10m INTEGER, break_low_10m INTEGER, break_high_20m INTEGER, break_low_20m INTEGER,
+              break_high_30m INTEGER, break_low_30m INTEGER, break_high_60m INTEGER, break_low_60m INTEGER,
+              failed_break_high_5m INTEGER, failed_break_low_5m INTEGER,
+              failed_break_high_20m INTEGER, failed_break_low_20m INTEGER,
+              range_pos_3m REAL, range_pos_5m REAL, range_pos_10m REAL,
+              range_pos_20m REAL, range_pos_30m REAL, range_pos_60m REAL,
+              day_high_before REAL, day_low_before REAL, day_high_so_far REAL, day_low_so_far REAL,
+              day_range_pos REAL, break_day_high INTEGER, break_day_low INTEGER,
+              failed_break_day_high INTEGER, failed_break_day_low INTEGER,
+              distance_to_day_high_ticks REAL, distance_to_day_low_ticks REAL,
+              opening_high_5m REAL, opening_low_5m REAL, opening_high_10m REAL, opening_low_10m REAL,
+              opening_range_width_5m REAL, opening_range_width_10m REAL,
+              break_opening_high_5m INTEGER, break_opening_low_5m INTEGER,
+              break_opening_high_10m INTEGER, break_opening_low_10m INTEGER,
+              failed_break_opening_high_5m INTEGER, failed_break_opening_low_5m INTEGER,
+              failed_break_opening_high_10m INTEGER, failed_break_opening_low_10m INTEGER,
+              afternoon_open_high_5m REAL, afternoon_open_low_5m REAL,
+              afternoon_open_high_10m REAL, afternoon_open_low_10m REAL,
+              afternoon_open_range_width_5m REAL, afternoon_open_range_width_10m REAL,
+              break_afternoon_open_high_5m INTEGER, break_afternoon_open_low_5m INTEGER,
+              break_afternoon_open_high_10m INTEGER, break_afternoon_open_low_10m INTEGER,
+              failed_break_afternoon_open_high_5m INTEGER, failed_break_afternoon_open_low_5m INTEGER,
+              failed_break_afternoon_open_high_10m INTEGER, failed_break_afternoon_open_low_10m INTEGER,
+              volume_delta_1m REAL, volume_delta_3m REAL, volume_median_20m REAL,
+              volume_ratio_1m REAL, volume_ratio_3m REAL, volume_z_20m REAL,
+              price_change_1m REAL, price_change_3m REAL, price_change_5m REAL,
+              price_change_10m REAL, price_change_20m REAL, price_change_30m REAL, price_change_60m REAL,
+              volume_price_efficiency_1m REAL, volume_price_efficiency_3m REAL, volume_price_efficiency_5m REAL,
+              rsi9_slope_1m REAL, rsi9_slope_3m REAL, ma5_slope_3m REAL, ma25_slope_5m REAL, ema13_slope_4m REAL,
+              close_above_ma5 INTEGER, close_above_ma25 INTEGER, close_above_ma75 INTEGER, close_above_vwap INTEGER,
+              spread_ticks REAL, obi_l1 REAL, obi_l3 REAL, obi_l10 REAL,
+              obi_l3_delta_3m REAL, obi_l10_delta_3m REAL, microprice REAL, micro_gap_ticks REAL,
+              raw_context_json TEXT
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_market_structure_features_1m_ts ON market_structure_features_1m(ts)")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_structure_signal_candidates(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT,
+              symbol TEXT,
+              signal_name TEXT,
+              side TEXT,
+              action TEXT,
+              confidence REAL,
+              reason TEXT,
+              blocked_by_data_collection_only INTEGER,
+              feature_json TEXT
+            )""")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_market_structure_signal_candidates_ts_signal ON market_structure_signal_candidates(ts, signal_name)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_facts_order_id_ts ON execution_facts(order_id, ts)")
             self._ensure_prediction_rsi9_column(cur)
             self._ensure_execution_fill_price_column(cur)
@@ -1336,6 +1439,38 @@ class Storage:
                     decision_features_json(gf),
                 ),
             )
+            con.commit()
+
+    def save_market_structure_features_1m(self, row: dict[str, Any]) -> None:
+        if not row.get("ts"):
+            return
+        cols = list(row.keys())
+        placeholders = ",".join("?" for _ in cols)
+        sql = f"INSERT OR REPLACE INTO market_structure_features_1m({','.join(cols)}) VALUES ({placeholders})"
+        with self._connect() as con:
+            con.execute(sql, [row.get(c) for c in cols])
+            con.commit()
+
+    def save_market_structure_signal_candidates(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        cols = [
+            "ts",
+            "symbol",
+            "signal_name",
+            "side",
+            "action",
+            "confidence",
+            "reason",
+            "blocked_by_data_collection_only",
+            "feature_json",
+        ]
+        with self._connect() as con:
+            for row in rows:
+                con.execute(
+                    f"INSERT OR IGNORE INTO market_structure_signal_candidates({','.join(cols)}) VALUES (?,?,?,?,?,?,?,?,?)",
+                    [row.get(c) for c in cols],
+                )
             con.commit()
 
     def insert_execution_fill_price(self, event_type: str, order_id: str, side: str, strategy: str, signal_reason: str, fill_price: Optional[float]) -> None:
@@ -1827,6 +1962,287 @@ def calc_obi(s: TickSnapshot) -> tuple[float, float]:
     return obi_l1, obi_l3
 
 
+def _safe_div(num: Optional[float], den: Optional[float]) -> Optional[float]:
+    if num is None or den is None or den == 0:
+        return None
+    return num / den
+
+
+def _as_int_flag(value: Optional[bool]) -> Optional[int]:
+    return None if value is None else (1 if value else 0)
+
+
+def _median(values: list[float]) -> Optional[float]:
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _bars_for_same_day(history: list[Bar], current: Bar) -> list[Bar]:
+    return [b for b in history if b.ts.date() == current.ts.date()]
+
+
+def _prev_window(history: list[Bar], minutes: int) -> list[Bar]:
+    if len(history) <= 1:
+        return []
+    return history[max(0, len(history) - 1 - minutes) : len(history) - 1]
+
+
+def _range_position(close: float, high_value: Optional[float], low_value: Optional[float]) -> Optional[float]:
+    if high_value is None or low_value is None or high_value == low_value:
+        return None
+    return (close - low_value) / (high_value - low_value)
+
+
+def _fixed_opening_range(history: list[Bar], current: Bar, start_hhmm: str, minutes: int) -> tuple[Optional[float], Optional[float]]:
+    start_hour, start_min = [int(x) for x in start_hhmm.split(":")]
+    start_dt = current.ts.replace(hour=start_hour, minute=start_min, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(minutes=minutes)
+    if current.ts < end_dt:
+        return None, None
+    bars = [b for b in history if start_dt <= b.ts < end_dt]
+    if len(bars) < minutes:
+        return None, None
+    return max(b.high for b in bars), min(b.low for b in bars)
+
+
+def _calc_board_context(snapshot: Optional[TickSnapshot], tick_ref: float, history_features: list[dict[str, Any]]) -> dict[str, Any]:
+    if snapshot is None:
+        return {
+            "spread_ticks": None,
+            "obi_l1": None,
+            "obi_l3": None,
+            "obi_l10": None,
+            "obi_l3_delta_3m": None,
+            "obi_l10_delta_3m": None,
+            "microprice": None,
+            "micro_gap_ticks": None,
+        }
+    spread_ticks = calc_spread_ticks(snapshot)
+    obi_l1, obi_l3 = calc_obi(snapshot)
+    # kabu board levels currently retained in TickSnapshot are L1-L3, so L10 is
+    # stored as NULL rather than inventing depth that was not collected.
+    obi_l10 = None
+    prev3 = history_features[-3] if len(history_features) >= 3 else None
+    obi_l3_delta_3m = obi_l3 - prev3.get("obi_l3") if prev3 and prev3.get("obi_l3") is not None else None
+    obi_l10_delta_3m = None
+    bid = snapshot.buy1_price
+    ask = snapshot.sell1_price
+    bid_qty = snapshot.buy1_qty or 0.0
+    ask_qty = snapshot.sell1_qty or 0.0
+    microprice = None
+    micro_gap_ticks = None
+    if bid is not None and ask is not None and (bid_qty + ask_qty) > 0:
+        mid = (bid + ask) / 2.0
+        microprice = (ask * bid_qty + bid * ask_qty) / (bid_qty + ask_qty)
+        micro_gap_ticks = (microprice - mid) / tick_size_for_1570(tick_ref)
+    return {
+        "spread_ticks": spread_ticks,
+        "obi_l1": obi_l1,
+        "obi_l3": obi_l3,
+        "obi_l10": obi_l10,
+        "obi_l3_delta_3m": obi_l3_delta_3m,
+        "obi_l10_delta_3m": obi_l10_delta_3m,
+        "microprice": microprice,
+        "micro_gap_ticks": micro_gap_ticks,
+    }
+
+
+def build_market_structure_features_1m(
+    history: list[Bar],
+    config: dict[str, Any],
+    latest_snapshot: Optional[TickSnapshot],
+    recent_feature_rows: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not history:
+        return None
+    current = history[-1]
+    closes = [b.close for b in history]
+    rsi9 = rsi9_wilder(closes, RSI9_PERIOD)
+    cfg = market_structure_features_config(config)
+    lookbacks = [int(x) for x in cfg.get("lookback_minutes", [3, 5, 10, 20, 30, 60])]
+    row: dict[str, Any] = {
+        "ts": current.ts.isoformat(),
+        "symbol": str(config.get("symbol", SYMBOL_DEFAULT)),
+        "session": "AM" if current.ts.strftime("%H:%M:%S") < "11:30:00" else "PM",
+        "open": current.open,
+        "high": current.high,
+        "low": current.low,
+        "close": current.close,
+        "volume": current.volume,
+        "vwap": current.vwap,
+        "ma5": current.ma5,
+        "ma13": current.ma13,
+        "ema13": current.ema13,
+        "ma25": current.ma25,
+        "ma75": current.ma75,
+        "rsi9": rsi9,
+    }
+    raw_context: dict[str, Any] = {"range_pos_raw": {}, "signed_volume_price_efficiency": {}}
+    for minutes in lookbacks:
+        prev = _prev_window(history, minutes)
+        hi = max((b.high for b in prev), default=None)
+        lo = min((b.low for b in prev), default=None)
+        row[f"high_prev_{minutes}m"] = hi
+        row[f"low_prev_{minutes}m"] = lo
+        row[f"break_high_{minutes}m"] = _as_int_flag(current.close > hi) if hi is not None else None
+        row[f"break_low_{minutes}m"] = _as_int_flag(current.close < lo) if lo is not None else None
+        row[f"range_pos_{minutes}m"] = _range_position(current.close, hi, lo)
+        raw_context["range_pos_raw"][f"{minutes}m"] = row[f"range_pos_{minutes}m"]
+    for minutes in (5, 20):
+        hi = row.get(f"high_prev_{minutes}m")
+        lo = row.get(f"low_prev_{minutes}m")
+        row[f"failed_break_high_{minutes}m"] = _as_int_flag(current.high > hi and current.close <= hi) if hi is not None else None
+        row[f"failed_break_low_{minutes}m"] = _as_int_flag(current.low < lo and current.close >= lo) if lo is not None else None
+    day_prev = _bars_for_same_day(history[:-1], current)
+    day_high_before = max((b.high for b in day_prev), default=None)
+    day_low_before = min((b.low for b in day_prev), default=None)
+    day_with_current = _bars_for_same_day(history, current)
+    day_high_so_far = max((b.high for b in day_with_current), default=None)
+    day_low_so_far = min((b.low for b in day_with_current), default=None)
+    row.update({
+        "day_high_before": day_high_before,
+        "day_low_before": day_low_before,
+        "day_high_so_far": day_high_so_far,
+        "day_low_so_far": day_low_so_far,
+        "day_range_pos": _range_position(current.close, day_high_before, day_low_before),
+        "break_day_high": _as_int_flag(current.close > day_high_before) if day_high_before is not None else None,
+        "break_day_low": _as_int_flag(current.close < day_low_before) if day_low_before is not None else None,
+        "failed_break_day_high": _as_int_flag(current.high > day_high_before and current.close <= day_high_before) if day_high_before is not None else None,
+        "failed_break_day_low": _as_int_flag(current.low < day_low_before and current.close >= day_low_before) if day_low_before is not None else None,
+        "distance_to_day_high_ticks": price_to_ticks(day_high_before - current.close, current.close) if day_high_before is not None else None,
+        "distance_to_day_low_ticks": price_to_ticks(current.close - day_low_before, current.close) if day_low_before is not None else None,
+    })
+    for minutes in (5, 10):
+        hi, lo = _fixed_opening_range(history, current, "09:00", minutes)
+        row[f"opening_high_{minutes}m"] = hi
+        row[f"opening_low_{minutes}m"] = lo
+        row[f"opening_range_width_{minutes}m"] = hi - lo if hi is not None and lo is not None else None
+        row[f"break_opening_high_{minutes}m"] = _as_int_flag(current.close > hi) if hi is not None else None
+        row[f"break_opening_low_{minutes}m"] = _as_int_flag(current.close < lo) if lo is not None else None
+        row[f"failed_break_opening_high_{minutes}m"] = _as_int_flag(current.high > hi and current.close <= hi) if hi is not None else None
+        row[f"failed_break_opening_low_{minutes}m"] = _as_int_flag(current.low < lo and current.close >= lo) if lo is not None else None
+        ahi, alo = _fixed_opening_range(history, current, "12:30", minutes)
+        row[f"afternoon_open_high_{minutes}m"] = ahi
+        row[f"afternoon_open_low_{minutes}m"] = alo
+        row[f"afternoon_open_range_width_{minutes}m"] = ahi - alo if ahi is not None and alo is not None else None
+        row[f"break_afternoon_open_high_{minutes}m"] = _as_int_flag(current.close > ahi) if ahi is not None else None
+        row[f"break_afternoon_open_low_{minutes}m"] = _as_int_flag(current.close < alo) if alo is not None else None
+        row[f"failed_break_afternoon_open_high_{minutes}m"] = _as_int_flag(current.high > ahi and current.close <= ahi) if ahi is not None else None
+        row[f"failed_break_afternoon_open_low_{minutes}m"] = _as_int_flag(current.low < alo and current.close >= alo) if alo is not None else None
+    prev20_vols = [b.volume for b in _prev_window(history, int(cfg.get("volume_median_lookback_minutes", 20)))]
+    volume_median_20m = _median(prev20_vols)
+    volume_delta_3m = sum(b.volume for b in history[-3:])
+    volume_mean = sum(prev20_vols) / len(prev20_vols) if prev20_vols else None
+    volume_std = math.sqrt(sum((v - volume_mean) ** 2 for v in prev20_vols) / len(prev20_vols)) if volume_mean is not None and prev20_vols else None
+    row.update({
+        "volume_delta_1m": current.volume,
+        "volume_delta_3m": volume_delta_3m,
+        "volume_median_20m": volume_median_20m,
+        "volume_ratio_1m": _safe_div(current.volume, volume_median_20m),
+        "volume_ratio_3m": _safe_div(volume_delta_3m, volume_median_20m * 3 if volume_median_20m is not None else None),
+        "volume_z_20m": ((current.volume - volume_mean) / volume_std if volume_mean is not None and volume_std not in (None, 0) else None),
+    })
+    for minutes in lookbacks:
+        row[f"price_change_{minutes}m"] = current.close - history[-1 - minutes].close if len(history) > minutes else None
+    row["volume_price_efficiency_1m"] = abs(row["price_change_1m"]) / max(current.volume, 1.0) if row.get("price_change_1m") is not None else None
+    row["volume_price_efficiency_3m"] = abs(row["price_change_3m"]) / max(volume_delta_3m, 1.0) if row.get("price_change_3m") is not None else None
+    row["volume_price_efficiency_5m"] = abs(row["price_change_5m"]) / max(sum(b.volume for b in history[-5:]), 1.0) if row.get("price_change_5m") is not None else None
+    raw_context["signed_volume_price_efficiency"]["1m"] = (_safe_div(row.get("price_change_1m"), max(current.volume, 1.0)) if row.get("price_change_1m") is not None else None)
+    raw_context["signed_volume_price_efficiency"]["3m"] = (_safe_div(row.get("price_change_3m"), max(volume_delta_3m, 1.0)) if row.get("price_change_3m") is not None else None)
+    rsi_values = [rsi9_wilder([b.close for b in history[: i + 1]], RSI9_PERIOD) for i in range(len(history))]
+    row["rsi9_slope_1m"] = rsi9 - rsi_values[-2] if rsi9 is not None and len(rsi_values) >= 2 and rsi_values[-2] is not None else None
+    row["rsi9_slope_3m"] = rsi9 - rsi_values[-4] if rsi9 is not None and len(rsi_values) >= 4 and rsi_values[-4] is not None else None
+    row["ma5_slope_3m"] = current.ma5 - history[-4].ma5 if len(history) >= 4 and current.ma5 is not None and history[-4].ma5 is not None else None
+    row["ma25_slope_5m"] = current.ma25 - history[-6].ma25 if len(history) >= 6 and current.ma25 is not None and history[-6].ma25 is not None else None
+    row["ema13_slope_4m"] = current.ema13 - history[-5].ema13 if len(history) >= 5 and current.ema13 is not None and history[-5].ema13 is not None else None
+    row["close_above_ma5"] = _as_int_flag(current.close > current.ma5) if current.ma5 is not None else None
+    row["close_above_ma25"] = _as_int_flag(current.close > current.ma25) if current.ma25 is not None else None
+    row["close_above_ma75"] = _as_int_flag(current.close > current.ma75) if current.ma75 is not None else None
+    row["close_above_vwap"] = _as_int_flag(current.close > current.vwap) if current.vwap is not None else None
+    row.update(_calc_board_context(latest_snapshot, current.close, recent_feature_rows))
+    row["raw_context_json"] = json.dumps(raw_context, ensure_ascii=False, default=str)
+    return row
+
+
+def build_market_structure_signal_candidates(feature_row: dict[str, Any], history: list[Bar], config: dict[str, Any]) -> list[dict[str, Any]]:
+    if not bool(market_structure_features_config(config).get("save_signal_candidates", True)):
+        return []
+    ts = str(feature_row.get("ts"))
+    symbol = str(config.get("symbol", SYMBOL_DEFAULT))
+    close = feature_row.get("close")
+    ma5 = feature_row.get("ma5")
+    ma25 = feature_row.get("ma25")
+    rsi9 = feature_row.get("rsi9")
+    volume_ratio_1m = feature_row.get("volume_ratio_1m")
+    high_prev_5m = feature_row.get("high_prev_5m")
+    low_prev_5m = feature_row.get("low_prev_5m")
+    low_prev_3m = feature_row.get("low_prev_3m")
+    high_prev_20m = feature_row.get("high_prev_20m")
+    rsi_last20 = [rsi9_wilder([b.close for b in history[: i + 1]], RSI9_PERIOD) for i in range(max(0, len(history) - 20), len(history))]
+    rsi_min_last20 = min([x for x in rsi_last20 if x is not None], default=None)
+
+    def add(name: str, side: str, ok: bool, reason: str, confidence: float = 1.0) -> Optional[dict[str, Any]]:
+        if not ok:
+            return None
+        return {
+            "ts": ts,
+            "symbol": symbol,
+            "signal_name": name,
+            "side": side,
+            "action": "LOG_ONLY",
+            "confidence": confidence,
+            "reason": reason,
+            "blocked_by_data_collection_only": 1 if is_data_collection_only(config) else 0,
+            "feature_json": json.dumps(feature_row, ensure_ascii=False, default=str),
+        }
+
+    tstr = datetime.fromisoformat(ts).strftime("%H:%M:%S")
+    candidates = [
+        add("opening_range_failure_short", "SHORT", "09:05:00" <= tstr <= "09:20:00" and close is not None and low_prev_5m is not None and ma5 is not None and volume_ratio_1m is not None and close < low_prev_5m and close < ma5 and volume_ratio_1m >= 1.2, "opening range low close break with volume"),
+        add("failed_pullback_continuation_short", "SHORT", close is not None and low_prev_3m is not None and ma5 is not None and high_prev_5m is not None and rsi9 is not None and close < low_prev_3m and close < ma5 and close <= high_prev_5m and rsi9 < 50, "pullback failed under short-term range"),
+        add("short_exit_reversal_candidate", "LONG_EXIT_OR_REVERSAL", close is not None and high_prev_5m is not None and close > high_prev_5m, "close above previous 5m high"),
+        add("capitulation_reversal_long", "LONG", rsi_min_last20 is not None and close is not None and high_prev_5m is not None and ma5 is not None and volume_ratio_1m is not None and rsi_min_last20 <= 35 and close > high_prev_5m and close > ma5 and volume_ratio_1m >= 1.2, "capitulation rebound with volume"),
+        add("strong_reversal_long", "LONG", close is not None and high_prev_20m is not None and ma25 is not None and volume_ratio_1m is not None and close > high_prev_20m and close > ma25 and volume_ratio_1m >= 1.5, "strong 20m high reversal"),
+        add("no_trade_range", "NEUTRAL", not bool(feature_row.get("break_high_5m")) and not bool(feature_row.get("break_low_5m")) and rsi9 is not None and volume_ratio_1m is not None and 45 <= rsi9 <= 55 and volume_ratio_1m < 1.2, "range/no-trade regime"),
+    ]
+    return [c for c in candidates if c is not None]
+
+
+def save_market_structure_for_finalized_bar(
+    storage: Storage,
+    config: dict[str, Any],
+    rb1: RollingBars,
+    latest_snapshot: Optional[TickSnapshot],
+    recent_feature_rows: list[dict[str, Any]],
+) -> None:
+    cfg = market_structure_features_config(config)
+    if not bool(cfg.get("enabled", False)) or not bool(cfg.get("save_every_1m_bar", True)):
+        return
+    feature_row = build_market_structure_features_1m(list(rb1.history), config, latest_snapshot, recent_feature_rows)
+    if feature_row is None:
+        return
+    storage.save_market_structure_features_1m(feature_row)
+    recent_feature_rows.append(feature_row)
+    if len(recent_feature_rows) > 120:
+        del recent_feature_rows[:-120]
+    candidates = build_market_structure_signal_candidates(feature_row, list(rb1.history), config)
+    storage.save_market_structure_signal_candidates(candidates)
+    storage.log_structured(
+        "INFO",
+        "MARKET_STRUCTURE_FEATURES_1M_SAVED",
+        {
+            "ts": feature_row.get("ts"),
+            "candidate_count": len(candidates),
+            "data_collection_only": is_data_collection_only(config),
+        },
+    )
+
+
 def calc_close_pos_in_bar(bar: Optional[Bar]) -> float:
     if not bar:
         return 0.5
@@ -1990,6 +2406,52 @@ def scalp_feature_rule_config(config: dict[str, Any], rule_name: str) -> dict[st
 def long_rsi50_trend_hold_config(config: dict[str, Any]) -> dict[str, Any]:
     raw = config.get("long_rsi50_trend_hold", {}) if isinstance(config.get("long_rsi50_trend_hold"), dict) else {}
     return deep_merge_dict(NESTED_CONFIG_DEFAULTS["long_rsi50_trend_hold"], raw)
+
+
+def data_collection_only_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("data_collection_only", {}) if isinstance(config.get("data_collection_only"), dict) else {}
+    return deep_merge_dict(NESTED_CONFIG_DEFAULTS["data_collection_only"], raw)
+
+
+def is_data_collection_only(config: dict[str, Any]) -> bool:
+    cfg = config.get("data_collection_only", {})
+    return bool(isinstance(cfg, dict) and cfg.get("enabled", False))
+
+
+def log_data_collection_only_order_blocked(
+    storage: Optional[Storage],
+    config: dict[str, Any],
+    blocked_action: str,
+    signal: str = "",
+    side: str = "",
+    price: Optional[float] = None,
+    strategy: str = "",
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    if storage is None or not is_data_collection_only(config):
+        return
+    cfg = data_collection_only_config(config)
+    if not bool(cfg.get("log_order_block_events", True)):
+        return
+    storage.log_structured(
+        "INFO",
+        "DATA_COLLECTION_ONLY_ORDER_BLOCKED",
+        {
+            "ts": now_jst().isoformat(),
+            "reason": "data_collection_only_enabled",
+            "blocked_action": blocked_action,
+            "signal": signal,
+            "side": side,
+            "price": price,
+            "strategy": strategy,
+            **(extra or {}),
+        },
+    )
+
+
+def market_structure_features_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("market_structure_features", {}) if isinstance(config.get("market_structure_features"), dict) else {}
+    return deep_merge_dict(NESTED_CONFIG_DEFAULTS["market_structure_features"], raw)
 
 
 def is_long_rsi50_trend_hold_only(config: dict[str, Any]) -> bool:
@@ -5423,6 +5885,9 @@ def cancel_pending_take_profit_order(
         order_ids = [pos.take_profit_order_id]
     if not order_ids:
         return True, False
+    if is_data_collection_only(config):
+        log_data_collection_only_order_blocked(storage, config, "cancel_order", side=pos.side, strategy=pos.strategy, extra={"context": context, "order_ids": order_ids})
+        return False, False
     any_fail = False
     for order_id in order_ids:
         cancel_payload = {"OrderId": order_id}
@@ -5523,6 +5988,18 @@ def execute_live_entry(
     entry_ema13_lookback_value: Optional[float] = None,
     entry_ema13_delta_ticks: Optional[float] = None,
 ) -> LiveOrderResult:
+    if is_data_collection_only(config):
+        log_data_collection_only_order_blocked(
+            storage,
+            config,
+            "live_entry_order",
+            signal=pred.signal,
+            side=side,
+            price=candidate.entry_price,
+            strategy=candidate.strategy,
+            extra={"entry_rule": candidate.entry_rule, "prediction_ts": pred.ts.isoformat()},
+        )
+        return LiveOrderResult(False, "DATA_COLLECTION_ONLY_ORDER_BLOCKED", recoverable=False)
     entry_exec = entry_execution_config(config)
     limit_entry = use_limit_entry(config)
     retries = max(int(config.get("live_retry_max", LIVE_RETRY_MAX)), 0)
@@ -5977,6 +6454,18 @@ def execute_live_exit(
     pnl_ticks: Optional[float] = None,
     ma5_exit_context: Optional[dict[str, Any]] = None,
 ) -> LiveOrderResult:
+    if is_data_collection_only(config):
+        log_data_collection_only_order_blocked(
+            storage,
+            config,
+            "live_exit_order",
+            signal=pos.entry_rule,
+            side=side,
+            price=signal_price,
+            strategy=pos.strategy,
+            extra={"exit_signal_ts": exit_signal_ts.isoformat() if exit_signal_ts else None},
+        )
+        return LiveOrderResult(False, "DATA_COLLECTION_ONLY_ORDER_BLOCKED", recoverable=False)
     exit_exec = config.get("exit_execution", {}) if isinstance(config.get("exit_execution", {}), dict) else {}
     retries = max(int(exit_exec.get("max_reprice_attempts", config.get("live_retry_max", LIVE_RETRY_MAX))), 0)
     timeout_sec = int(config.get("live_exit_timeout_sec", LIVE_EXIT_TIMEOUT_SEC))
@@ -6564,6 +7053,19 @@ def force_close_open_position(
     pos = status.open_position
     if pos is None:
         return
+    if is_data_collection_only(config):
+        storage.log_structured(
+            "CRITICAL",
+            "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED",
+            {
+                "ts": ts.isoformat(),
+                "reason": reason,
+                "message": "force close suppressed in data_collection_only mode",
+                "open_position": position_state_payload(pos),
+            },
+        )
+        log_data_collection_only_order_blocked(storage, config, "force_close_order", signal=reason, side=pos.side, price=pos.entry_price, strategy=pos.strategy)
+        return
     if not config.get("live_mode"):
         storage.log("WARN", "FORCE_EXIT_PAPER_CLEAR", f"reason={reason} side={pos.side}")
         status.open_position = None
@@ -7068,6 +7570,9 @@ def midday_order_cleanup(
         "open_position": position_state_payload(pos),
         **kept_payload,
     }
+    if is_data_collection_only(config):
+        log_data_collection_only_order_blocked(storage, config, "midday_cancel_order", extra=base_payload)
+        return
     storage.log_structured("INFO", "MIDDAY_ENTRY_ORDER_CLEANUP_START", base_payload)
 
     entry_order_ids: list[str] = []
@@ -7147,6 +7652,19 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     startup_payload = startup_config_effective_payload(config)
     storage.log_structured("INFO", "STARTUP_CONFIG_EFFECTIVE", startup_payload)
     print(f"STARTUP_CONFIG_EFFECTIVE {json.dumps(startup_payload, ensure_ascii=False, sort_keys=True)}", flush=True)
+    if is_data_collection_only(config):
+        data_payload = {
+            "live_mode": bool(config.get("live_mode")),
+            "strategy_mode": config.get("strategy_mode"),
+            "data_collection_only": data_collection_only_config(config),
+            "market_structure_features": market_structure_features_config(config),
+            "market_data_source": config.get("market_data_source", {}),
+            "orders_disabled": True,
+            "paper_trades_disabled": bool(data_collection_only_config(config).get("disable_paper_trades", True)),
+        }
+        storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ENABLED", data_payload)
+        storage.log_structured("INFO", "MARKET_STRUCTURE_FEATURES_ENABLED", data_payload)
+        storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", data_payload)
 
     client = KabuApiClient(config["base_url"])
     status = MonitorStatus()
@@ -7166,6 +7684,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             print(f"[ERROR] startup auth/register failed: {err}")
             storage.log("ERROR", "TOKEN_FAIL", err)
             time.sleep(1)
+    if is_data_collection_only(config) and bool(data_collection_only_config(config).get("allow_position_polling", True)):
+        try:
+            sp = fetch_positions(client, config, storage, reason="DATA_COLLECTION_ONLY_POSITION_POLL")
+            tq, mq = summarize_positions(sp)
+            if tq > 0:
+                storage.log_structured(
+                    "CRITICAL",
+                    "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED",
+                    {"total_qty": tq, "matching_qty": mq, "positions_json": sp, "auto_close_disabled": True},
+                )
+        except Exception as e:
+            storage.log("WARN", "DATA_COLLECTION_ONLY_POSITION_POLL_FAIL", str(e))
     if config.get("live_mode"):
         try:
             sp = fetch_positions(client, config, storage, reason="STARTUP_POSITION_CHECK")
@@ -7213,6 +7743,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
     last_pred: Optional[PredictionSnapshot] = None
     last_gate: Optional[GateDecision] = None
     last_snapshot: Optional[TickSnapshot] = None
+    recent_market_structure_rows: list[dict[str, Any]] = []
     last_processed_snapshot_ts: Optional[datetime] = None
     last_processed_ws_seq: Optional[int] = None
     last_rest_fallback_ts: Optional[datetime] = None
@@ -7516,6 +8047,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 if updated_1m is not None:
                     bar1_queue_finalized = updated_1m
                     storage.insert_bar("bars_1m", updated_1m)
+                    save_market_structure_for_finalized_bar(storage, config, rb1, last_snapshot, recent_market_structure_rows)
                     if final_snapshot_source == "websocket_queue":
                         storage.log_structured(
                             "INFO",
@@ -7563,6 +8095,20 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
 
             force_close_time_reached_top = tstr >= str(config.get("force_close_after", FORCE_CLOSE_AFTER))
             if force_close_time_reached_top:
+                if is_data_collection_only(config):
+                    if status.open_position is not None:
+                        storage.log_structured(
+                            "CRITICAL",
+                            "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED",
+                            {
+                                "ts": now_.isoformat(),
+                                "message": "15:20 force close suppressed in data_collection_only mode",
+                                "open_position": position_state_payload(status.open_position),
+                            },
+                        )
+                        log_data_collection_only_order_blocked(storage, config, "force_close_order", signal="FORCE_MARKET_CLOSE_1520", side=status.open_position.side, price=status.open_position.entry_price, strategy=status.open_position.strategy)
+                    sleep_or_wait_for_market_data()
+                    continue
                 storage.log_structured("WARN", "FORCE_MARKET_CLOSE_1520_START", {
                     "ts": now_.isoformat(),
                     "live_state": status.live_state,
@@ -7599,6 +8145,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
             bar1_new = bar1_time_finalized or bar1_queue_finalized
             if bar1_time_finalized:
                 storage.insert_bar("bars_1m", bar1_time_finalized)
+                save_market_structure_for_finalized_bar(storage, config, rb1, last_snapshot, recent_market_structure_rows)
             current_bar_bucket_1m = rb1.current_bucket
             current_bar_open_1m = rb1.rows[0].price if rb1.rows and rb1.rows[0].price is not None else None
             confirmed_bar1 = rb1.latest()
@@ -7621,6 +8168,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 b1f = rb1.force_finalize()
                 if b1f:
                     storage.insert_bar("bars_1m", b1f)
+                    save_market_structure_for_finalized_bar(storage, config, rb1, last_snapshot, recent_market_structure_rows)
                 b3f = rb3.force_finalize()
                 if b3f:
                     storage.insert_bar("bars_3m", b3f)
@@ -7655,10 +8203,12 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 # 15:20強制決済は上位ブロックで処理済み。ここでは新規停止フラグとして扱わない。
                 force_close_handled_above = False
                 entry_cutoff_reached = new_entry_cutoff_reached(config, tstr)
+                data_collection_mode = is_data_collection_only(config)
                 allow_new_entry = (
                     time_in_windows(tstr, TRADE_WINDOWS)
                     and not force_close_handled_above
                     and not entry_cutoff_reached
+                    and not data_collection_mode
                     and status.pending_entry_side is None
                     and status.live_state not in {"RECOVERING", "MANUAL_POSITION_CHECK_REQUIRED", "ENTRY_SENT", "EXIT_SENT", "EXIT_VERIFYING"}
                 )
@@ -7888,6 +8438,17 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                             "reason_3_after": p.reason_3,
                         },
                     )
+                if data_collection_mode and p.signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
+                    log_data_collection_only_order_blocked(
+                        storage,
+                        config,
+                        "signal_candidate_to_order",
+                        signal=p.signal,
+                        side="LONG" if p.signal == "LONG_CANDIDATE" else "SHORT",
+                        price=f.price,
+                        strategy=p.reason_1,
+                        extra={"bar_ts": f.ts.isoformat(), "reason_3": p.reason_3},
+                    )
                 storage.insert_prediction(p)
                 gate_features = volatility_gate.compute_features(tick_buf, f)
                 gate_decision = volatility_gate.evaluate(p.signal, gate_features, current_position=status.open_position)
@@ -7900,7 +8461,7 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                 current_rsi = extract_rsi_from_pred(p)
 
                 # RSI threshold hit on closed 1m bar -> execute on next 1m bar open (first tick)
-                if (not force_close_handled_above) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
+                if (not data_collection_mode) and (not force_close_handled_above) and bar1_new is not None and status.pending_entry_side is None and status.open_position is None:
                     if effective_signal in {"LONG_CANDIDATE", "SHORT_CANDIDATE"}:
                         pending_side = "LONG" if effective_signal == "LONG_CANDIDATE" else "SHORT"
                         if long_rsi50_only and (pending_side != "LONG" or p.reason_3 != LONG_RSI50_ENTRY_RULE):
@@ -8324,6 +8885,12 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                                 mfe_ticks = 0.0
                                                 mae_ticks = 0.0
                             else:
+                                if is_data_collection_only(config):
+                                    log_data_collection_only_order_blocked(storage, config, "paper_trade_entry", signal=p.signal, side=side, price=candidate_pos.entry_price, strategy=candidate_pos.strategy, extra={"entry_rule": candidate_pos.entry_rule})
+                                    status.pending_entry_side = None
+                                    status.pending_entry_ts = None
+                                    status.pending_add = False
+                                    continue
                                 status.open_position = candidate_pos
                                 log_entry_risk_parameters(storage, candidate_pos, p.reason_3)
                                 status.live_state = "OPEN"
@@ -8336,6 +8903,18 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                 mfe_ticks = 0.0
                                 mae_ticks = 0.0
                 elif status.open_position is not None:
+                    if data_collection_mode:
+                        storage.log_structured(
+                            "CRITICAL",
+                            "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED",
+                            {
+                                "ts": f.ts.isoformat(),
+                                "message": "exit evaluation suppressed in data_collection_only mode",
+                                "open_position": position_state_payload(status.open_position),
+                            },
+                        )
+                        sleep_or_wait_for_market_data()
+                        continue
                     skip_exit_eval = False
                     if config["live_mode"] and status.live_state == "RECOVERING":
                         rec = reconcile_live_position(client, config, status, storage, expected_side=status.open_position.side, reason="RECOVERING_POLL", ts=f.ts, expected_margin_trade_type=status.open_position.margin_trade_type)
@@ -8608,6 +9187,9 @@ def run_monitor(config: dict[str, Any]) -> tuple[str, str]:
                                         pos.entry_fill_price,
                                     )
                                     pnl_ticks = actual_pnl_ticks if pos.side == "LONG" else -actual_pnl_ticks
+                                if is_data_collection_only(config):
+                                    log_data_collection_only_order_blocked(storage, config, "paper_trade_exit", signal=ex_reason, side=pos.side, price=pos.exit_fill_price if pos.exit_fill_price is not None else f.price, strategy=pos.strategy)
+                                    continue
                                 storage.insert_trade(
                                     entry_ts=pos.entry_ts.isoformat(),
                                     exit_ts=f.ts.isoformat(),
