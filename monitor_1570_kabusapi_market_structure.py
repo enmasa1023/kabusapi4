@@ -89,7 +89,8 @@ class TickSnapshot:
     sell1_qty: Optional[float] = None
     buy1_price: Optional[float] = None
     buy1_qty: Optional[float] = None
-    volume: Optional[float] = None
+    cumulative_volume: Optional[float] = None
+    volume_delta: float = 0.0
     vwap: Optional[float] = None
     buy_depth_10: Optional[float] = None
     sell_depth_10: Optional[float] = None
@@ -132,6 +133,10 @@ class PositionState:
     entry_price: float
     strategy: str
     entry_ts: datetime
+    order_id: str = ""
+    execution_ids: list[str] = field(default_factory=list)
+    margin_trade_type: int = 0
+    cash_margin: int = 2
 
 
 @dataclass
@@ -146,6 +151,7 @@ class RuntimeState:
     recovery_until: Optional[datetime] = None
     force_close_logged: bool = False
     rest_fallback_count: int = 0
+    last_cumulative_volume: Optional[float] = None
 
 
 class AsyncDbWriter:
@@ -314,13 +320,15 @@ class KabuApiClient:
         return self._request("POST", "/sendorder", payload)
 
     def cancel_order(self, order_id: str) -> Any:
-        return self._request("PUT", "/cancelorder", {"OrderId": order_id, "Password": self.order_password})
+        return self._request("PUT", "/cancelorder", {"OrderId": order_id})
 
     def get_positions(self, symbol: str) -> Any:
-        return self._request("GET", f"/positions?symbol={symbol}")
+        return self._request("GET", f"/positions?product=2&symbol={symbol}&addinfo=true")
 
-    def get_orders(self, symbol: str) -> Any:
-        return self._request("GET", f"/orders?symbol={symbol}")
+    def get_orders(self, symbol: str, order_id: Optional[str] = None, details: bool = True) -> Any:
+        suffix = f"&id={order_id}" if order_id else ""
+        detail = "&details=true" if details else ""
+        return self._request("GET", f"/orders?product=2{suffix}{detail}")
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -357,7 +365,24 @@ def extract_snapshot(raw: dict[str, Any], ws_seq: Optional[int] = None) -> Optio
             buy1p, buy1q, sell1p, sell1q = bp, bq, sp, sq
         buy_depth_10 += bq or 0.0
         sell_depth_10 += sq or 0.0
-    return TickSnapshot(ts=ts, price=price, buy1_price=buy1p, buy1_qty=buy1q, sell1_price=sell1p, sell1_qty=sell1q, volume=_to_float(raw.get("TradingVolume")), vwap=_to_float(raw.get("VWAP")), buy_depth_10=buy_depth_10 or None, sell_depth_10=sell_depth_10 or None, ws_seq=ws_seq)
+    return TickSnapshot(ts=ts, price=price, buy1_price=buy1p, buy1_qty=buy1q, sell1_price=sell1p, sell1_qty=sell1q, cumulative_volume=_to_float(raw.get("TradingVolume")), vwap=_to_float(raw.get("VWAP")), buy_depth_10=buy_depth_10 or None, sell_depth_10=sell_depth_10 or None, ws_seq=ws_seq)
+
+
+def attach_volume_delta(state: RuntimeState, snap: TickSnapshot, storage: Optional[AsyncDbWriter] = None) -> TickSnapshot:
+    """Convert kabu API daily cumulative TradingVolume to per-snapshot delta."""
+    current = snap.cumulative_volume
+    prev = state.last_cumulative_volume
+    delta = 0.0
+    if current is not None and prev is not None and current >= prev:
+        delta = current - prev
+        if delta > 5_000_000 and storage:
+            storage.log_structured("WARN", "SNAPSHOT_VOLUME_DELTA_ABNORMAL", {"snapshot_ts": snap.ts.isoformat(), "current_cumulative_volume": current, "previous_cumulative_volume": prev, "volume_delta": delta}, False)
+    elif current is not None and prev is not None and current < prev and storage:
+        storage.log_structured("WARN", "SNAPSHOT_VOLUME_CUMULATIVE_RESET", {"snapshot_ts": snap.ts.isoformat(), "current_cumulative_volume": current, "previous_cumulative_volume": prev}, False)
+    snap.volume_delta = max(delta, 0.0)
+    if current is not None:
+        state.last_cumulative_volume = current
+    return snap
 
 
 class WebSocketMarketDataFeed:
@@ -445,16 +470,16 @@ class RollingBars:
     def update(self, snap: TickSnapshot) -> Optional[Bar]:
         bucket = floor_minute(snap.ts, self.minutes)
         if self.current is None:
-            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume or 0.0, snap.vwap, 1)
+            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume_delta, snap.vwap, 1)
             return None
         if bucket > self.current.ts:
             finished = self.current
-            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume or 0.0, snap.vwap, 1)
+            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume_delta, snap.vwap, 1)
             return finished
         self.current.high = max(self.current.high, snap.price)
         self.current.low = min(self.current.low, snap.price)
         self.current.close = snap.price
-        self.current.volume += snap.volume or 0.0
+        self.current.volume += snap.volume_delta
         self.current.vwap = snap.vwap if snap.vwap is not None else self.current.vwap
         self.current.snapshots += 1
         return None
@@ -638,21 +663,29 @@ def evaluate_market_structure_strategy(feature: dict[str, Any], cfg: dict[str, A
     long_cfg = strategy.get("long", {})
     def add(name: str, side: str, reason: str, confidence: float = 1.0) -> None:
         candidates.append({"ts": feature["ts"], "symbol": feature.get("symbol"), "signal_name": name, "side": side, "action": "LOG_ONLY" if is_data_collection_only(cfg) else "PENDING", "confidence": confidence, "reason": reason, "feature_json": json.dumps(feature, ensure_ascii=False, default=str)})
-    short_allowed = bool(strategy.get("allow_short", True) and short_cfg.get("enabled", True) and close is not None and low5 is not None and ma5 is not None and ma25 is not None and rsi9 is not None and volr is not None and close < low5 and close < ma5 and close < ma25 and rsi9 < float(short_cfg.get("rsi9_max", 50)) and volr >= float(short_cfg.get("volume_ratio_min", 1.2)))
+    short_allowed = bool(not state.open_position and strategy.get("allow_short", True) and short_cfg.get("enabled", True) and close is not None and low5 is not None and ma5 is not None and ma25 is not None and rsi9 is not None and volr is not None and close < low5 and close < ma5 and close < ma25 and rsi9 < float(short_cfg.get("rsi9_max", 50)) and volr >= float(short_cfg.get("volume_ratio_min", 1.2)))
     bar_ts = datetime.fromisoformat(feature["ts"])
     time_str = bar_ts.strftime("%H:%M:%S")
     if short_allowed:
         signal = "opening_range_failure_short" if "09:05:00" <= time_str <= "09:20:00" else "strict_failed_pullback_short"
         add(signal, SIDE_SELL, "close_below_prev5_low_ma5_ma25_rsi_volume")
+        feature.setdefault("signal_detected_at", now_jst().isoformat())
+        feature.setdefault("pending_signal_created_at", now_jst().isoformat())
         pending = PendingSignal(signal_bar_ts=bar_ts, execute_not_before_minute=bar_ts + timedelta(minutes=1), side=SIDE_SELL, action=ACTION_ENTRY, signal_name=signal, reason="strict_market_structure_short", features=feature)
     if high5 is not None and close is not None and close > high5:
         add("short_exit_reversal_candidate", SIDE_BUY, "close_above_high_prev_5m", 0.8)
+        if state.open_position and state.open_position.side == SIDE_SELL:
+            feature.setdefault("signal_detected_at", now_jst().isoformat())
+            feature.setdefault("pending_signal_created_at", now_jst().isoformat())
+            pending = PendingSignal(signal_bar_ts=bar_ts, execute_not_before_minute=bar_ts + timedelta(minutes=1), side=SIDE_BUY, action=ACTION_EXIT, signal_name="short_exit_reversal_candidate", reason="close_above_high_prev_5m", features=feature)
     if high10 is not None and close is not None and close > high10:
         add("short_exit_confirmed", SIDE_BUY, "close_above_high_prev_10m", 1.0)
     long_allowed = bool(strategy.get("allow_long", False) and long_cfg.get("enabled", False) and close is not None and high5 is not None and high20 is not None and ma5 is not None and ma25 is not None and vwap is not None and rsi9 is not None and volr is not None and close > high5 and close > high20 and close > ma5 and close > ma25 and close > vwap and rsi9 >= float(long_cfg.get("rsi9_min", 50)) and volr >= float(long_cfg.get("volume_ratio_min", 1.2)))
     if long_allowed and pending is None:
         add("strict_reversal_long", SIDE_BUY, "close_above_prev5_prev20_ma_vwap_rsi_volume")
         if not long_cfg.get("require_next_bar_hold", True):
+            feature.setdefault("signal_detected_at", now_jst().isoformat())
+            feature.setdefault("pending_signal_created_at", now_jst().isoformat())
             pending = PendingSignal(signal_bar_ts=bar_ts, execute_not_before_minute=bar_ts + timedelta(minutes=1), side=SIDE_BUY, action=ACTION_ENTRY, signal_name="strict_reversal_long", reason="strict_market_structure_long", features=feature)
     return candidates, pending
 
@@ -666,6 +699,151 @@ def build_entry_order_payload(config: dict[str, Any], side: str, price: float) -
     return {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("margin_entry_exchange", config.get("order_exchange", 9)), "SecurityType": 1, "Side": "1" if is_short else "2", "CashMargin": config.get("entry_cash_margin", 2), "MarginTradeType": config.get("margin_trade_type_short" if is_short else "margin_trade_type_long", 1 if is_short else 3), "DelivType": config.get("entry_deliv_type", 0), "AccountType": config.get("account_type", 4), "Qty": config.get("order_qty", 2), "FrontOrderType": config.get("entry_front_order_type", 10), "Price": config.get("entry_price", 0), "ExpireDay": config.get("expire_day", 0)}
 
 
+def build_exit_order_payload(config: dict[str, Any], position: PositionState, qty: Optional[int] = None) -> dict[str, Any]:
+    # Credit repayments use CashMargin=3 and either ClosePositionOrder or
+    # ClosePositions, never both.  The simple, yaml-compatible default is
+    # ClosePositionOrder=0.
+    exit_side = "2" if position.side == SIDE_SELL else "1"
+    return {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("exit_order_exchange", 1), "SecurityType": 1, "Side": exit_side, "CashMargin": config.get("exit_cash_margin", 3), "DelivType": config.get("exit_deliv_type", 2), "AccountType": config.get("account_type", 4), "Qty": qty or position.qty, "FrontOrderType": config.get("exit_front_order_type", 10), "Price": config.get("exit_price", 0), "ExpireDay": config.get("expire_day", 0), "ClosePositionOrder": 0}
+
+
+def order_id_from_response(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    return str(response.get("OrderId") or response.get("OrderID") or "")
+
+
+def order_cum_qty(order: Any) -> float:
+    if isinstance(order, list):
+        return max((order_cum_qty(x) for x in order), default=0.0)
+    if not isinstance(order, dict):
+        return 0.0
+    cum = _to_float(order.get("CumQty"))
+    if cum is not None:
+        return cum
+    details = order.get("Details") or order.get("details") or []
+    total = 0.0
+    for d in details if isinstance(details, list) else []:
+        if isinstance(d, dict) and str(d.get("RecType")) == "8":
+            total += _to_float(d.get("Qty") or d.get("ExecutionQty") or d.get("CumQty")) or 0.0
+    return total
+
+
+def order_terminal(order: Any) -> bool:
+    if isinstance(order, list):
+        return any(order_terminal(x) for x in order)
+    if not isinstance(order, dict):
+        return False
+    state = str(order.get("State") or order.get("OrderState") or "")
+    return state == "5"
+
+
+def normalize_positions(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, dict):
+        raw = raw.get("Positions") or raw.get("positions") or raw.get("Result") or []
+    return raw if isinstance(raw, list) else []
+
+
+def position_from_api(raw_positions: Any, side: str, strategy: str, order_id: str, config: dict[str, Any]) -> Optional[PositionState]:
+    target_side = "1" if side == SIDE_SELL else "2"
+    positions = [p for p in normalize_positions(raw_positions) if isinstance(p, dict) and str(p.get("Side")) == target_side and (_to_float(p.get("LeavesQty")) or 0) > 0]
+    if not positions:
+        return None
+    qty = int(sum(_to_float(p.get("LeavesQty")) or 0 for p in positions))
+    weighted = sum((_to_float(p.get("Price")) or 0) * (_to_float(p.get("LeavesQty")) or 0) for p in positions)
+    entry_price = weighted / qty if qty else 0.0
+    execution_ids = [str(p.get("ExecutionID") or p.get("HoldID") or "") for p in positions if p.get("ExecutionID") or p.get("HoldID")]
+    margin_trade_type = int(_to_float(positions[0].get("MarginTradeType")) or config.get("margin_trade_type_short" if side == SIDE_SELL else "margin_trade_type_long", 1 if side == SIDE_SELL else 3))
+    return PositionState(side=side, qty=qty, entry_price=entry_price, strategy=strategy, entry_ts=now_jst(), order_id=order_id, execution_ids=execution_ids, margin_trade_type=margin_trade_type, cash_margin=2)
+
+
+def reconcile_positions(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, expected_side: Optional[str] = None, strategy: str = "market_structure_strategy", order_id: str = "") -> Optional[PositionState]:
+    started = now_jst()
+    positions = client.get_positions(str(config.get("symbol", "1570")))
+    side = expected_side or (state.open_position.side if state.open_position else SIDE_SELL)
+    pos = position_from_api(positions, side, strategy, order_id, config)
+    state.open_position = pos
+    storage.log_structured("INFO" if pos else "WARN", "POSITION_RECONCILE_RESULT", {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": expected_side, "position_found": bool(pos), "qty": pos.qty if pos else 0, "order_id": order_id}, True)
+    if is_data_collection_only(config) and pos:
+        storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "order_id": pos.order_id}, True)
+    return pos
+
+
+def wait_order_fill(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, order_id: str, min_qty: float) -> tuple[float, bool]:
+    timeout = float(config.get("entry_execution", {}).get("timeout_sec", 2.0))
+    deadline = time.monotonic() + timeout
+    last_order: Any = None
+    while time.monotonic() <= deadline:
+        last_order = client.get_orders(str(config.get("symbol", "1570")), order_id, True)
+        cum = order_cum_qty(last_order)
+        if cum >= min_qty:
+            return cum, True
+        if order_terminal(last_order) and cum > 0:
+            return cum, cum >= min_qty
+        time.sleep(0.25)
+    storage.log_structured("WARN", "ORDER_FILL_TIMEOUT", {"order_id": order_id, "cum_qty": order_cum_qty(last_order), "min_qty": min_qty}, True)
+    return order_cum_qty(last_order), False
+
+
+def confirm_cancel(config: dict[str, Any], client: KabuApiClient, order_id: str) -> bool:
+    for _ in range(8):
+        order = client.get_orders(str(config.get("symbol", "1570")), order_id, True)
+        if order_terminal(order):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def latency_payload(sig: PendingSignal, extra: dict[str, Any]) -> dict[str, Any]:
+    payload = {"signal_bar_ts": sig.signal_bar_ts.isoformat(), "signal_detected_at": sig.features.get("signal_detected_at"), "pending_signal_created_at": sig.features.get("pending_signal_created_at"), "next_bar_first_tick_at": extra.get("next_bar_first_tick_at"), "order_decision_at": extra.get("order_decision_at"), "order_send_started_at": extra.get("order_send_started_at"), "order_response_at": extra.get("order_response_at"), "order_verify_started_at": extra.get("order_verify_started_at"), "order_verify_finished_at": extra.get("order_verify_finished_at"), "position_reconcile_started_at": extra.get("position_reconcile_started_at"), "position_reconcile_finished_at": extra.get("position_reconcile_finished_at"), "db_enqueue_at": now_jst().isoformat(), "signal_to_decision_ms": extra.get("signal_to_decision_ms"), "decision_to_order_send_ms": extra.get("decision_to_order_send_ms"), "order_send_to_response_ms": extra.get("order_send_to_response_ms"), "order_response_to_verify_ms": extra.get("order_response_to_verify_ms"), "signal_to_position_confirm_ms": extra.get("signal_to_position_confirm_ms"), "db_queue_lag_ms": 0, "signal": sig.signal_name, "action": sig.action, "side": sig.side}
+    return payload
+
+
+def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, sig: PendingSignal, snap: TickSnapshot) -> None:
+    decision_at = now_jst()
+    if is_data_collection_only(config):
+        event = "DATA_COLLECTION_ONLY_EXIT_BLOCKED" if sig.action == ACTION_EXIT else "DATA_COLLECTION_ONLY_ORDER_BLOCKED"
+        storage.log_structured("INFO", event, {"ts": decision_at.isoformat(), "reason": "data_collection_only_enabled", "blocked_action": "send_order", "signal": sig.signal_name, "side": sig.side, "price": snap.price, "strategy": "market_structure_strategy"}, True)
+        storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000}), True)
+        return
+    if not orders_enabled(config):
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "signal": sig.signal_name, "action": sig.action}, True)
+        return
+    if sig.action == ACTION_ENTRY and (state.open_position is not None or state.recovery_until and now_jst() < state.recovery_until):
+        storage.log_structured("WARN", "ENTRY_BLOCKED_BY_POSITION_OR_RECOVERY", {"has_open_position": state.open_position is not None, "recovery_until": iso_dt(state.recovery_until)}, True)
+        return
+    if sig.action == ACTION_EXIT and state.open_position is None:
+        storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side}, True)
+        return
+    payload = build_entry_order_payload(config, sig.side, snap.price) if sig.action == ACTION_ENTRY else build_exit_order_payload(config, state.open_position, state.open_position.qty if state.open_position else None)
+    send_started = now_jst()
+    response = client.send_order(payload)
+    response_at = now_jst()
+    order_id = order_id_from_response(response)
+    if not order_id:
+        state.recovery_until = now_jst() + timedelta(seconds=30)
+        storage.log_structured("CRITICAL", "ORDER_RESPONSE_MISSING_ORDER_ID", {"response": response, "signal": sig.signal_name}, True)
+        return
+    verify_started = now_jst()
+    min_qty = config.get("entry_min_fill_qty", config.get("order_qty", 1)) if sig.action == ACTION_ENTRY else 1
+    cum_qty, fill_ok = wait_order_fill(config, client, storage, order_id, float(min_qty))
+    verify_finished = now_jst()
+    if not fill_ok and config.get("entry_execution", {}).get("cancel_on_timeout", True):
+        client.cancel_order(order_id)
+        canceled = confirm_cancel(config, client, order_id)
+        storage.log_structured("WARN", "ORDER_CANCEL_AFTER_TIMEOUT", {"order_id": order_id, "cum_qty": cum_qty, "cancel_confirmed": canceled}, True)
+    rec_started = now_jst()
+    pos = reconcile_positions(config, client, storage, state, sig.side if sig.action == ACTION_ENTRY else None, "market_structure_strategy", order_id)
+    rec_finished = now_jst()
+    if sig.action == ACTION_EXIT and (not pos or pos.qty == 0):
+        state.open_position = None
+    elif sig.action == ACTION_ENTRY and fill_ok and not pos:
+        state.recovery_until = now_jst() + timedelta(seconds=60)
+        storage.log_structured("CRITICAL", "POSITION_CONFIRM_FAILED_AFTER_ENTRY_FILL", {"order_id": order_id, "cum_qty": cum_qty}, True)
+    storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response}, ensure_ascii=False, default=str)), True)
+    storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000}), True)
+
+
 def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, snap: TickSnapshot) -> None:
     sig = state.pending_signal
     if not sig or snap.ts < sig.execute_not_before_minute:
@@ -677,16 +855,10 @@ def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage
         state.pending_signal = None
         storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_EXPIRED", {"signal": sig.signal_name, "bar_ts": sig.signal_bar_ts.isoformat(), "reason": "outside_entry_window"})
         return
-    if not orders_enabled(config):
-        block_order(storage, sig, sig.side, snap.price, "market_structure_strategy", "send_order")
-        state.pending_signal = None
-        return
-    payload = build_entry_order_payload(config, sig.side, snap.price)
-    started = now_jst()
-    res = client.send_order(payload)
-    state.last_entry_bar_ts = sig.signal_bar_ts
+    execute_signal_order(config, client, storage, state, sig, snap)
+    if sig.action == ACTION_ENTRY:
+        state.last_entry_bar_ts = sig.signal_bar_ts
     state.pending_signal = None
-    storage.enqueue("execution", (now_jst().isoformat(), "ENTRY_ORDER_REQUEST", sig.side, config.get("order_qty", 2), snap.price, str(res.get("OrderId", "")) if isinstance(res, dict) else "", json.dumps({"signal": sig.signal_name, "payload": payload, "response": res, "order_send_started_at": started.isoformat()}, ensure_ascii=False, default=str)), True)
 
 
 def check_hard_stop_and_force_close(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, snap: TickSnapshot) -> None:
@@ -702,9 +874,11 @@ def check_hard_stop_and_force_close(config: dict[str, Any], client: KabuApiClien
     reason = "HARD_STOP" if hard else "FORCE_CLOSE_1520"
     if not orders_enabled(config):
         storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"reason": reason, "side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "current_price": snap.price}, True)
+        if is_data_collection_only(config):
+            storage.log_structured("INFO", "DATA_COLLECTION_ONLY_EXIT_BLOCKED", {"reason": reason, "blocked_action": "send_order", "side": SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, "price": snap.price, "strategy": pos.strategy}, True)
         return
-    # Real exit wrapper is retained but unavailable in initial data-collection config.
-    storage.log_structured("CRITICAL", "MARKET_STRUCTURE_EXIT_REQUIRED", {"reason": reason, "side": pos.side, "current_price": snap.price}, True)
+    sig = PendingSignal(signal_bar_ts=snap.ts, execute_not_before_minute=snap.ts, side=SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, action=ACTION_EXIT, signal_name=reason, reason=reason, features={"signal_detected_at": now_jst().isoformat(), "pending_signal_created_at": now_jst().isoformat()})
+    execute_signal_order(config, client, storage, state, sig, snap)
 
 
 def save_bar_and_features(config: dict[str, Any], storage: AsyncDbWriter, state: RuntimeState, bar: Bar, latest_snap: Optional[TickSnapshot], is_1m: bool) -> None:
@@ -712,11 +886,14 @@ def save_bar_and_features(config: dict[str, Any], storage: AsyncDbWriter, state:
         decorate_bar(bar, state.bars_1m_buffer)
         feature = compute_market_structure_features(str(config.get("symbol", "1570")), bar, state, latest_snap)
         candidates, pending = evaluate_market_structure_strategy(feature, config, state)
-        if pending and not state.open_position:
+        if pending and (pending.action == ACTION_EXIT or not state.open_position):
             state.pending_signal = pending
             storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_CREATED", {"signal": pending.signal_name, "side": pending.side, "signal_bar_ts": pending.signal_bar_ts.isoformat(), "execute_not_before_minute": pending.execute_not_before_minute.isoformat()}, True)
             if is_data_collection_only(config):
-                block_order(storage, pending, pending.side, latest_snap.price if latest_snap else None, "market_structure_strategy", "send_order")
+                if pending.action == ACTION_EXIT:
+                    storage.log_structured("INFO", "DATA_COLLECTION_ONLY_EXIT_BLOCKED", {"reason": pending.reason, "blocked_action": "send_order", "side": pending.side, "price": latest_snap.price if latest_snap else None, "strategy": "market_structure_strategy"}, True)
+                else:
+                    block_order(storage, pending, pending.side, latest_snap.price if latest_snap else None, "market_structure_strategy", "send_order")
         for c in candidates:
             c["blocked_by_data_collection_only"] = int(is_data_collection_only(config))
             storage.enqueue("candidate", (c["ts"], c["symbol"], c["signal_name"], c["side"], "LOG_ONLY" if is_data_collection_only(config) else c["action"], c["confidence"], c["reason"], c["blocked_by_data_collection_only"], c["feature_json"]), False)
@@ -752,15 +929,19 @@ def main() -> int:
     storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ENABLED", startup, True)
     storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", {"orders_enabled": orders_enabled(config), "live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled")}, True)
     storage.log_structured("INFO", "LEGACY_STRATEGIES_DISABLED", {k: startup[k] for k in startup if k.startswith("legacy_")}, True)
+    state = RuntimeState()
     client = KabuApiClient(config.get("base_url") or config.get("api_base_url") or API_BASE_DEFAULT, config.get("api_password", ""), config.get("order_password", ""))
     try:
         client.get_token()
         client.register_symbol(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
+        if config.get("data_collection_only", {}).get("allow_position_polling", True):
+            # 起動時照合。data_collection_only中に建玉があっても自動決済はしない。
+            reconcile_positions(config, client, storage, state, None, "market_structure_strategy", "")
     except Exception as exc:
         storage.log_structured("ERROR", "KABU_API_STARTUP_FAILED", {"error": str(exc), "data_collection_only": is_data_collection_only(config)}, True)
         storage.stop()
         raise
-    state = RuntimeState(); rb1 = RollingBars(1); rb3 = RollingBars(3)
+    rb1 = RollingBars(1); rb3 = RollingBars(3)
     ws = WebSocketMarketDataFeed(config, str(config.get("symbol", "1570")), int(config.get("exchange", 1)), storage)
     if config.get("market_data_source", {}).get("mode") == "websocket":
         ws.start()
@@ -782,6 +963,7 @@ def main() -> int:
                 except Exception as exc:
                     storage.log_structured("WARN", "REST_FALLBACK_FAILED", {"error": str(exc)}, False)
             for snap in snaps:
+                attach_volume_delta(state, snap, storage)
                 latest = snap; state.snapshot_buffer.append(snap)
                 if snap.ws_seq is not None:
                     last_ws_seq = snap.ws_seq
