@@ -15,8 +15,8 @@
   "exit_cash_margin": 3,
   "entry_deliv_type": 0,
   "exit_deliv_type": 2,
-  "entry_front_order_type": 10,
-  "exit_front_order_type": 10,
+  "entry_front_order_type": 20,
+  "exit_front_order_type": 20,
   "entry_price": 0,
   "exit_price": 0,
   "expire_day": 0,
@@ -145,5 +145,14 @@
     "drop_low_priority_when_full": true
   },
   "api_password": "enmasa1023",
-  "order_password": "47095095"
+  "order_password": "47095095",
+  "exit_execution": {
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 1,
+    "fallback_to_market": false,
+    "log_execution_detail": true
+  }
 }

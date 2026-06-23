@@ -720,17 +720,82 @@ def block_order(storage: AsyncDbWriter, signal: Optional[PendingSignal], side: s
     storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ORDER_BLOCKED", {"ts": now_jst().isoformat(), "reason": "data_collection_only_enabled", "blocked_action": action, "signal": signal.signal_name if signal else None, "side": side, "price": price, "strategy": strategy}, True)
 
 
-def build_entry_order_payload(config: dict[str, Any], side: str, price: float) -> dict[str, Any]:
+def spread_ticks(snap: TickSnapshot) -> Optional[float]:
+    if snap.buy1_price is None or snap.sell1_price is None:
+        return None
+    return (snap.sell1_price - snap.buy1_price) / tick_size_for_1570(snap.price)
+
+
+def normalize_limit_price(price: float, side: str, tick_size: float) -> float:
+    if tick_size <= 0:
+        return price
+    units = price / tick_size
+    if abs(units - round(units)) < 1e-9:
+        return float(round(units) * tick_size)
+    # 買い指値は下へ丸めず、売り指値は上へ丸めない。
+    return float((math.ceil(units) if side == SIDE_BUY else math.floor(units)) * tick_size)
+
+
+def best_limit_price_for_order(side: str, action: str, snap: TickSnapshot) -> tuple[Optional[float], str]:
+    if side == SIDE_SELL:
+        return snap.buy1_price, "best_bid_for_sell"
+    if side == SIDE_BUY:
+        return snap.sell1_price, "best_ask_for_buy"
+    return None, "unknown_side"
+
+
+def validate_best_quote(side: str, action: str, snap: TickSnapshot) -> tuple[Optional[float], dict[str, Any]]:
+    price, source = best_limit_price_for_order(side, action, snap)
+    sp = spread_ticks(snap)
+    reason = ""
+    if price is None:
+        reason = "missing_best_bid_for_sell" if side == SIDE_SELL else "missing_best_ask_for_buy"
+    elif price <= 0:
+        reason = "best_quote_non_positive"
+    elif sp is not None and (sp < 0 or sp > 50):
+        reason = "spread_ticks_abnormal"
+    if reason:
+        return None, {"price_source": source, "reason": reason, "source_best_bid": snap.buy1_price, "source_best_ask": snap.sell1_price, "spread_ticks": sp}
+    limit_price = normalize_limit_price(float(price), side, tick_size_for_1570(snap.price))
+    return limit_price, {"price_source": source, "reason": "", "source_best_bid": snap.buy1_price, "source_best_ask": snap.sell1_price, "spread_ticks": sp, "limit_price": limit_price}
+
+
+def log_no_valid_best_quote(storage: AsyncDbWriter, sig: PendingSignal, snap: TickSnapshot, quote_meta: dict[str, Any]) -> None:
+    storage.log_structured("WARN", "ORDER_BLOCKED_NO_VALID_BEST_QUOTE", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "current_price": snap.price, "buy1_price": snap.buy1_price, "sell1_price": snap.sell1_price, "spread_ticks": quote_meta.get("spread_ticks"), "reason": quote_meta.get("reason")}, True)
+
+
+def order_execution_config(config: dict[str, Any], action: str) -> dict[str, Any]:
+    return config.get("entry_execution", {}) if action == ACTION_ENTRY else config.get("exit_execution", config.get("entry_execution", {}))
+
+
+def build_execution_detail(config: dict[str, Any], action: str, front_order_type: int, quote_meta: dict[str, Any]) -> dict[str, Any]:
+    exe = order_execution_config(config, action)
+    return {"execution_mode": exe.get("mode", "limit_with_timeout"), "limit_mode": exe.get("limit_mode", "marketable_best"), "front_order_type": front_order_type, "limit_price": quote_meta.get("limit_price"), "source_best_bid": quote_meta.get("source_best_bid"), "source_best_ask": quote_meta.get("source_best_ask"), "spread_ticks": quote_meta.get("spread_ticks"), "price_source": quote_meta.get("price_source")}
+
+
+def build_entry_order_payload(config: dict[str, Any], side: str, snap: TickSnapshot) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     is_short = side == SIDE_SELL
-    return {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("margin_entry_exchange", config.get("order_exchange", 9)), "SecurityType": 1, "Side": "1" if is_short else "2", "CashMargin": config.get("entry_cash_margin", 2), "MarginTradeType": config.get("margin_trade_type_short" if is_short else "margin_trade_type_long", 1 if is_short else 3), "DelivType": config.get("entry_deliv_type", 0), "AccountType": config.get("account_type", 4), "Qty": config.get("order_qty", 2), "FrontOrderType": config.get("entry_front_order_type", 10), "Price": config.get("entry_price", 0), "ExpireDay": config.get("expire_day", 0)}
+    limit_price, quote_meta = validate_best_quote(side, ACTION_ENTRY, snap)
+    if limit_price is None:
+        return None, quote_meta
+    front_order_type = 20 if config.get("entry_execution", {}).get("mode") == "limit_with_timeout" else config.get("entry_front_order_type", 20)
+    payload = {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("margin_entry_exchange", config.get("order_exchange", 9)), "SecurityType": 1, "Side": "1" if is_short else "2", "CashMargin": config.get("entry_cash_margin", 2), "MarginTradeType": config.get("margin_trade_type_short" if is_short else "margin_trade_type_long", 1 if is_short else 3), "DelivType": config.get("entry_deliv_type", 0), "AccountType": config.get("account_type", 4), "Qty": config.get("order_qty", 2), "FrontOrderType": front_order_type, "Price": limit_price, "ExpireDay": config.get("expire_day", 0)}
+    quote_meta.update(build_execution_detail(config, ACTION_ENTRY, front_order_type, quote_meta))
+    return payload, quote_meta
 
 
-def build_exit_order_payload(config: dict[str, Any], position: PositionState, qty: Optional[int] = None) -> dict[str, Any]:
+def build_exit_order_payload(config: dict[str, Any], position: PositionState, snap: TickSnapshot, qty: Optional[int] = None) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
     # Credit repayments use CashMargin=3 and either ClosePositionOrder or
     # ClosePositions, never both.  The simple, yaml-compatible default is
     # ClosePositionOrder=0.
     exit_side = "2" if position.side == SIDE_SELL else "1"
-    return {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("exit_order_exchange", 1), "SecurityType": 1, "Side": exit_side, "CashMargin": config.get("exit_cash_margin", 3), "DelivType": config.get("exit_deliv_type", 2), "AccountType": config.get("account_type", 4), "Qty": qty or position.qty, "FrontOrderType": config.get("exit_front_order_type", 10), "Price": config.get("exit_price", 0), "ExpireDay": config.get("expire_day", 0), "ClosePositionOrder": 0}
+    limit_price, quote_meta = validate_best_quote(SIDE_BUY if exit_side == "2" else SIDE_SELL, ACTION_EXIT, snap)
+    if limit_price is None:
+        return None, quote_meta
+    front_order_type = 20 if config.get("exit_execution", {}).get("mode", "limit_with_timeout") == "limit_with_timeout" else config.get("exit_front_order_type", 20)
+    payload = {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("exit_order_exchange", 1), "SecurityType": 1, "Side": exit_side, "CashMargin": config.get("exit_cash_margin", 3), "DelivType": config.get("exit_deliv_type", 2), "AccountType": config.get("account_type", 4), "Qty": qty or position.qty, "FrontOrderType": front_order_type, "Price": limit_price, "ExpireDay": config.get("expire_day", 0), "ClosePositionOrder": 0}
+    quote_meta.update(build_execution_detail(config, ACTION_EXIT, front_order_type, quote_meta))
+    return payload, quote_meta
 
 
 def order_id_from_response(response: Any) -> str:
@@ -795,8 +860,8 @@ def reconcile_positions(config: dict[str, Any], client: KabuApiClient, storage: 
     return pos
 
 
-def wait_order_fill(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, order_id: str, min_qty: float) -> tuple[float, bool]:
-    timeout = float(config.get("entry_execution", {}).get("timeout_sec", 2.0))
+def wait_order_fill(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, order_id: str, min_qty: float, action: str = ACTION_ENTRY) -> tuple[float, bool]:
+    timeout = float(order_execution_config(config, action).get("timeout_sec", 2.0))
     deadline = time.monotonic() + timeout
     last_order: Any = None
     while time.monotonic() <= deadline:
@@ -820,8 +885,22 @@ def confirm_cancel(config: dict[str, Any], client: KabuApiClient, order_id: str)
     return False
 
 
+def refresh_order_snapshot(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, fallback_snap: TickSnapshot) -> TickSnapshot:
+    try:
+        raw = client.get_board(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
+        snap = extract_snapshot(raw)
+        if snap:
+            return snap
+    except Exception as exc:
+        storage.log_structured("WARN", "ORDER_SNAPSHOT_REFRESH_FAILED", {"error": str(exc), "fallback_ts": fallback_snap.ts.isoformat()}, True)
+    return fallback_snap
+
+
 def latency_payload(sig: PendingSignal, extra: dict[str, Any]) -> dict[str, Any]:
     payload = {"signal_bar_ts": sig.signal_bar_ts.isoformat(), "signal_detected_at": sig.features.get("signal_detected_at"), "pending_signal_created_at": sig.features.get("pending_signal_created_at"), "next_bar_first_tick_at": extra.get("next_bar_first_tick_at"), "order_decision_at": extra.get("order_decision_at"), "order_send_started_at": extra.get("order_send_started_at"), "order_response_at": extra.get("order_response_at"), "order_verify_started_at": extra.get("order_verify_started_at"), "order_verify_finished_at": extra.get("order_verify_finished_at"), "position_reconcile_started_at": extra.get("position_reconcile_started_at"), "position_reconcile_finished_at": extra.get("position_reconcile_finished_at"), "db_enqueue_at": now_jst().isoformat(), "signal_to_decision_ms": extra.get("signal_to_decision_ms"), "decision_to_order_send_ms": extra.get("decision_to_order_send_ms"), "order_send_to_response_ms": extra.get("order_send_to_response_ms"), "order_response_to_verify_ms": extra.get("order_response_to_verify_ms"), "signal_to_position_confirm_ms": extra.get("signal_to_position_confirm_ms"), "db_queue_lag_ms": 0, "signal": sig.signal_name, "action": sig.action, "side": sig.side}
+    for key in ("execution_mode", "limit_mode", "front_order_type", "limit_price", "source_best_bid", "source_best_ask", "spread_ticks", "price_source", "reprice_attempt"):
+        if key in extra:
+            payload[key] = extra[key]
     return payload
 
 
@@ -841,33 +920,54 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
     if sig.action == ACTION_EXIT and state.open_position is None:
         storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side}, True)
         return
-    payload = build_entry_order_payload(config, sig.side, snap.price) if sig.action == ACTION_ENTRY else build_exit_order_payload(config, state.open_position, state.open_position.qty if state.open_position else None)
-    send_started = now_jst()
-    response = client.send_order(payload)
-    response_at = now_jst()
-    order_id = order_id_from_response(response)
-    if not order_id:
-        state.recovery_until = now_jst() + timedelta(seconds=30)
-        storage.log_structured("CRITICAL", "ORDER_RESPONSE_MISSING_ORDER_ID", {"response": response, "signal": sig.signal_name}, True)
-        return
-    verify_started = now_jst()
-    min_qty = config.get("entry_min_fill_qty", config.get("order_qty", 1)) if sig.action == ACTION_ENTRY else 1
-    cum_qty, fill_ok = wait_order_fill(config, client, storage, order_id, float(min_qty))
-    verify_finished = now_jst()
-    if not fill_ok and config.get("entry_execution", {}).get("cancel_on_timeout", True):
-        client.cancel_order(order_id)
-        canceled = confirm_cancel(config, client, order_id)
-        storage.log_structured("WARN", "ORDER_CANCEL_AFTER_TIMEOUT", {"order_id": order_id, "cum_qty": cum_qty, "cancel_confirmed": canceled}, True)
-    rec_started = now_jst()
-    pos = reconcile_positions(config, client, storage, state, sig.side if sig.action == ACTION_ENTRY else None, "market_structure_strategy", order_id)
-    rec_finished = now_jst()
-    if sig.action == ACTION_EXIT and (not pos or pos.qty == 0):
-        state.open_position = None
-    elif sig.action == ACTION_ENTRY and fill_ok and not pos:
-        state.recovery_until = now_jst() + timedelta(seconds=60)
-        storage.log_structured("CRITICAL", "POSITION_CONFIRM_FAILED_AFTER_ENTRY_FILL", {"order_id": order_id, "cum_qty": cum_qty}, True)
-    storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response}, ensure_ascii=False, default=str)), True)
-    storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000}), True)
+    exe_cfg = order_execution_config(config, sig.action)
+    max_reprice = int(exe_cfg.get("max_reprice_attempts", 0)) if sig.action == ACTION_EXIT and sig.signal_name in {"HARD_STOP", "FORCE_CLOSE_1520"} else 0
+    attempt = 0
+    current_snap = snap
+    last_latency: dict[str, Any] = {}
+    while True:
+        if sig.action == ACTION_ENTRY:
+            payload, quote_meta = build_entry_order_payload(config, sig.side, current_snap)
+        else:
+            payload, quote_meta = build_exit_order_payload(config, state.open_position, current_snap, state.open_position.qty if state.open_position else None)
+        if payload is None:
+            log_no_valid_best_quote(storage, sig, current_snap, quote_meta)
+            return
+        execution_detail = build_execution_detail(config, sig.action, int(payload["FrontOrderType"]), quote_meta)
+        send_started = now_jst()
+        response = client.send_order(payload)
+        response_at = now_jst()
+        order_id = order_id_from_response(response)
+        if not order_id:
+            state.recovery_until = now_jst() + timedelta(seconds=30)
+            storage.log_structured("CRITICAL", "ORDER_RESPONSE_MISSING_ORDER_ID", {"response": response, "signal": sig.signal_name, **execution_detail}, True)
+            return
+        verify_started = now_jst()
+        min_qty = config.get("entry_min_fill_qty", config.get("order_qty", 1)) if sig.action == ACTION_ENTRY else 1
+        cum_qty, fill_ok = wait_order_fill(config, client, storage, order_id, float(min_qty), sig.action)
+        verify_finished = now_jst()
+        if not fill_ok and exe_cfg.get("cancel_on_timeout", True):
+            client.cancel_order(order_id)
+            canceled = confirm_cancel(config, client, order_id)
+            storage.log_structured("WARN", "ORDER_CANCEL_AFTER_TIMEOUT", {"order_id": order_id, "cum_qty": cum_qty, "cancel_confirmed": canceled, "attempt": attempt, **execution_detail}, True)
+        rec_started = now_jst()
+        pos = reconcile_positions(config, client, storage, state, sig.side if sig.action == ACTION_ENTRY else None, "market_structure_strategy", order_id)
+        rec_finished = now_jst()
+        if sig.action == ACTION_EXIT and (not pos or pos.qty == 0):
+            state.open_position = None
+        elif sig.action == ACTION_ENTRY and fill_ok and not pos:
+            state.recovery_until = now_jst() + timedelta(seconds=60)
+            storage.log_structured("CRITICAL", "POSITION_CONFIRM_FAILED_AFTER_ENTRY_FILL", {"order_id": order_id, "cum_qty": cum_qty, **execution_detail}, True)
+        storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, current_snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response, "execution_detail": execution_detail, "attempt": attempt}, ensure_ascii=False, default=str)), True)
+        last_latency = {"next_bar_first_tick_at": current_snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000, **execution_detail, "reprice_attempt": attempt}
+        if sig.action == ACTION_ENTRY or fill_ok or state.open_position is None or attempt >= max_reprice:
+            break
+        attempt += 1
+        storage.log_structured("WARN", "EXIT_REPRICE_ATTEMPT", {"signal": sig.signal_name, "attempt": attempt, "max_reprice_attempts": max_reprice, "remaining_qty": state.open_position.qty if state.open_position else 0, **execution_detail}, True)
+        current_snap = refresh_order_snapshot(config, client, storage, current_snap)
+    if sig.action == ACTION_EXIT and state.open_position is not None and not fill_ok:
+        storage.log_structured("CRITICAL", "EXIT_REPRICE_EXHAUSTED_POSITION_REMAINS", {"signal": sig.signal_name, "remaining_qty": state.open_position.qty, "max_reprice_attempts": max_reprice}, True)
+    storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, last_latency), True)
 
 
 def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, snap: TickSnapshot) -> None:
@@ -969,10 +1069,10 @@ def main() -> int:
     db_cfg = config.get("async_db_writer", {})
     storage = AsyncDbWriter(db_path, config.get("sqlite", {}), db_cfg.get("max_queue_size", 10000), db_cfg.get("batch_size", 100), db_cfg.get("flush_interval_sec", 0.5))
     storage.log_structured("INFO", "ASYNC_DB_WRITER_STARTED", {"db_path": db_path}, True)
-    startup = {"live_mode": config.get("live_mode"), "strategy_mode": config.get("strategy_mode"), "data_collection_only": config.get("data_collection_only"), "entry_execution": config.get("entry_execution"), "market_structure_strategy": config.get("market_structure_strategy"), "legacy_long_rsi50_enabled": False, "legacy_long_rsi35_enabled": False, "legacy_scalping_enabled": False, "legacy_feature_entries_enabled": False, "legacy_big_trend_enabled": False, "legacy_hold_score_enabled": False}
+    startup = {"live_mode": config.get("live_mode"), "strategy_mode": config.get("strategy_mode"), "data_collection_only": config.get("data_collection_only"), "entry_execution": config.get("entry_execution"), "exit_execution": config.get("exit_execution"), "market_structure_strategy": config.get("market_structure_strategy"), "entry_front_order_type": config.get("entry_front_order_type"), "exit_front_order_type": config.get("exit_front_order_type"), "legacy_long_rsi50_enabled": False, "legacy_long_rsi35_enabled": False, "legacy_scalping_enabled": False, "legacy_feature_entries_enabled": False, "legacy_big_trend_enabled": False, "legacy_hold_score_enabled": False}
     storage.log_structured("INFO", "MARKET_STRUCTURE_ENGINE_STARTED", startup, True)
     storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ENABLED", startup, True)
-    storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", {"orders_enabled": orders_enabled(config), "live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled")}, True)
+    storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", {"orders_enabled": orders_enabled(config), "live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "exit_execution": config.get("exit_execution"), "entry_front_order_type": config.get("entry_front_order_type"), "exit_front_order_type": config.get("exit_front_order_type")}, True)
     storage.log_structured("INFO", "LEGACY_STRATEGIES_DISABLED", {k: startup[k] for k in startup if k.startswith("legacy_")}, True)
     state = RuntimeState()
     client = KabuApiClient(config.get("base_url") or config.get("api_base_url") or API_BASE_DEFAULT, config.get("api_password", ""), config.get("order_password", ""))
