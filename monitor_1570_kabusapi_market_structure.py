@@ -75,10 +75,36 @@ def orders_enabled(config: dict[str, Any]) -> bool:
     )
 
 
+def entry_orders_enabled(config: dict[str, Any], state: RuntimeState, snap: TickSnapshot) -> bool:
+    return bool(
+        config.get("live_mode", False) is True
+        and not is_data_collection_only(config)
+        and config.get("entry_execution", {}).get("enabled") is True
+        and config.get("market_structure_strategy", {}).get("enabled") is True
+        and state.open_position is None
+        and (state.recovery_until is None or now_jst() >= state.recovery_until)
+        and market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00")))
+    )
+
+
+def exit_orders_enabled(config: dict[str, Any], state: RuntimeState, _snap: TickSnapshot) -> bool:
+    return bool(
+        config.get("live_mode", False) is True
+        and not is_data_collection_only(config)
+        and config.get("market_structure_strategy", {}).get("enabled") is True
+        and state.open_position is not None
+    )
+
+
 def market_open_for_new_entry(ts: datetime, cutoff: dtime) -> bool:
     t = ts.timetz().replace(tzinfo=None)
     in_window = (MORNING_START <= t <= MORNING_END) or (AFTERNOON_START <= t <= AFTERNOON_END)
     return in_window and t < cutoff
+
+
+def market_open_for_exit(ts: datetime) -> bool:
+    t = ts.timetz().replace(tzinfo=None)
+    return (MORNING_START <= t <= MORNING_END) or (AFTERNOON_START <= t <= AFTERNOON_END)
 
 
 @dataclass
@@ -806,11 +832,11 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         storage.log_structured("INFO", event, {"ts": decision_at.isoformat(), "reason": "data_collection_only_enabled", "blocked_action": "send_order", "signal": sig.signal_name, "side": sig.side, "price": snap.price, "strategy": "market_structure_strategy"}, True)
         storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000}), True)
         return
-    if not orders_enabled(config):
-        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "signal": sig.signal_name, "action": sig.action}, True)
+    if sig.action == ACTION_ENTRY and not entry_orders_enabled(config, state, snap):
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
         return
-    if sig.action == ACTION_ENTRY and (state.open_position is not None or state.recovery_until and now_jst() < state.recovery_until):
-        storage.log_structured("WARN", "ENTRY_BLOCKED_BY_POSITION_OR_RECOVERY", {"has_open_position": state.open_position is not None, "recovery_until": iso_dt(state.recovery_until)}, True)
+    if sig.action == ACTION_EXIT and not exit_orders_enabled(config, state, snap):
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "signal": sig.signal_name, "action": sig.action}, True)
         return
     if sig.action == ACTION_EXIT and state.open_position is None:
         storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side}, True)
@@ -848,13 +874,30 @@ def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage
     sig = state.pending_signal
     if not sig or snap.ts < sig.execute_not_before_minute:
         return
-    if state.open_position or state.last_entry_bar_ts == sig.signal_bar_ts:
-        state.pending_signal = None
-        return
-    if not market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))):
-        state.pending_signal = None
-        storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_EXPIRED", {"signal": sig.signal_name, "bar_ts": sig.signal_bar_ts.isoformat(), "reason": "outside_entry_window"})
-        return
+    if sig.action == ACTION_ENTRY:
+        if state.open_position is not None:
+            storage.log_structured("WARN", "ENTRY_BLOCKED_BY_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side, "signal_bar_ts": sig.signal_bar_ts.isoformat()}, True)
+            state.pending_signal = None
+            return
+        if state.last_entry_bar_ts == sig.signal_bar_ts:
+            storage.log_structured("WARN", "ENTRY_BLOCKED_BY_SAME_BAR_DUPLICATE", {"signal": sig.signal_name, "side": sig.side, "signal_bar_ts": sig.signal_bar_ts.isoformat()}, True)
+            state.pending_signal = None
+            return
+        if not market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))):
+            state.pending_signal = None
+            storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_EXPIRED", {"signal": sig.signal_name, "action": sig.action, "bar_ts": sig.signal_bar_ts.isoformat(), "reason": "outside_entry_window"}, True)
+            return
+    elif sig.action == ACTION_EXIT:
+        if state.open_position is None:
+            storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side, "signal_bar_ts": sig.signal_bar_ts.isoformat()}, True)
+            state.pending_signal = None
+            return
+        # EXITには新規IN用の15:10 cutoffを適用しない。取引可能時間外は
+        # 通常EXITだけ止めるが、FORCE_CLOSE_1520 / HARD_STOPは即時経路で処理する。
+        if not market_open_for_exit(snap.ts) and sig.signal_name not in {"FORCE_CLOSE_1520", "HARD_STOP"}:
+            storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_EXPIRED", {"signal": sig.signal_name, "action": sig.action, "bar_ts": sig.signal_bar_ts.isoformat(), "reason": "outside_exit_window"}, True)
+            state.pending_signal = None
+            return
     execute_signal_order(config, client, storage, state, sig, snap)
     if sig.action == ACTION_ENTRY:
         state.last_entry_bar_ts = sig.signal_bar_ts
@@ -872,10 +915,12 @@ def check_hard_stop_and_force_close(config: dict[str, Any], client: KabuApiClien
     if not (hard or force):
         return
     reason = "HARD_STOP" if hard else "FORCE_CLOSE_1520"
-    if not orders_enabled(config):
+    if not exit_orders_enabled(config, state, snap):
         storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"reason": reason, "side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "current_price": snap.price}, True)
         if is_data_collection_only(config):
             storage.log_structured("INFO", "DATA_COLLECTION_ONLY_EXIT_BLOCKED", {"reason": reason, "blocked_action": "send_order", "side": SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, "price": snap.price, "strategy": pos.strategy}, True)
+        else:
+            storage.log_structured("WARN", "EXIT_BLOCKED_BY_RUNTIME_GUARD", {"reason": reason, "live_mode": config.get("live_mode"), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None}, True)
         return
     sig = PendingSignal(signal_bar_ts=snap.ts, execute_not_before_minute=snap.ts, side=SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, action=ACTION_EXIT, signal_name=reason, reason=reason, features={"signal_detected_at": now_jst().isoformat(), "pending_signal_created_at": now_jst().isoformat()})
     execute_signal_order(config, client, storage, state, sig, snap)
