@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""1570 market-structure-only monitor.
+
+合言葉: 戦略は単純化 / 執行・安全装置は維持 / DBは後追い記録 / 判断はメモリで即時実行。
+
+This engine intentionally excludes the legacy RSI50/RSI35/scalping/feature-entry
+execution paths.  It keeps market-data collection, operational safety wrappers,
+and asynchronous DB logging while evaluating only `market_structure_strategy`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import queue
+import sqlite3
+import statistics
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, time as dtime, timezone
+from pathlib import Path
+from typing import Any, Deque, Optional
+
+JST = timezone(timedelta(hours=9))
+API_BASE_DEFAULT = "http://localhost:18080/kabusapi"
+SIDE_BUY = "BUY"
+SIDE_SELL = "SELL"
+ACTION_ENTRY = "ENTRY"
+ACTION_EXIT = "EXIT"
+MORNING_START = dtime(9, 0)
+MORNING_END = dtime(11, 25)
+AFTERNOON_START = dtime(12, 30)
+AFTERNOON_END = dtime(15, 20)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def parse_hms(value: str) -> dtime:
+    h, m, s = [int(x) for x in value.split(":")]
+    return dtime(h, m, s)
+
+
+def floor_minute(ts: datetime, minutes: int = 1) -> datetime:
+    minute = (ts.minute // minutes) * minutes
+    return ts.replace(minute=minute, second=0, microsecond=0)
+
+
+def iso_dt(value: Any) -> Optional[str]:
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def tick_size_for_1570(price: float) -> float:
+    # 1570 normally trades in 10-yen ticks in the target price band; keep a
+    # conservative fallback for lower test prices.
+    return 10.0 if price >= 3000 else 1.0
+
+
+def is_data_collection_only(config: dict[str, Any]) -> bool:
+    cfg = config.get("data_collection_only", {})
+    return bool(isinstance(cfg, dict) and cfg.get("enabled", False))
+
+
+def orders_enabled(config: dict[str, Any]) -> bool:
+    return bool(
+        config.get("live_mode", False)
+        and not is_data_collection_only(config)
+        and config.get("entry_execution", {}).get("enabled", False)
+    )
+
+
+def market_open_for_new_entry(ts: datetime, cutoff: dtime) -> bool:
+    t = ts.timetz().replace(tzinfo=None)
+    in_window = (MORNING_START <= t <= MORNING_END) or (AFTERNOON_START <= t <= AFTERNOON_END)
+    return in_window and t < cutoff
+
+
+@dataclass
+class TickSnapshot:
+    ts: datetime
+    price: float
+    sell1_price: Optional[float] = None
+    sell1_qty: Optional[float] = None
+    buy1_price: Optional[float] = None
+    buy1_qty: Optional[float] = None
+    volume: Optional[float] = None
+    vwap: Optional[float] = None
+    buy_depth_10: Optional[float] = None
+    sell_depth_10: Optional[float] = None
+    ws_seq: Optional[int] = None
+
+
+@dataclass
+class Bar:
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    vwap: Optional[float] = None
+    snapshots: int = 0
+    ma5: Optional[float] = None
+    ma13: Optional[float] = None
+    ema13: Optional[float] = None
+    ma25: Optional[float] = None
+    ma75: Optional[float] = None
+    rsi9: Optional[float] = None
+
+
+@dataclass
+class PendingSignal:
+    signal_bar_ts: datetime
+    execute_not_before_minute: datetime
+    side: str
+    action: str
+    signal_name: str
+    reason: str
+    features: dict[str, Any]
+
+
+@dataclass
+class PositionState:
+    side: str
+    qty: int
+    entry_price: float
+    strategy: str
+    entry_ts: datetime
+
+
+@dataclass
+class RuntimeState:
+    bars_1m_buffer: Deque[Bar] = field(default_factory=lambda: deque(maxlen=180))
+    bars_3m_buffer: Deque[Bar] = field(default_factory=lambda: deque(maxlen=180))
+    market_structure_feature_buffer: Deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=180))
+    snapshot_buffer: Deque[TickSnapshot] = field(default_factory=lambda: deque(maxlen=2000))
+    pending_signal: Optional[PendingSignal] = None
+    open_position: Optional[PositionState] = None
+    last_entry_bar_ts: Optional[datetime] = None
+    recovery_until: Optional[datetime] = None
+    force_close_logged: bool = False
+    rest_fallback_count: int = 0
+
+
+class AsyncDbWriter:
+    def __init__(self, db_path: str, sqlite_cfg: dict[str, Any], max_queue_size: int = 10000, batch_size: int = 100, flush_interval_sec: float = 0.5):
+        self.db_path = db_path
+        self.sqlite_cfg = sqlite_cfg
+        self.batch_size = int(batch_size)
+        self.flush_interval_sec = float(flush_interval_sec)
+        self.q: queue.Queue[tuple[str, Any, bool]] = queue.Queue(maxsize=int(max_queue_size))
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="AsyncDbWriter", daemon=True)
+        self.thread.start()
+
+    def enqueue(self, op: str, payload: Any, important: bool = False) -> bool:
+        try:
+            self.q.put_nowait((op, payload, important))
+            return True
+        except queue.Full:
+            if important:
+                self.q.put((op, payload, important), timeout=1.0)
+                return True
+            return False
+
+    def log_structured(self, level: str, event_type: str, payload: dict[str, Any], important: bool = False) -> None:
+        self.enqueue("structured", {"ts": now_jst().isoformat(), "level": level, "event_type": event_type, "payload": payload}, important)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=5)
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.db_path, timeout=max(1.0, self.sqlite_cfg.get("busy_timeout_ms", 3000) / 1000.0))
+        con.execute(f"PRAGMA journal_mode={self.sqlite_cfg.get('journal_mode', 'WAL')}")
+        con.execute(f"PRAGMA synchronous={self.sqlite_cfg.get('synchronous', 'NORMAL')}")
+        con.execute(f"PRAGMA busy_timeout={int(self.sqlite_cfg.get('busy_timeout_ms', 3000))}")
+        con.execute(f"PRAGMA temp_store={self.sqlite_cfg.get('temp_store', 'MEMORY')}")
+        con.execute(f"PRAGMA wal_autocheckpoint={int(self.sqlite_cfg.get('wal_autocheckpoint', 1000))}")
+        self._init_schema(con)
+        return con
+
+    def _init_schema(self, con: sqlite3.Connection) -> None:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS structured_events(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, level TEXT, event_type TEXT, payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS execution_facts(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, event_type TEXT, side TEXT, qty REAL, price REAL, order_id TEXT, payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS paper_trades(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, side TEXT, qty REAL, price REAL, reason TEXT, payload_json TEXT
+            );
+            CREATE TABLE IF NOT EXISTS bars_1m(
+              ts TEXT PRIMARY KEY, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
+              ma5 REAL, ma13 REAL, ema13 REAL, ma25 REAL, ma75 REAL, rsi9 REAL
+            );
+            CREATE TABLE IF NOT EXISTS bars_3m(
+              ts TEXT PRIMARY KEY, open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL
+            );
+            CREATE TABLE IF NOT EXISTS market_structure_features_1m(
+              ts TEXT PRIMARY KEY, symbol TEXT, session TEXT,
+              open REAL, high REAL, low REAL, close REAL, volume REAL, vwap REAL,
+              ma5 REAL, ma13 REAL, ema13 REAL, ma25 REAL, ma75 REAL, rsi9 REAL,
+              high_prev_3m REAL, low_prev_3m REAL, high_prev_5m REAL, low_prev_5m REAL,
+              high_prev_10m REAL, low_prev_10m REAL, high_prev_20m REAL, low_prev_20m REAL,
+              high_prev_30m REAL, low_prev_30m REAL, high_prev_60m REAL, low_prev_60m REAL,
+              break_high_3m INTEGER, break_low_3m INTEGER, break_high_5m INTEGER, break_low_5m INTEGER,
+              break_high_10m INTEGER, break_low_10m INTEGER, break_high_20m INTEGER, break_low_20m INTEGER,
+              break_high_30m INTEGER, break_low_30m INTEGER, break_high_60m INTEGER, break_low_60m INTEGER,
+              failed_break_high_5m INTEGER, failed_break_low_5m INTEGER, failed_break_high_20m INTEGER, failed_break_low_20m INTEGER,
+              range_pos_3m REAL, range_pos_5m REAL, range_pos_10m REAL, range_pos_20m REAL, range_pos_30m REAL, range_pos_60m REAL,
+              day_high_before REAL, day_low_before REAL, day_high_so_far REAL, day_low_so_far REAL,
+              day_range_pos REAL, break_day_high INTEGER, break_day_low INTEGER, failed_break_day_high INTEGER, failed_break_day_low INTEGER,
+              distance_to_day_high_ticks REAL, distance_to_day_low_ticks REAL,
+              opening_high_5m REAL, opening_low_5m REAL, opening_high_10m REAL, opening_low_10m REAL,
+              opening_range_width_5m REAL, opening_range_width_10m REAL,
+              break_opening_high_5m INTEGER, break_opening_low_5m INTEGER, break_opening_high_10m INTEGER, break_opening_low_10m INTEGER,
+              failed_break_opening_high_5m INTEGER, failed_break_opening_low_5m INTEGER, failed_break_opening_high_10m INTEGER, failed_break_opening_low_10m INTEGER,
+              afternoon_open_high_5m REAL, afternoon_open_low_5m REAL, afternoon_open_high_10m REAL, afternoon_open_low_10m REAL,
+              afternoon_open_range_width_5m REAL, afternoon_open_range_width_10m REAL,
+              break_afternoon_open_high_5m INTEGER, break_afternoon_open_low_5m INTEGER, break_afternoon_open_high_10m INTEGER, break_afternoon_open_low_10m INTEGER,
+              failed_break_afternoon_open_high_5m INTEGER, failed_break_afternoon_open_low_5m INTEGER, failed_break_afternoon_open_high_10m INTEGER, failed_break_afternoon_open_low_10m INTEGER,
+              volume_delta_1m REAL, volume_delta_3m REAL, volume_median_20m REAL, volume_ratio_1m REAL, volume_ratio_3m REAL, volume_z_20m REAL,
+              price_change_1m REAL, price_change_3m REAL, price_change_5m REAL, price_change_10m REAL, price_change_20m REAL, price_change_30m REAL, price_change_60m REAL,
+              volume_price_efficiency_1m REAL, volume_price_efficiency_3m REAL, volume_price_efficiency_5m REAL,
+              rsi9_slope_1m REAL, rsi9_slope_3m REAL, ma5_slope_3m REAL, ma25_slope_5m REAL, ema13_slope_4m REAL,
+              close_above_ma5 INTEGER, close_above_ma25 INTEGER, close_above_ma75 INTEGER, close_above_vwap INTEGER,
+              buy_depth_10 REAL, sell_depth_10 REAL, spread_ticks REAL, obi_l1 REAL, obi_l3 REAL, obi_l10 REAL, obi_l3_delta_3m REAL, obi_l10_delta_3m REAL, microprice REAL, micro_gap_ticks REAL,
+              raw_context_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_structure_features_1m_ts ON market_structure_features_1m(ts);
+            CREATE TABLE IF NOT EXISTS market_structure_signal_candidates(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT, signal_name TEXT, side TEXT, action TEXT,
+              confidence REAL, reason TEXT, blocked_by_data_collection_only INTEGER, feature_json TEXT,
+              UNIQUE(ts, signal_name)
+            );
+            """
+        )
+        con.commit()
+
+    def _run(self) -> None:
+        con = self._connect()
+        batch: list[tuple[str, Any, bool]] = []
+        last_flush = time.monotonic()
+        while not self.stop_event.is_set() or not self.q.empty() or batch:
+            timeout = max(0.05, self.flush_interval_sec - (time.monotonic() - last_flush))
+            try:
+                batch.append(self.q.get(timeout=timeout))
+            except queue.Empty:
+                pass
+            if batch and (len(batch) >= self.batch_size or time.monotonic() - last_flush >= self.flush_interval_sec or self.stop_event.is_set()):
+                self._flush(con, batch)
+                batch.clear()
+                last_flush = time.monotonic()
+        con.close()
+
+    def _flush(self, con: sqlite3.Connection, batch: list[tuple[str, Any, bool]]) -> None:
+        for op, p, _important in batch:
+            if op == "structured":
+                con.execute("INSERT INTO structured_events(ts,level,event_type,payload_json) VALUES(?,?,?,?)", (p["ts"], p["level"], p["event_type"], json.dumps(p["payload"], ensure_ascii=False, default=str)))
+            elif op == "bar1":
+                con.execute("INSERT OR REPLACE INTO bars_1m VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", p)
+            elif op == "bar3":
+                con.execute("INSERT OR REPLACE INTO bars_3m VALUES(?,?,?,?,?,?,?)", p)
+            elif op == "feature":
+                keys = list(p.keys())
+                con.execute(f"INSERT OR REPLACE INTO market_structure_features_1m({','.join(keys)}) VALUES({','.join(['?']*len(keys))})", [p[k] for k in keys])
+            elif op == "candidate":
+                con.execute("INSERT OR IGNORE INTO market_structure_signal_candidates(ts,symbol,signal_name,side,action,confidence,reason,blocked_by_data_collection_only,feature_json) VALUES(?,?,?,?,?,?,?,?,?)", p)
+            elif op == "execution":
+                con.execute("INSERT INTO execution_facts(ts,event_type,side,qty,price,order_id,payload_json) VALUES(?,?,?,?,?,?,?)", p)
+        con.commit()
+
+
+class KabuApiClient:
+    def __init__(self, base_url: str, api_password: str, order_password: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_password = api_password
+        self.order_password = order_password
+        self.token: Optional[str] = None
+
+    def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None, timeout: float = 5.0) -> Any:
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.base_url + path, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        if self.token:
+            req.add_header("X-API-KEY", self.token)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+
+    def get_token(self) -> str:
+        res = self._request("POST", "/token", {"APIPassword": self.api_password})
+        self.token = str(res.get("Token") or res.get("token") or "")
+        if not self.token:
+            raise RuntimeError("kabu API token response did not include Token")
+        return self.token
+
+    def register_symbol(self, symbol: str, exchange: int) -> Any:
+        return self._request("PUT", "/register", {"Symbols": [{"Symbol": symbol, "Exchange": exchange}]})
+
+    def get_board(self, symbol: str, exchange: int) -> Any:
+        return self._request("GET", f"/board/{symbol}@{exchange}")
+
+    def send_order(self, payload: dict[str, Any]) -> Any:
+        return self._request("POST", "/sendorder", payload)
+
+    def cancel_order(self, order_id: str) -> Any:
+        return self._request("PUT", "/cancelorder", {"OrderId": order_id, "Password": self.order_password})
+
+    def get_positions(self, symbol: str) -> Any:
+        return self._request("GET", f"/positions?symbol={symbol}")
+
+    def get_orders(self, symbol: str) -> Any:
+        return self._request("GET", f"/orders?symbol={symbol}")
+
+
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_snapshot(raw: dict[str, Any], ws_seq: Optional[int] = None) -> Optional[TickSnapshot]:
+    price = _to_float(raw.get("CurrentPrice") or raw.get("Price") or raw.get("price"))
+    if price is None:
+        return None
+    ts_raw = raw.get("CurrentPriceTime") or raw.get("Time") or raw.get("ts")
+    if ts_raw:
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).astimezone(JST)
+        except ValueError:
+            ts = now_jst()
+    else:
+        ts = now_jst()
+    buy_depth_10 = sell_depth_10 = 0.0
+    buy1p = buy1q = sell1p = sell1q = None
+    for i in range(1, 11):
+        b = raw.get(f"Buy{i}") or {}
+        s = raw.get(f"Sell{i}") or {}
+        bp = _to_float(b.get("Price") if isinstance(b, dict) else None)
+        bq = _to_float(b.get("Qty") if isinstance(b, dict) else None)
+        sp = _to_float(s.get("Price") if isinstance(s, dict) else None)
+        sq = _to_float(s.get("Qty") if isinstance(s, dict) else None)
+        if i == 1:
+            buy1p, buy1q, sell1p, sell1q = bp, bq, sp, sq
+        buy_depth_10 += bq or 0.0
+        sell_depth_10 += sq or 0.0
+    return TickSnapshot(ts=ts, price=price, buy1_price=buy1p, buy1_qty=buy1q, sell1_price=sell1p, sell1_qty=sell1q, volume=_to_float(raw.get("TradingVolume")), vwap=_to_float(raw.get("VWAP")), buy_depth_10=buy_depth_10 or None, sell_depth_10=sell_depth_10 or None, ws_seq=ws_seq)
+
+
+class WebSocketMarketDataFeed:
+    def __init__(self, config: dict[str, Any], symbol: str, exchange: int, storage: AsyncDbWriter):
+        self.config = config
+        self.symbol = symbol
+        self.exchange = exchange
+        self.storage = storage
+        self._queue: Deque[TickSnapshot] = deque(maxlen=int(config.get("market_data_source", {}).get("ws_queue_maxlen", 5000)))
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._ws_seq = 0
+        self._latest: Optional[TickSnapshot] = None
+        self.available = False
+        self.last_error = ""
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        try:
+            import websocket  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.last_error = f"WEBSOCKET_MODULE_UNAVAILABLE: {exc}"
+            self.storage.log_structured("WARN", "WEBSOCKET_MARKET_DATA_UNAVAILABLE", {"reason": self.last_error}, True)
+            return
+        url = str(self.config.get("websocket_url") or "ws://localhost:18080/kabusapi/websocket")
+        def run() -> None:
+            def on_message(_ws: Any, message: str) -> None:
+                try:
+                    raw = json.loads(message)
+                    with self._lock:
+                        self._ws_seq += 1
+                        seq = self._ws_seq
+                    snap = extract_snapshot(raw, seq)
+                    if snap:
+                        with self._lock:
+                            self._latest = snap
+                            self._queue.append(snap)
+                            self.available = True
+                            self._event.set()
+                except Exception as exc:
+                    self.last_error = str(exc)
+            def on_error(_ws: Any, error: Any) -> None:
+                self.available = False
+                self.last_error = str(error)
+            def on_close(_ws: Any, *_args: Any) -> None:
+                self.available = False
+            ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error, on_close=on_close)
+            while not self._stop.is_set():
+                try:
+                    ws.run_forever(ping_interval=20, ping_timeout=5)
+                except Exception as exc:
+                    self.last_error = str(exc)
+                self.available = False
+                time.sleep(1)
+        self._thread = threading.Thread(target=run, name="WebSocketMarketDataFeed", daemon=True)
+        self._thread.start()
+        self.storage.log_structured("INFO", "WEBSOCKET_MARKET_DATA_START", {"symbol": self.symbol, "exchange": self.exchange}, True)
+
+    def drain_snapshots_after(self, last_ws_seq: Optional[int]) -> list[TickSnapshot]:
+        with self._lock:
+            items = list(self._queue)
+            self._queue.clear()
+            self._event.clear()
+        out = [s for s in items if last_ws_seq is None or (s.ws_seq is not None and s.ws_seq > last_ws_seq)]
+        out.sort(key=lambda s: (s.ws_seq or 0, s.ts))
+        return out
+
+    def wait_for_data(self, timeout_sec: float) -> bool:
+        return self._event.wait(timeout=timeout_sec)
+
+    def latest_snapshot(self) -> Optional[TickSnapshot]:
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+class RollingBars:
+    def __init__(self, minutes: int):
+        self.minutes = minutes
+        self.current: Optional[Bar] = None
+
+    def update(self, snap: TickSnapshot) -> Optional[Bar]:
+        bucket = floor_minute(snap.ts, self.minutes)
+        if self.current is None:
+            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume or 0.0, snap.vwap, 1)
+            return None
+        if bucket > self.current.ts:
+            finished = self.current
+            self.current = Bar(bucket, snap.price, snap.price, snap.price, snap.price, snap.volume or 0.0, snap.vwap, 1)
+            return finished
+        self.current.high = max(self.current.high, snap.price)
+        self.current.low = min(self.current.low, snap.price)
+        self.current.close = snap.price
+        self.current.volume += snap.volume or 0.0
+        self.current.vwap = snap.vwap if snap.vwap is not None else self.current.vwap
+        self.current.snapshots += 1
+        return None
+
+    def force_finalize_completed_bucket(self, now_ts: datetime, finalize_delay_ms: int) -> Optional[Bar]:
+        if self.current is None:
+            return None
+        end_ts = self.current.ts + timedelta(minutes=self.minutes, milliseconds=finalize_delay_ms)
+        if now_ts >= end_ts:
+            finished = self.current
+            self.current = None
+            return finished
+        return None
+
+
+def simple_ma(values: list[float], period: int) -> Optional[float]:
+    return sum(values[-period:]) / period if len(values) >= period else None
+
+
+def ema(values: list[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def rsi_wilder(values: list[float], period: int = 9) -> Optional[float]:
+    if len(values) <= period:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for a, b in zip(values, values[1:]):
+        d = b - a
+        gains.append(max(d, 0.0)); losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def decorate_bar(bar: Bar, history: Deque[Bar]) -> None:
+    closes = [b.close for b in history] + [bar.close]
+    bar.ma5 = simple_ma(closes, 5)
+    bar.ma13 = simple_ma(closes, 13)
+    bar.ema13 = ema(closes, 13)
+    bar.ma25 = simple_ma(closes, 25)
+    bar.ma75 = simple_ma(closes, 75)
+    bar.rsi9 = rsi_wilder(closes, 9)
+
+
+def prev_high_low(history: list[Bar], n: int) -> tuple[Optional[float], Optional[float]]:
+    bars = history[-n:] if len(history) >= n else []
+    if not bars:
+        return None, None
+    return max(b.high for b in bars), min(b.low for b in bars)
+
+
+def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+
+
+def board_context(snap: Optional[TickSnapshot], features: Deque[dict[str, Any]]) -> dict[str, Any]:
+    if not snap:
+        return {"buy_depth_10": None, "sell_depth_10": None, "spread_ticks": None, "obi_l10": None, "obi_l10_delta_3m": None, "microprice": None, "micro_gap_ticks": None}
+    tick = tick_size_for_1570(snap.price)
+    buy10 = snap.buy_depth_10
+    sell10 = snap.sell_depth_10
+    obi10 = safe_div((buy10 or 0) - (sell10 or 0), (buy10 or 0) + (sell10 or 0)) if buy10 is not None and sell10 is not None else None
+    prev_obi = features[-3].get("obi_l10") if len(features) >= 3 else None
+    bid = snap.buy1_price; ask = snap.sell1_price; bq = snap.buy1_qty; aq = snap.sell1_qty
+    micro = gap = spread = None
+    if bid is not None and ask is not None:
+        spread = (ask - bid) / tick
+        mid = (ask + bid) / 2
+        if bq and aq and bq + aq:
+            micro = (ask * bq + bid * aq) / (bq + aq)
+            gap = (micro - mid) / tick
+    return {"buy_depth_10": buy10, "sell_depth_10": sell10, "spread_ticks": spread, "obi_l10": obi10, "obi_l10_delta_3m": (obi10 - prev_obi) if obi10 is not None and prev_obi is not None else None, "microprice": micro, "micro_gap_ticks": gap}
+
+
+def session_name(ts: datetime) -> str:
+    t = ts.timetz().replace(tzinfo=None)
+    if MORNING_START <= t <= MORNING_END:
+        return "morning"
+    if AFTERNOON_START <= t <= AFTERNOON_END:
+        return "afternoon"
+    return "off_session"
+
+
+def opening_range(history_with_current: list[Bar], start: dtime, minutes: int, current_ts: datetime) -> tuple[Optional[float], Optional[float]]:
+    complete_at = (datetime.combine(current_ts.date(), start, JST) + timedelta(minutes=minutes)).timetz().replace(tzinfo=None)
+    if current_ts.timetz().replace(tzinfo=None) < complete_at:
+        return None, None
+    bars = [b for b in history_with_current if b.ts.date() == current_ts.date() and start <= b.ts.timetz().replace(tzinfo=None) < complete_at]
+    if len(bars) < minutes:
+        return None, None
+    return max(b.high for b in bars), min(b.low for b in bars)
+
+
+def compute_market_structure_features(symbol: str, bar: Bar, state: RuntimeState, latest_snap: Optional[TickSnapshot]) -> dict[str, Any]:
+    history = list(state.bars_1m_buffer)  # excludes current until caller appends later
+    hist_current = history + [bar]
+    closes = [b.close for b in hist_current]
+    vols_prev = [b.volume for b in history[-20:]]
+    vol_median = statistics.median(vols_prev) if vols_prev else None
+    vol3 = sum(b.volume for b in hist_current[-3:]) if hist_current else None
+    day_bars_before = [b for b in history if b.ts.date() == bar.ts.date()]
+    day_bars_so_far = day_bars_before + [bar]
+    f: dict[str, Any] = {"ts": bar.ts.isoformat(), "symbol": symbol, "session": session_name(bar.ts), "open": bar.open, "high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume, "vwap": bar.vwap, "ma5": bar.ma5, "ma13": bar.ma13, "ema13": bar.ema13, "ma25": bar.ma25, "ma75": bar.ma75, "rsi9": bar.rsi9}
+    for n in [3,5,10,20,30,60]:
+        hi, lo = prev_high_low(history, n)
+        f[f"high_prev_{n}m"] = hi; f[f"low_prev_{n}m"] = lo
+        f[f"break_high_{n}m"] = int(hi is not None and bar.close > hi)
+        f[f"break_low_{n}m"] = int(lo is not None and bar.close < lo)
+        f[f"range_pos_{n}m"] = safe_div(bar.close - lo, hi - lo) if hi is not None and lo is not None and hi != lo else None
+        f[f"price_change_{n}m"] = bar.close - history[-n].close if len(history) >= n else None
+    for n in [5,20]:
+        hi = f.get(f"high_prev_{n}m"); lo = f.get(f"low_prev_{n}m")
+        f[f"failed_break_high_{n}m"] = int(hi is not None and bar.high > hi and bar.close <= hi)
+        f[f"failed_break_low_{n}m"] = int(lo is not None and bar.low < lo and bar.close >= lo)
+    day_high_before = max((b.high for b in day_bars_before), default=None)
+    day_low_before = min((b.low for b in day_bars_before), default=None)
+    day_high = max(b.high for b in day_bars_so_far); day_low = min(b.low for b in day_bars_so_far)
+    f.update({"day_high_before": day_high_before, "day_low_before": day_low_before, "day_high_so_far": day_high, "day_low_so_far": day_low,
+              "day_range_pos": safe_div(bar.close - day_low, day_high - day_low) if day_high != day_low else None,
+              "break_day_high": int(day_high_before is not None and bar.close > day_high_before), "break_day_low": int(day_low_before is not None and bar.close < day_low_before),
+              "failed_break_day_high": int(day_high_before is not None and bar.high > day_high_before and bar.close <= day_high_before),
+              "failed_break_day_low": int(day_low_before is not None and bar.low < day_low_before and bar.close >= day_low_before),
+              "distance_to_day_high_ticks": safe_div(day_high_before - bar.close, tick_size_for_1570(bar.close)) if day_high_before else None,
+              "distance_to_day_low_ticks": safe_div(bar.close - day_low_before, tick_size_for_1570(bar.close)) if day_low_before else None})
+    for prefix, start in [("opening", MORNING_START), ("afternoon_open", AFTERNOON_START)]:
+        for n in [5,10]:
+            hi, lo = opening_range(hist_current, start, n, bar.ts)
+            f[f"{prefix}_high_{n}m"] = hi; f[f"{prefix}_low_{n}m"] = lo; f[f"{prefix}_range_width_{n}m"] = (hi - lo) if hi is not None and lo is not None else None
+            f[f"break_{prefix}_high_{n}m"] = int(hi is not None and bar.close > hi)
+            f[f"break_{prefix}_low_{n}m"] = int(lo is not None and bar.close < lo)
+            f[f"failed_break_{prefix}_high_{n}m"] = int(hi is not None and bar.high > hi and bar.close <= hi)
+            f[f"failed_break_{prefix}_low_{n}m"] = int(lo is not None and bar.low < lo and bar.close >= lo)
+    f.update({"volume_delta_1m": bar.volume, "volume_delta_3m": vol3, "volume_median_20m": vol_median,
+              "volume_ratio_1m": safe_div(bar.volume, vol_median), "volume_ratio_3m": safe_div(vol3, (vol_median * 3) if vol_median else None)})
+    if vols_prev and len(vols_prev) > 1:
+        sd = statistics.pstdev(vols_prev)
+        f["volume_z_20m"] = safe_div(bar.volume - statistics.mean(vols_prev), sd) if sd else None
+    else:
+        f["volume_z_20m"] = None
+    f["price_change_1m"] = bar.close - history[-1].close if history else None
+    f["volume_price_efficiency_1m"] = abs(f["price_change_1m"]) / max(bar.volume, 1) if f["price_change_1m"] is not None else None
+    f["volume_price_efficiency_3m"] = abs(f["price_change_3m"]) / max(vol3 or 0, 1) if f.get("price_change_3m") is not None else None
+    f["volume_price_efficiency_5m"] = abs(f["price_change_5m"]) / max(sum(b.volume for b in hist_current[-5:]), 1) if f.get("price_change_5m") is not None else None
+    f["rsi9_slope_1m"] = bar.rsi9 - history[-1].rsi9 if history and bar.rsi9 is not None and history[-1].rsi9 is not None else None
+    f["rsi9_slope_3m"] = bar.rsi9 - history[-3].rsi9 if len(history) >= 3 and bar.rsi9 is not None and history[-3].rsi9 is not None else None
+    f["ma5_slope_3m"] = bar.ma5 - history[-3].ma5 if len(history) >= 3 and bar.ma5 is not None and history[-3].ma5 is not None else None
+    f["ma25_slope_5m"] = bar.ma25 - history[-5].ma25 if len(history) >= 5 and bar.ma25 is not None and history[-5].ma25 is not None else None
+    f["ema13_slope_4m"] = bar.ema13 - history[-4].ema13 if len(history) >= 4 and bar.ema13 is not None and history[-4].ema13 is not None else None
+    f["close_above_ma5"] = int(bar.ma5 is not None and bar.close > bar.ma5); f["close_above_ma25"] = int(bar.ma25 is not None and bar.close > bar.ma25); f["close_above_ma75"] = int(bar.ma75 is not None and bar.close > bar.ma75); f["close_above_vwap"] = int(bar.vwap is not None and bar.close > bar.vwap)
+    f.update(board_context(latest_snap, state.market_structure_feature_buffer))
+    f["obi_l1"] = None; f["obi_l3"] = None; f["obi_l3_delta_3m"] = None
+    f["raw_context_json"] = json.dumps({"signed_volume_price_efficiency_1m": safe_div(f.get("price_change_1m"), max(bar.volume, 1)), "current_bar_excluded_from_prev_ranges": True}, ensure_ascii=False)
+    return f
+
+
+def evaluate_market_structure_strategy(feature: dict[str, Any], cfg: dict[str, Any], state: RuntimeState) -> tuple[list[dict[str, Any]], Optional[PendingSignal]]:
+    strategy = cfg.get("market_structure_strategy", {})
+    if not strategy.get("enabled", True):
+        return [], None
+    candidates: list[dict[str, Any]] = []
+    pending: Optional[PendingSignal] = None
+    close = feature.get("close"); ma5 = feature.get("ma5"); ma25 = feature.get("ma25"); rsi9 = feature.get("rsi9"); volr = feature.get("volume_ratio_1m")
+    low5 = feature.get("low_prev_5m"); high5 = feature.get("high_prev_5m"); high10 = feature.get("high_prev_10m"); high20 = feature.get("high_prev_20m"); vwap = feature.get("vwap")
+    short_cfg = strategy.get("short", {})
+    long_cfg = strategy.get("long", {})
+    def add(name: str, side: str, reason: str, confidence: float = 1.0) -> None:
+        candidates.append({"ts": feature["ts"], "symbol": feature.get("symbol"), "signal_name": name, "side": side, "action": "LOG_ONLY" if is_data_collection_only(cfg) else "PENDING", "confidence": confidence, "reason": reason, "feature_json": json.dumps(feature, ensure_ascii=False, default=str)})
+    short_allowed = bool(strategy.get("allow_short", True) and short_cfg.get("enabled", True) and close is not None and low5 is not None and ma5 is not None and ma25 is not None and rsi9 is not None and volr is not None and close < low5 and close < ma5 and close < ma25 and rsi9 < float(short_cfg.get("rsi9_max", 50)) and volr >= float(short_cfg.get("volume_ratio_min", 1.2)))
+    bar_ts = datetime.fromisoformat(feature["ts"])
+    time_str = bar_ts.strftime("%H:%M:%S")
+    if short_allowed:
+        signal = "opening_range_failure_short" if "09:05:00" <= time_str <= "09:20:00" else "strict_failed_pullback_short"
+        add(signal, SIDE_SELL, "close_below_prev5_low_ma5_ma25_rsi_volume")
+        pending = PendingSignal(signal_bar_ts=bar_ts, execute_not_before_minute=bar_ts + timedelta(minutes=1), side=SIDE_SELL, action=ACTION_ENTRY, signal_name=signal, reason="strict_market_structure_short", features=feature)
+    if high5 is not None and close is not None and close > high5:
+        add("short_exit_reversal_candidate", SIDE_BUY, "close_above_high_prev_5m", 0.8)
+    if high10 is not None and close is not None and close > high10:
+        add("short_exit_confirmed", SIDE_BUY, "close_above_high_prev_10m", 1.0)
+    long_allowed = bool(strategy.get("allow_long", False) and long_cfg.get("enabled", False) and close is not None and high5 is not None and high20 is not None and ma5 is not None and ma25 is not None and vwap is not None and rsi9 is not None and volr is not None and close > high5 and close > high20 and close > ma5 and close > ma25 and close > vwap and rsi9 >= float(long_cfg.get("rsi9_min", 50)) and volr >= float(long_cfg.get("volume_ratio_min", 1.2)))
+    if long_allowed and pending is None:
+        add("strict_reversal_long", SIDE_BUY, "close_above_prev5_prev20_ma_vwap_rsi_volume")
+        if not long_cfg.get("require_next_bar_hold", True):
+            pending = PendingSignal(signal_bar_ts=bar_ts, execute_not_before_minute=bar_ts + timedelta(minutes=1), side=SIDE_BUY, action=ACTION_ENTRY, signal_name="strict_reversal_long", reason="strict_market_structure_long", features=feature)
+    return candidates, pending
+
+
+def block_order(storage: AsyncDbWriter, signal: Optional[PendingSignal], side: str, price: Optional[float], strategy: str, action: str) -> None:
+    storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ORDER_BLOCKED", {"ts": now_jst().isoformat(), "reason": "data_collection_only_enabled", "blocked_action": action, "signal": signal.signal_name if signal else None, "side": side, "price": price, "strategy": strategy}, True)
+
+
+def build_entry_order_payload(config: dict[str, Any], side: str, price: float) -> dict[str, Any]:
+    is_short = side == SIDE_SELL
+    return {"Password": config.get("order_password", ""), "Symbol": config.get("symbol", "1570"), "Exchange": config.get("margin_entry_exchange", config.get("order_exchange", 9)), "SecurityType": 1, "Side": "1" if is_short else "2", "CashMargin": config.get("entry_cash_margin", 2), "MarginTradeType": config.get("margin_trade_type_short" if is_short else "margin_trade_type_long", 1 if is_short else 3), "DelivType": config.get("entry_deliv_type", 0), "AccountType": config.get("account_type", 4), "Qty": config.get("order_qty", 2), "FrontOrderType": config.get("entry_front_order_type", 10), "Price": config.get("entry_price", 0), "ExpireDay": config.get("expire_day", 0)}
+
+
+def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, snap: TickSnapshot) -> None:
+    sig = state.pending_signal
+    if not sig or snap.ts < sig.execute_not_before_minute:
+        return
+    if state.open_position or state.last_entry_bar_ts == sig.signal_bar_ts:
+        state.pending_signal = None
+        return
+    if not market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))):
+        state.pending_signal = None
+        storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_EXPIRED", {"signal": sig.signal_name, "bar_ts": sig.signal_bar_ts.isoformat(), "reason": "outside_entry_window"})
+        return
+    if not orders_enabled(config):
+        block_order(storage, sig, sig.side, snap.price, "market_structure_strategy", "send_order")
+        state.pending_signal = None
+        return
+    payload = build_entry_order_payload(config, sig.side, snap.price)
+    started = now_jst()
+    res = client.send_order(payload)
+    state.last_entry_bar_ts = sig.signal_bar_ts
+    state.pending_signal = None
+    storage.enqueue("execution", (now_jst().isoformat(), "ENTRY_ORDER_REQUEST", sig.side, config.get("order_qty", 2), snap.price, str(res.get("OrderId", "")) if isinstance(res, dict) else "", json.dumps({"signal": sig.signal_name, "payload": payload, "response": res, "order_send_started_at": started.isoformat()}, ensure_ascii=False, default=str)), True)
+
+
+def check_hard_stop_and_force_close(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, snap: TickSnapshot) -> None:
+    pos = state.open_position
+    if not pos:
+        return
+    hard_ticks = float(config.get("market_structure_strategy", {}).get("hard_stop_ticks", 20))
+    tick = tick_size_for_1570(pos.entry_price)
+    hard = (pos.side == SIDE_SELL and snap.price >= pos.entry_price + hard_ticks * tick) or (pos.side == SIDE_BUY and snap.price <= pos.entry_price - hard_ticks * tick)
+    force = snap.ts.timetz().replace(tzinfo=None) >= parse_hms(config.get("force_close_after", "15:20:00"))
+    if not (hard or force):
+        return
+    reason = "HARD_STOP" if hard else "FORCE_CLOSE_1520"
+    if not orders_enabled(config):
+        storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"reason": reason, "side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "current_price": snap.price}, True)
+        return
+    # Real exit wrapper is retained but unavailable in initial data-collection config.
+    storage.log_structured("CRITICAL", "MARKET_STRUCTURE_EXIT_REQUIRED", {"reason": reason, "side": pos.side, "current_price": snap.price}, True)
+
+
+def save_bar_and_features(config: dict[str, Any], storage: AsyncDbWriter, state: RuntimeState, bar: Bar, latest_snap: Optional[TickSnapshot], is_1m: bool) -> None:
+    if is_1m:
+        decorate_bar(bar, state.bars_1m_buffer)
+        feature = compute_market_structure_features(str(config.get("symbol", "1570")), bar, state, latest_snap)
+        candidates, pending = evaluate_market_structure_strategy(feature, config, state)
+        if pending and not state.open_position:
+            state.pending_signal = pending
+            storage.log_structured("INFO", "MARKET_STRUCTURE_PENDING_SIGNAL_CREATED", {"signal": pending.signal_name, "side": pending.side, "signal_bar_ts": pending.signal_bar_ts.isoformat(), "execute_not_before_minute": pending.execute_not_before_minute.isoformat()}, True)
+            if is_data_collection_only(config):
+                block_order(storage, pending, pending.side, latest_snap.price if latest_snap else None, "market_structure_strategy", "send_order")
+        for c in candidates:
+            c["blocked_by_data_collection_only"] = int(is_data_collection_only(config))
+            storage.enqueue("candidate", (c["ts"], c["symbol"], c["signal_name"], c["side"], "LOG_ONLY" if is_data_collection_only(config) else c["action"], c["confidence"], c["reason"], c["blocked_by_data_collection_only"], c["feature_json"]), False)
+        state.market_structure_feature_buffer.append(feature)
+        state.bars_1m_buffer.append(bar)
+        storage.enqueue("bar1", (bar.ts.isoformat(), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.vwap, bar.ma5, bar.ma13, bar.ema13, bar.ma25, bar.ma75, bar.rsi9), False)
+        storage.enqueue("feature", feature, False)
+    else:
+        state.bars_3m_buffer.append(bar)
+        storage.enqueue("bar3", (bar.ts.isoformat(), bar.open, bar.high, bar.low, bar.close, bar.volume, bar.vwap), False)
+
+
+def load_config(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config_1570_market_structure.json")
+    ap.add_argument("--runtime-minutes", type=float, default=None)
+    args = ap.parse_args()
+    config = load_config(args.config)
+    if args.runtime_minutes is not None:
+        config["runtime_minutes"] = args.runtime_minutes
+    outdir = Path(config.get("outdir", "monitor_output_market_structure")); outdir.mkdir(parents=True, exist_ok=True)
+    db_path = str(outdir / f"market_structure_{now_jst().strftime('%Y%m%d')}.db")
+    db_cfg = config.get("async_db_writer", {})
+    storage = AsyncDbWriter(db_path, config.get("sqlite", {}), db_cfg.get("max_queue_size", 10000), db_cfg.get("batch_size", 100), db_cfg.get("flush_interval_sec", 0.5))
+    storage.log_structured("INFO", "ASYNC_DB_WRITER_STARTED", {"db_path": db_path}, True)
+    startup = {"live_mode": config.get("live_mode"), "strategy_mode": config.get("strategy_mode"), "data_collection_only": config.get("data_collection_only"), "entry_execution": config.get("entry_execution"), "market_structure_strategy": config.get("market_structure_strategy"), "legacy_long_rsi50_enabled": False, "legacy_long_rsi35_enabled": False, "legacy_scalping_enabled": False, "legacy_feature_entries_enabled": False, "legacy_big_trend_enabled": False, "legacy_hold_score_enabled": False}
+    storage.log_structured("INFO", "MARKET_STRUCTURE_ENGINE_STARTED", startup, True)
+    storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ENABLED", startup, True)
+    storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", {"orders_enabled": orders_enabled(config), "live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled")}, True)
+    storage.log_structured("INFO", "LEGACY_STRATEGIES_DISABLED", {k: startup[k] for k in startup if k.startswith("legacy_")}, True)
+    client = KabuApiClient(config.get("base_url") or config.get("api_base_url") or API_BASE_DEFAULT, config.get("api_password", ""), config.get("order_password", ""))
+    try:
+        client.get_token()
+        client.register_symbol(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
+    except Exception as exc:
+        storage.log_structured("ERROR", "KABU_API_STARTUP_FAILED", {"error": str(exc), "data_collection_only": is_data_collection_only(config)}, True)
+        storage.stop()
+        raise
+    state = RuntimeState(); rb1 = RollingBars(1); rb3 = RollingBars(3)
+    ws = WebSocketMarketDataFeed(config, str(config.get("symbol", "1570")), int(config.get("exchange", 1)), storage)
+    if config.get("market_data_source", {}).get("mode") == "websocket":
+        ws.start()
+    started = time.monotonic(); runtime = config.get("runtime_minutes")
+    last_ws_seq: Optional[int] = None; last_rest = 0.0; latest: Optional[TickSnapshot] = None
+    md_cfg = config.get("market_data_source", {})
+    try:
+        while runtime is None or (time.monotonic() - started) < float(runtime) * 60:
+            loop_now = now_jst()
+            snaps = ws.drain_snapshots_after(last_ws_seq) if md_cfg.get("mode") == "websocket" else []
+            if not snaps and md_cfg.get("fallback_to_rest", True) and time.monotonic() - last_rest >= float(md_cfg.get("rest_fallback_min_interval_sec", 2.0)):
+                try:
+                    board = client.get_board(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
+                    snap = extract_snapshot(board)
+                    if snap:
+                        snaps = [snap]
+                        last_rest = time.monotonic(); state.rest_fallback_count += 1
+                        storage.log_structured("INFO", "REST_SNAPSHOT_USED", {"snapshot_ts": snap.ts.isoformat(), "price": snap.price}, False)
+                except Exception as exc:
+                    storage.log_structured("WARN", "REST_FALLBACK_FAILED", {"error": str(exc)}, False)
+            for snap in snaps:
+                latest = snap; state.snapshot_buffer.append(snap)
+                if snap.ws_seq is not None:
+                    last_ws_seq = snap.ws_seq
+                check_hard_stop_and_force_close(config, client, storage, state, snap)
+                handle_pending_signal(config, client, storage, state, snap)
+                b1 = rb1.update(snap); b3 = rb3.update(snap)
+                if b1: save_bar_and_features(config, storage, state, b1, latest, True)
+                if b3: save_bar_and_features(config, storage, state, b3, latest, False)
+            b1t = rb1.force_finalize_completed_bucket(loop_now, int(md_cfg.get("bar_finalize_delay_ms", 300)))
+            b3t = rb3.force_finalize_completed_bucket(loop_now, int(md_cfg.get("bar_finalize_delay_ms", 300)))
+            if b1t: save_bar_and_features(config, storage, state, b1t, latest, True)
+            if b3t: save_bar_and_features(config, storage, state, b3t, latest, False)
+            time.sleep(float(md_cfg.get("websocket_loop_sleep_sec", 0.1)) if md_cfg.get("mode") == "websocket" else 1.0)
+    finally:
+        ws.stop(); storage.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
