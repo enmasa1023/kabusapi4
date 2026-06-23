@@ -51,6 +51,8 @@
     "check_on_startup": true,
     "check_both_sides_when_expected_side_none": true,
     "resume_existing_position": false,
-    "block_entry_on_unexpected_position": true
+    "block_entry_on_unexpected_position": true,
+    "allow_safety_exit_during_manual_check": true,
+    "allow_strategy_exit_during_manual_check": false
   }
 }

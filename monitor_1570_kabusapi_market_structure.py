@@ -981,10 +981,18 @@ def latency_payload(sig: PendingSignal, extra: dict[str, Any]) -> dict[str, Any]
 
 def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, sig: PendingSignal, snap: TickSnapshot) -> None:
     decision_at = now_jst()
+    is_safety_exit = sig.signal_name in {"HARD_STOP", "FORCE_CLOSE_1520"}
     if is_data_collection_only(config):
         event = "DATA_COLLECTION_ONLY_EXIT_BLOCKED" if sig.action == ACTION_EXIT else "DATA_COLLECTION_ONLY_ORDER_BLOCKED"
         storage.log_structured("INFO", event, {"ts": decision_at.isoformat(), "reason": "data_collection_only_enabled", "blocked_action": "send_order", "signal": sig.signal_name, "side": sig.side, "price": snap.price, "strategy": "market_structure_strategy"}, True)
         storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000}), True)
+        return
+    pos_cfg = config.get("position_reconcile", {})
+    if sig.action == ACTION_EXIT and state.manual_check_required and (
+        (is_safety_exit and not bool(pos_cfg.get("allow_safety_exit_during_manual_check", True)))
+        or (not is_safety_exit and not bool(pos_cfg.get("allow_strategy_exit_during_manual_check", False)))
+    ):
+        storage.log_structured("WARN", "MANUAL_CHECK_REQUIRED_EXIT_BLOCKED", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "manual_check_required": state.manual_check_required, "live_positions_detected": positions_log_payload(state.live_positions_detected)}, True)
         return
     if sig.action == ACTION_ENTRY and not entry_orders_enabled(config, state, snap):
         storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "manual_check_required": state.manual_check_required, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
@@ -996,15 +1004,20 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side}, True)
         return
     exe_cfg = order_execution_config(config, sig.action)
-    max_reprice = int(exe_cfg.get("max_reprice_attempts", 0)) if sig.action == ACTION_EXIT and sig.signal_name in {"HARD_STOP", "FORCE_CLOSE_1520"} else 0
+    max_reprice = int(exe_cfg.get("max_reprice_attempts", 0)) if sig.action == ACTION_EXIT and is_safety_exit else 0
     attempt = 0
     current_snap = snap
     last_latency: dict[str, Any] = {}
+    initial_expected_exit_qty = state.open_position.qty if sig.action == ACTION_EXIT and state.open_position else 0
+    final_fill_ok = False
+    exit_fully_closed = False
     while True:
         if sig.action == ACTION_ENTRY:
             payload, quote_meta = build_entry_order_payload(config, sig.side, current_snap)
+            expected_order_qty = float(config.get("entry_min_fill_qty", config.get("order_qty", 1)))
         else:
-            payload, quote_meta = build_exit_order_payload(config, state.open_position, current_snap, state.open_position.qty if state.open_position else None)
+            expected_order_qty = float(state.open_position.qty if state.open_position else initial_expected_exit_qty)
+            payload, quote_meta = build_exit_order_payload(config, state.open_position, current_snap, int(expected_order_qty) if expected_order_qty else None)
         if payload is None:
             log_no_valid_best_quote(storage, sig, current_snap, quote_meta)
             return
@@ -1018,8 +1031,9 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
             storage.log_structured("CRITICAL", "ORDER_RESPONSE_MISSING_ORDER_ID", {"response": response, "signal": sig.signal_name, **execution_detail}, True)
             return
         verify_started = now_jst()
-        min_qty = config.get("entry_min_fill_qty", config.get("order_qty", 1)) if sig.action == ACTION_ENTRY else 1
-        cum_qty, fill_ok = wait_order_fill(config, client, storage, order_id, float(min_qty), sig.action)
+        min_qty = float(config.get("entry_min_fill_qty", config.get("order_qty", 1))) if sig.action == ACTION_ENTRY else expected_order_qty
+        cum_qty, fill_ok = wait_order_fill(config, client, storage, order_id, min_qty, sig.action)
+        final_fill_ok = fill_ok
         verify_finished = now_jst()
         if not fill_ok and exe_cfg.get("cancel_on_timeout", True):
             client.cancel_order(order_id)
@@ -1029,20 +1043,35 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         pos = reconcile_positions(config, client, storage, state, sig.side if sig.action == ACTION_ENTRY else None, "market_structure_strategy", order_id)
         rec_finished = now_jst()
         reconcile_result = {"position_found": bool(pos), "qty": pos.qty if pos else 0, "side": pos.side if pos else None, "manual_check_required": state.manual_check_required}
-        if sig.action == ACTION_EXIT and (not pos or pos.qty == 0):
+        exit_fully_closed = bool(sig.action == ACTION_EXIT and (not pos or pos.qty == 0))
+        if exit_fully_closed:
             state.open_position = None
+            state.manual_check_required = False
         elif sig.action == ACTION_ENTRY and fill_ok and not pos:
             state.recovery_until = now_jst() + timedelta(seconds=60)
             storage.log_structured("CRITICAL", "POSITION_CONFIRM_FAILED_AFTER_ENTRY_FILL", {"order_id": order_id, "cum_qty": cum_qty, **execution_detail}, True)
+        elif sig.action == ACTION_ENTRY and pos and cum_qty < min_qty:
+            state.manual_check_required = True
+            state.recovery_until = now_jst() + timedelta(minutes=30)
+            storage.log_structured("CRITICAL", "ENTRY_PARTIAL_FILL_BELOW_MIN_QTY", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "order_id": order_id, "expected_entry_min_qty": min_qty, "cum_qty": cum_qty, "position_reconcile_result": reconcile_result, **execution_detail}, True)
+        elif sig.action == ACTION_EXIT and not exit_fully_closed:
+            state.manual_check_required = True
+            state.recovery_until = now_jst() + timedelta(minutes=30)
+            level = "WARN" if is_safety_exit and attempt < max_reprice else "CRITICAL"
+            storage.log_structured(level, "EXIT_PARTIAL_FILL_POSITION_REMAINS", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "expected_exit_qty": expected_order_qty, "initial_expected_exit_qty": initial_expected_exit_qty, "cum_qty": cum_qty, "remaining_qty": pos.qty if pos else 0, "order_id": order_id, "attempt": attempt, "max_reprice_attempts": max_reprice, "position_reconcile_result": reconcile_result, **execution_detail}, True)
         storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, current_snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response, "execution_detail": execution_detail, "attempt": attempt, "max_reprice_attempts": max_reprice, "position_reconcile_result": reconcile_result}, ensure_ascii=False, default=str)), True)
         last_latency = {"next_bar_first_tick_at": current_snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000, **execution_detail, "reprice_attempt": attempt, "max_reprice_attempts": max_reprice, "position_reconcile_result": reconcile_result}
-        if sig.action == ACTION_ENTRY or fill_ok or state.open_position is None or attempt >= max_reprice:
+        if sig.action == ACTION_ENTRY:
+            break
+        if exit_fully_closed:
+            break
+        if attempt >= max_reprice:
             break
         attempt += 1
         storage.log_structured("WARN", "EXIT_REPRICE_ATTEMPT", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "attempt": attempt, "max_reprice_attempts": max_reprice, "remaining_qty": state.open_position.qty if state.open_position else 0, **execution_detail}, True)
         current_snap = refresh_order_snapshot(config, client, storage, current_snap)
-    if sig.action == ACTION_EXIT and state.open_position is not None and not fill_ok:
-        storage.log_structured("CRITICAL", "EXIT_REPRICE_EXHAUSTED_POSITION_REMAINS", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "remaining_qty": state.open_position.qty, "max_reprice_attempts": max_reprice}, True)
+    if sig.action == ACTION_EXIT and state.open_position is not None and not exit_fully_closed:
+        storage.log_structured("CRITICAL", "EXIT_REPRICE_EXHAUSTED_POSITION_REMAINS", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "remaining_qty": state.open_position.qty, "max_reprice_attempts": max_reprice, "fill_ok": final_fill_ok}, True)
     storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, last_latency), True)
 
 
