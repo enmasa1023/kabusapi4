@@ -45,5 +45,12 @@
     "max_reprice_attempts": 1,
     "fallback_to_market": false,
     "log_execution_detail": true
+  },
+  "position_reconcile": {
+    "enabled": true,
+    "check_on_startup": true,
+    "check_both_sides_when_expected_side_none": true,
+    "resume_existing_position": false,
+    "block_entry_on_unexpected_position": true
   }
 }

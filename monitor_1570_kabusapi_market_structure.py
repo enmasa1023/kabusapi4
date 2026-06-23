@@ -82,6 +82,7 @@ def entry_orders_enabled(config: dict[str, Any], state: RuntimeState, snap: Tick
         and config.get("entry_execution", {}).get("enabled") is True
         and config.get("market_structure_strategy", {}).get("enabled") is True
         and state.open_position is None
+        and not state.manual_check_required
         and (state.recovery_until is None or now_jst() >= state.recovery_until)
         and market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00")))
     )
@@ -163,6 +164,8 @@ class PositionState:
     execution_ids: list[str] = field(default_factory=list)
     margin_trade_type: int = 0
     cash_margin: int = 2
+    hold_qty: float = 0.0
+    raw_positions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -178,6 +181,8 @@ class RuntimeState:
     force_close_logged: bool = False
     rest_fallback_count: int = 0
     last_cumulative_volume: Optional[float] = None
+    manual_check_required: bool = False
+    live_positions_detected: list[PositionState] = field(default_factory=list)
 
 
 class AsyncDbWriter:
@@ -747,6 +752,7 @@ def best_limit_price_for_order(side: str, action: str, snap: TickSnapshot) -> tu
 def validate_best_quote(side: str, action: str, snap: TickSnapshot) -> tuple[Optional[float], dict[str, Any]]:
     price, source = best_limit_price_for_order(side, action, snap)
     sp = spread_ticks(snap)
+    tick = tick_size_for_1570(snap.price)
     reason = ""
     if price is None:
         reason = "missing_best_bid_for_sell" if side == SIDE_SELL else "missing_best_ask_for_buy"
@@ -754,14 +760,16 @@ def validate_best_quote(side: str, action: str, snap: TickSnapshot) -> tuple[Opt
         reason = "best_quote_non_positive"
     elif sp is not None and (sp < 0 or sp > 50):
         reason = "spread_ticks_abnormal"
+    elif tick > 0 and abs((float(price) / tick) - round(float(price) / tick)) >= 1e-9:
+        reason = "best_quote_not_on_tick"
     if reason:
         return None, {"price_source": source, "reason": reason, "source_best_bid": snap.buy1_price, "source_best_ask": snap.sell1_price, "spread_ticks": sp}
-    limit_price = normalize_limit_price(float(price), side, tick_size_for_1570(snap.price))
+    limit_price = normalize_limit_price(float(price), side, tick)
     return limit_price, {"price_source": source, "reason": "", "source_best_bid": snap.buy1_price, "source_best_ask": snap.sell1_price, "spread_ticks": sp, "limit_price": limit_price}
 
 
 def log_no_valid_best_quote(storage: AsyncDbWriter, sig: PendingSignal, snap: TickSnapshot, quote_meta: dict[str, Any]) -> None:
-    storage.log_structured("WARN", "ORDER_BLOCKED_NO_VALID_BEST_QUOTE", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "current_price": snap.price, "buy1_price": snap.buy1_price, "sell1_price": snap.sell1_price, "spread_ticks": quote_meta.get("spread_ticks"), "reason": quote_meta.get("reason")}, True)
+    storage.log_structured("WARN", "ORDER_BLOCKED_NO_VALID_BEST_QUOTE", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "current_price": snap.price, "buy1_price": snap.buy1_price, "sell1_price": snap.sell1_price, "spread_ticks": quote_meta.get("spread_ticks"), "price_source": quote_meta.get("price_source"), "reason": quote_meta.get("reason")}, True)
 
 
 def order_execution_config(config: dict[str, Any], action: str) -> dict[str, Any]:
@@ -835,9 +843,7 @@ def normalize_positions(raw: Any) -> list[dict[str, Any]]:
     return raw if isinstance(raw, list) else []
 
 
-def position_from_api(raw_positions: Any, side: str, strategy: str, order_id: str, config: dict[str, Any]) -> Optional[PositionState]:
-    target_side = "1" if side == SIDE_SELL else "2"
-    positions = [p for p in normalize_positions(raw_positions) if isinstance(p, dict) and str(p.get("Side")) == target_side and (_to_float(p.get("LeavesQty")) or 0) > 0]
+def position_from_rows(positions: list[dict[str, Any]], side: str, strategy: str, order_id: str, config: dict[str, Any]) -> Optional[PositionState]:
     if not positions:
         return None
     qty = int(sum(_to_float(p.get("LeavesQty")) or 0 for p in positions))
@@ -845,18 +851,87 @@ def position_from_api(raw_positions: Any, side: str, strategy: str, order_id: st
     entry_price = weighted / qty if qty else 0.0
     execution_ids = [str(p.get("ExecutionID") or p.get("HoldID") or "") for p in positions if p.get("ExecutionID") or p.get("HoldID")]
     margin_trade_type = int(_to_float(positions[0].get("MarginTradeType")) or config.get("margin_trade_type_short" if side == SIDE_SELL else "margin_trade_type_long", 1 if side == SIDE_SELL else 3))
-    return PositionState(side=side, qty=qty, entry_price=entry_price, strategy=strategy, entry_ts=now_jst(), order_id=order_id, execution_ids=execution_ids, margin_trade_type=margin_trade_type, cash_margin=2)
+    hold_qty = sum(_to_float(p.get("HoldQty")) or 0 for p in positions)
+    return PositionState(side=side, qty=qty, entry_price=entry_price, strategy=strategy, entry_ts=now_jst(), order_id=order_id, execution_ids=execution_ids, margin_trade_type=margin_trade_type, cash_margin=2, hold_qty=hold_qty, raw_positions=positions)
+
+
+def position_from_api(raw_positions: Any, side: str, strategy: str, order_id: str, config: dict[str, Any]) -> Optional[PositionState]:
+    target_side = "1" if side == SIDE_SELL else "2"
+    positions = [p for p in normalize_positions(raw_positions) if isinstance(p, dict) and str(p.get("Side")) == target_side and (_to_float(p.get("LeavesQty")) or 0) > 0]
+    return position_from_rows(positions, side, strategy, order_id, config)
+
+
+def positions_from_api_all_sides(raw_positions: Any, strategy: str, order_id: str, config: dict[str, Any]) -> list[PositionState]:
+    rows = [p for p in normalize_positions(raw_positions) if isinstance(p, dict) and (_to_float(p.get("LeavesQty")) or 0) > 0]
+    results: list[PositionState] = []
+    for api_side, side in (("1", SIDE_SELL), ("2", SIDE_BUY)):
+        pos = position_from_rows([p for p in rows if str(p.get("Side")) == api_side], side, strategy, order_id, config)
+        if pos:
+            results.append(pos)
+    return results
+
+
+def positions_log_payload(positions: list[PositionState]) -> list[dict[str, Any]]:
+    return [
+        {
+            "side": p.side,
+            "qty": p.qty,
+            "hold_qty": p.hold_qty,
+            "entry_price": p.entry_price,
+            "execution_ids": p.execution_ids,
+            "margin_trade_type": p.margin_trade_type,
+            "raw_positions": p.raw_positions,
+        }
+        for p in positions
+    ]
 
 
 def reconcile_positions(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, state: RuntimeState, expected_side: Optional[str] = None, strategy: str = "market_structure_strategy", order_id: str = "") -> Optional[PositionState]:
     started = now_jst()
-    positions = client.get_positions(str(config.get("symbol", "1570")))
-    side = expected_side or (state.open_position.side if state.open_position else SIDE_SELL)
-    pos = position_from_api(positions, side, strategy, order_id, config)
+    raw_positions = client.get_positions(str(config.get("symbol", "1570")))
+    pos_cfg = config.get("position_reconcile", {})
+    resume_existing = bool(pos_cfg.get("resume_existing_position", False))
+    if expected_side:
+        pos = position_from_api(raw_positions, expected_side, strategy, order_id, config)
+        state.open_position = pos
+        state.live_positions_detected = [pos] if pos else []
+        if pos:
+            state.manual_check_required = False
+        storage.log_structured("INFO" if pos else "WARN", "POSITION_RECONCILE_RESULT", {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": expected_side, "position_found": bool(pos), "qty": pos.qty if pos else 0, "hold_qty": pos.hold_qty if pos else 0, "order_id": order_id, "positions": positions_log_payload([pos] if pos else [])}, True)
+        if is_data_collection_only(config) and pos:
+            storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"side": pos.side, "qty": pos.qty, "hold_qty": pos.hold_qty, "entry_price": pos.entry_price, "order_id": pos.order_id, "positions": positions_log_payload([pos])}, True)
+        return pos
+
+    all_positions = positions_from_api_all_sides(raw_positions, strategy, order_id, config)
+    state.live_positions_detected = all_positions
+    if not all_positions:
+        state.open_position = None
+        state.manual_check_required = False
+        state.live_positions_detected = []
+        storage.log_structured("INFO", "POSITION_RECONCILE_RESULT", {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": None, "position_found": False, "qty": 0, "positions": []}, True)
+        return None
+
+    if len(all_positions) > 1:
+        state.open_position = None
+        state.manual_check_required = True
+        state.recovery_until = now_jst() + timedelta(minutes=30)
+        payload = {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": None, "position_found": True, "both_sides_detected": True, "positions": positions_log_payload(all_positions)}
+        storage.log_structured("CRITICAL", "LIVE_POSITION_BOTH_SIDES_DETECTED", payload, True)
+        storage.log_structured("CRITICAL", "MANUAL_POSITION_CHECK_REQUIRED", payload, True)
+        if is_data_collection_only(config):
+            storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", payload, True)
+        return None
+
+    pos = all_positions[0]
     state.open_position = pos
-    storage.log_structured("INFO" if pos else "WARN", "POSITION_RECONCILE_RESULT", {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": expected_side, "position_found": bool(pos), "qty": pos.qty if pos else 0, "order_id": order_id}, True)
-    if is_data_collection_only(config) and pos:
-        storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "order_id": pos.order_id}, True)
+    if not resume_existing:
+        state.manual_check_required = bool(pos_cfg.get("block_entry_on_unexpected_position", True))
+        state.recovery_until = now_jst() + timedelta(minutes=30) if state.manual_check_required else state.recovery_until
+    storage.log_structured("WARN", "LIVE_POSITION_DETECTED", {"started_at": started.isoformat(), "finished_at": now_jst().isoformat(), "expected_side": None, "side": pos.side, "qty": pos.qty, "hold_qty": pos.hold_qty, "entry_price": pos.entry_price, "resume_existing_position": resume_existing, "manual_check_required": state.manual_check_required, "positions": positions_log_payload([pos])}, True)
+    if state.manual_check_required:
+        storage.log_structured("CRITICAL", "MANUAL_POSITION_CHECK_REQUIRED", {"reason": "existing_position_detected_resume_disabled", "side": pos.side, "qty": pos.qty, "positions": positions_log_payload([pos])}, True)
+    if is_data_collection_only(config):
+        storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"side": pos.side, "qty": pos.qty, "hold_qty": pos.hold_qty, "entry_price": pos.entry_price, "order_id": pos.order_id, "positions": positions_log_payload([pos])}, True)
     return pos
 
 
@@ -898,7 +973,7 @@ def refresh_order_snapshot(config: dict[str, Any], client: KabuApiClient, storag
 
 def latency_payload(sig: PendingSignal, extra: dict[str, Any]) -> dict[str, Any]:
     payload = {"signal_bar_ts": sig.signal_bar_ts.isoformat(), "signal_detected_at": sig.features.get("signal_detected_at"), "pending_signal_created_at": sig.features.get("pending_signal_created_at"), "next_bar_first_tick_at": extra.get("next_bar_first_tick_at"), "order_decision_at": extra.get("order_decision_at"), "order_send_started_at": extra.get("order_send_started_at"), "order_response_at": extra.get("order_response_at"), "order_verify_started_at": extra.get("order_verify_started_at"), "order_verify_finished_at": extra.get("order_verify_finished_at"), "position_reconcile_started_at": extra.get("position_reconcile_started_at"), "position_reconcile_finished_at": extra.get("position_reconcile_finished_at"), "db_enqueue_at": now_jst().isoformat(), "signal_to_decision_ms": extra.get("signal_to_decision_ms"), "decision_to_order_send_ms": extra.get("decision_to_order_send_ms"), "order_send_to_response_ms": extra.get("order_send_to_response_ms"), "order_response_to_verify_ms": extra.get("order_response_to_verify_ms"), "signal_to_position_confirm_ms": extra.get("signal_to_position_confirm_ms"), "db_queue_lag_ms": 0, "signal": sig.signal_name, "action": sig.action, "side": sig.side}
-    for key in ("execution_mode", "limit_mode", "front_order_type", "limit_price", "source_best_bid", "source_best_ask", "spread_ticks", "price_source", "reprice_attempt"):
+    for key in ("execution_mode", "limit_mode", "front_order_type", "limit_price", "source_best_bid", "source_best_ask", "spread_ticks", "price_source", "reprice_attempt", "max_reprice_attempts", "position_reconcile_result"):
         if key in extra:
             payload[key] = extra[key]
     return payload
@@ -912,7 +987,7 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000}), True)
         return
     if sig.action == ACTION_ENTRY and not entry_orders_enabled(config, state, snap):
-        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "manual_check_required": state.manual_check_required, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
         return
     if sig.action == ACTION_EXIT and not exit_orders_enabled(config, state, snap):
         storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "signal": sig.signal_name, "action": sig.action}, True)
@@ -949,24 +1024,25 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         if not fill_ok and exe_cfg.get("cancel_on_timeout", True):
             client.cancel_order(order_id)
             canceled = confirm_cancel(config, client, order_id)
-            storage.log_structured("WARN", "ORDER_CANCEL_AFTER_TIMEOUT", {"order_id": order_id, "cum_qty": cum_qty, "cancel_confirmed": canceled, "attempt": attempt, **execution_detail}, True)
+            storage.log_structured("WARN", "ORDER_CANCEL_AFTER_TIMEOUT", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "order_id": order_id, "cum_qty": cum_qty, "cancel_confirmed": canceled, "attempt": attempt, "max_reprice_attempts": max_reprice, **execution_detail}, True)
         rec_started = now_jst()
         pos = reconcile_positions(config, client, storage, state, sig.side if sig.action == ACTION_ENTRY else None, "market_structure_strategy", order_id)
         rec_finished = now_jst()
+        reconcile_result = {"position_found": bool(pos), "qty": pos.qty if pos else 0, "side": pos.side if pos else None, "manual_check_required": state.manual_check_required}
         if sig.action == ACTION_EXIT and (not pos or pos.qty == 0):
             state.open_position = None
         elif sig.action == ACTION_ENTRY and fill_ok and not pos:
             state.recovery_until = now_jst() + timedelta(seconds=60)
             storage.log_structured("CRITICAL", "POSITION_CONFIRM_FAILED_AFTER_ENTRY_FILL", {"order_id": order_id, "cum_qty": cum_qty, **execution_detail}, True)
-        storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, current_snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response, "execution_detail": execution_detail, "attempt": attempt}, ensure_ascii=False, default=str)), True)
-        last_latency = {"next_bar_first_tick_at": current_snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000, **execution_detail, "reprice_attempt": attempt}
+        storage.enqueue("execution", (now_jst().isoformat(), "ORDER_REQUEST", sig.side, cum_qty, current_snap.price, order_id, json.dumps({"signal": sig.signal_name, "action": sig.action, "payload": payload, "response": response, "execution_detail": execution_detail, "attempt": attempt, "max_reprice_attempts": max_reprice, "position_reconcile_result": reconcile_result}, ensure_ascii=False, default=str)), True)
+        last_latency = {"next_bar_first_tick_at": current_snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "order_send_started_at": send_started.isoformat(), "order_response_at": response_at.isoformat(), "order_verify_started_at": verify_started.isoformat(), "order_verify_finished_at": verify_finished.isoformat(), "position_reconcile_started_at": rec_started.isoformat(), "position_reconcile_finished_at": rec_finished.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000, "decision_to_order_send_ms": (send_started - decision_at).total_seconds() * 1000, "order_send_to_response_ms": (response_at - send_started).total_seconds() * 1000, "order_response_to_verify_ms": (verify_finished - response_at).total_seconds() * 1000, "signal_to_position_confirm_ms": (rec_finished - sig.signal_bar_ts).total_seconds() * 1000, **execution_detail, "reprice_attempt": attempt, "max_reprice_attempts": max_reprice, "position_reconcile_result": reconcile_result}
         if sig.action == ACTION_ENTRY or fill_ok or state.open_position is None or attempt >= max_reprice:
             break
         attempt += 1
-        storage.log_structured("WARN", "EXIT_REPRICE_ATTEMPT", {"signal": sig.signal_name, "attempt": attempt, "max_reprice_attempts": max_reprice, "remaining_qty": state.open_position.qty if state.open_position else 0, **execution_detail}, True)
+        storage.log_structured("WARN", "EXIT_REPRICE_ATTEMPT", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "attempt": attempt, "max_reprice_attempts": max_reprice, "remaining_qty": state.open_position.qty if state.open_position else 0, **execution_detail}, True)
         current_snap = refresh_order_snapshot(config, client, storage, current_snap)
     if sig.action == ACTION_EXIT and state.open_position is not None and not fill_ok:
-        storage.log_structured("CRITICAL", "EXIT_REPRICE_EXHAUSTED_POSITION_REMAINS", {"signal": sig.signal_name, "remaining_qty": state.open_position.qty, "max_reprice_attempts": max_reprice}, True)
+        storage.log_structured("CRITICAL", "EXIT_REPRICE_EXHAUSTED_POSITION_REMAINS", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "remaining_qty": state.open_position.qty, "max_reprice_attempts": max_reprice}, True)
     storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, last_latency), True)
 
 
@@ -975,6 +1051,10 @@ def handle_pending_signal(config: dict[str, Any], client: KabuApiClient, storage
     if not sig or snap.ts < sig.execute_not_before_minute:
         return
     if sig.action == ACTION_ENTRY:
+        if state.manual_check_required:
+            storage.log_structured("WARN", "ENTRY_BLOCKED_BY_MANUAL_CHECK_REQUIRED", {"signal": sig.signal_name, "side": sig.side, "signal_bar_ts": sig.signal_bar_ts.isoformat(), "live_positions_detected": positions_log_payload(state.live_positions_detected)}, True)
+            state.pending_signal = None
+            return
         if state.open_position is not None:
             storage.log_structured("WARN", "ENTRY_BLOCKED_BY_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side, "signal_bar_ts": sig.signal_bar_ts.isoformat()}, True)
             state.pending_signal = None
@@ -1079,7 +1159,7 @@ def main() -> int:
     try:
         client.get_token()
         client.register_symbol(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
-        if config.get("data_collection_only", {}).get("allow_position_polling", True):
+        if config.get("position_reconcile", {}).get("enabled", True) and config.get("position_reconcile", {}).get("check_on_startup", True) and config.get("data_collection_only", {}).get("allow_position_polling", True):
             # 起動時照合。data_collection_only中に建玉があっても自動決済はしない。
             reconcile_positions(config, client, storage, state, None, "market_structure_strategy", "")
     except Exception as exc:
