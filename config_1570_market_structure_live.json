@@ -1,5 +1,5 @@
 {
-  "live_mode": false,
+  "live_mode": true,
   "symbol": "1570",
   "exchange": 1,
   "order_exchange": 9,
@@ -26,17 +26,17 @@
   "new_entry_cutoff_time": "15:10:00",
   "strategy_mode": "market_structure",
   "data_collection_only": {
-    "enabled": true,
-    "disable_all_orders": true,
+    "enabled": false,
+    "disable_all_orders": false,
     "disable_paper_trades": true,
     "log_signal_candidates": true,
     "log_order_block_events": true,
     "allow_market_data_collection": true,
     "allow_position_polling": true,
-    "allow_order_polling": false
+    "allow_order_polling": true
   },
   "entry_execution": {
-    "enabled": false,
+    "enabled": true,
     "mode": "limit_with_timeout",
     "limit_mode": "marketable_best",
     "timeout_sec": 2.0,
@@ -164,5 +164,6 @@
     "allow_safety_exit_during_manual_check": true,
     "allow_strategy_exit_during_manual_check": false
   },
-  "force_close_until": "15:24:00"
+  "force_close_until": "15:24:00",
+  "live_trading_ack": "I_UNDERSTAND_REAL_ORDERS"
 }

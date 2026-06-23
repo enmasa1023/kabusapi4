@@ -36,6 +36,7 @@ MORNING_START = dtime(9, 0)
 MORNING_END = dtime(11, 25)
 AFTERNOON_START = dtime(12, 30)
 AFTERNOON_END = dtime(15, 20)
+LIVE_TRADING_ACK = "I_UNDERSTAND_REAL_ORDERS"
 
 
 def now_jst() -> datetime:
@@ -67,12 +68,28 @@ def is_data_collection_only(config: dict[str, Any]) -> bool:
     return bool(isinstance(cfg, dict) and cfg.get("enabled", False))
 
 
+def live_trading_ack_ok(config: dict[str, Any]) -> bool:
+    return config.get("live_trading_ack") == LIVE_TRADING_ACK
+
+
 def orders_enabled(config: dict[str, Any]) -> bool:
     return bool(
         config.get("live_mode", False)
         and not is_data_collection_only(config)
         and config.get("entry_execution", {}).get("enabled", False)
+        and live_trading_ack_ok(config)
     )
+
+
+def within_force_close_window(ts: datetime, config: dict[str, Any]) -> bool:
+    t = ts.timetz().replace(tzinfo=None)
+    start = parse_hms(config.get("force_close_after", "15:20:00"))
+    end = parse_hms(config.get("force_close_until", "15:24:00"))
+    return start <= t <= end
+
+
+def after_force_close_start(ts: datetime, config: dict[str, Any]) -> bool:
+    return ts.timetz().replace(tzinfo=None) >= parse_hms(config.get("force_close_after", "15:20:00"))
 
 
 def entry_orders_enabled(config: dict[str, Any], state: RuntimeState, snap: TickSnapshot) -> bool:
@@ -80,6 +97,7 @@ def entry_orders_enabled(config: dict[str, Any], state: RuntimeState, snap: Tick
         config.get("live_mode", False) is True
         and not is_data_collection_only(config)
         and config.get("entry_execution", {}).get("enabled") is True
+        and live_trading_ack_ok(config)
         and config.get("market_structure_strategy", {}).get("enabled") is True
         and state.open_position is None
         and not state.manual_check_required
@@ -92,6 +110,7 @@ def exit_orders_enabled(config: dict[str, Any], state: RuntimeState, _snap: Tick
     return bool(
         config.get("live_mode", False) is True
         and not is_data_collection_only(config)
+        and live_trading_ack_ok(config)
         and config.get("market_structure_strategy", {}).get("enabled") is True
         and state.open_position is not None
     )
@@ -960,6 +979,84 @@ def confirm_cancel(config: dict[str, Any], client: KabuApiClient, order_id: str)
     return False
 
 
+def log_missing_live_trading_ack(storage: AsyncDbWriter, sig: PendingSignal, state: RuntimeState, snap: TickSnapshot, config: dict[str, Any]) -> None:
+    storage.log_structured(
+        "CRITICAL" if state.open_position else "WARN",
+        "ORDER_BLOCKED_BY_MISSING_LIVE_TRADING_ACK",
+        {
+            "signal_name": sig.signal_name,
+            "action": sig.action,
+            "side": sig.side,
+            "live_mode": config.get("live_mode"),
+            "data_collection_only": is_data_collection_only(config),
+            "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"),
+            "live_trading_ack_present": live_trading_ack_ok(config),
+            "has_open_position": state.open_position is not None,
+            "open_position_side": state.open_position.side if state.open_position else None,
+            "open_position_qty": state.open_position.qty if state.open_position else None,
+            "price": snap.price,
+        },
+        True,
+    )
+    if state.open_position is not None:
+        state.manual_check_required = True
+        state.recovery_until = now_jst() + timedelta(minutes=30)
+        storage.log_structured(
+            "CRITICAL",
+            "MANUAL_POSITION_CHECK_REQUIRED",
+            {
+                "reason": "missing_live_trading_ack_with_open_position",
+                "side": state.open_position.side,
+                "qty": state.open_position.qty,
+                "positions": positions_log_payload([state.open_position]),
+            },
+            True,
+        )
+
+
+def print_startup_banner(config_path: str, config: dict[str, Any], db_path: str) -> None:
+    live_mode = bool(config.get("live_mode", False))
+    dco = is_data_collection_only(config)
+    entry_enabled = bool(config.get("entry_execution", {}).get("enabled", False))
+    md_mode = config.get("market_data_source", {}).get("mode", "websocket")
+    print("Market structure engine started", flush=True)
+    print(f"config: {config_path}", flush=True)
+    print(f"db_path: {db_path}", flush=True)
+    print(f"live_mode: {str(live_mode).lower()}", flush=True)
+    print(f"data_collection_only: {str(dco).lower()}", flush=True)
+    print(f"entry_execution.enabled: {str(entry_enabled).lower()}", flush=True)
+    print(f"orders_enabled: {str(orders_enabled(config)).lower()}", flush=True)
+    print(f"symbol: {config.get('symbol', '1570')}", flush=True)
+    print(f"mode: {md_mode}", flush=True)
+    if live_mode and not dco:
+        print("*** LIVE ORDER MODE ENABLED ***", flush=True)
+        print("Real orders may be sent.", flush=True)
+    if dco:
+        print("DATA COLLECTION ONLY: send_order/cancel_order are blocked.", flush=True)
+    if config.get("runtime_minutes") is None:
+        print("runtime_minutes is not set. This process will keep running until Ctrl+C.", flush=True)
+        print("For a short test, run with: --runtime-minutes 1", flush=True)
+
+
+def live_mode_confirmation_payload(config: dict[str, Any]) -> dict[str, Any]:
+    strat = config.get("market_structure_strategy", {})
+    return {
+        "live_mode": config.get("live_mode") is True,
+        "data_collection_only": is_data_collection_only(config),
+        "entry_execution_enabled": config.get("entry_execution", {}).get("enabled") is True,
+        "live_trading_ack": live_trading_ack_ok(config),
+        "order_qty": config.get("order_qty"),
+        "allow_short": strat.get("allow_short"),
+        "allow_long": strat.get("allow_long"),
+        "entry_front_order_type": config.get("entry_front_order_type"),
+        "exit_front_order_type": config.get("exit_front_order_type"),
+        "entry_execution_mode": config.get("entry_execution", {}).get("mode"),
+        "exit_execution_mode": config.get("exit_execution", {}).get("mode"),
+        "force_close_after": config.get("force_close_after", "15:20:00"),
+        "force_close_until": config.get("force_close_until", "15:24:00"),
+    }
+
+
 def refresh_order_snapshot(config: dict[str, Any], client: KabuApiClient, storage: AsyncDbWriter, fallback_snap: TickSnapshot) -> TickSnapshot:
     try:
         raw = client.get_board(str(config.get("symbol", "1570")), int(config.get("exchange", 1)))
@@ -987,6 +1084,9 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         storage.log_structured("INFO", event, {"ts": decision_at.isoformat(), "reason": "data_collection_only_enabled", "blocked_action": "send_order", "signal": sig.signal_name, "side": sig.side, "price": snap.price, "strategy": "market_structure_strategy"}, True)
         storage.log_structured("INFO", "ORDER_LATENCY_TRACE", latency_payload(sig, {"next_bar_first_tick_at": snap.ts.isoformat(), "order_decision_at": decision_at.isoformat(), "signal_to_decision_ms": (decision_at - sig.signal_bar_ts).total_seconds() * 1000}), True)
         return
+    if config.get("live_mode", False) is True and not live_trading_ack_ok(config):
+        log_missing_live_trading_ack(storage, sig, state, snap, config)
+        return
     pos_cfg = config.get("position_reconcile", {})
     if sig.action == ACTION_EXIT and state.manual_check_required and (
         (is_safety_exit and not bool(pos_cfg.get("allow_safety_exit_during_manual_check", True)))
@@ -995,10 +1095,10 @@ def execute_signal_order(config: dict[str, Any], client: KabuApiClient, storage:
         storage.log_structured("WARN", "MANUAL_CHECK_REQUIRED_EXIT_BLOCKED", {"signal_name": sig.signal_name, "action": sig.action, "side": sig.side, "manual_check_required": state.manual_check_required, "live_positions_detected": positions_log_payload(state.live_positions_detected)}, True)
         return
     if sig.action == ACTION_ENTRY and not entry_orders_enabled(config, state, snap):
-        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "manual_check_required": state.manual_check_required, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "live_trading_ack": live_trading_ack_ok(config), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "manual_check_required": state.manual_check_required, "recovery_until": iso_dt(state.recovery_until), "within_entry_window": market_open_for_new_entry(snap.ts, parse_hms(config.get("new_entry_cutoff_time", "15:10:00"))), "signal": sig.signal_name, "action": sig.action}, True)
         return
     if sig.action == ACTION_EXIT and not exit_orders_enabled(config, state, snap):
-        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "signal": sig.signal_name, "action": sig.action}, True)
+        storage.log_structured("WARN", "ORDER_BLOCKED_BY_RUNTIME_GUARD", {"live_mode": config.get("live_mode"), "live_trading_ack": live_trading_ack_ok(config), "data_collection_only": is_data_collection_only(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None, "signal": sig.signal_name, "action": sig.action}, True)
         return
     if sig.action == ACTION_EXIT and state.open_position is None:
         storage.log_structured("WARN", "EXIT_BLOCKED_NO_OPEN_POSITION", {"signal": sig.signal_name, "side": sig.side}, True)
@@ -1120,18 +1220,30 @@ def check_hard_stop_and_force_close(config: dict[str, Any], client: KabuApiClien
     hard_ticks = float(config.get("market_structure_strategy", {}).get("hard_stop_ticks", 20))
     tick = tick_size_for_1570(pos.entry_price)
     hard = (pos.side == SIDE_SELL and snap.price >= pos.entry_price + hard_ticks * tick) or (pos.side == SIDE_BUY and snap.price <= pos.entry_price - hard_ticks * tick)
-    force = snap.ts.timetz().replace(tzinfo=None) >= parse_hms(config.get("force_close_after", "15:20:00"))
+    force = within_force_close_window(snap.ts, config)
+    if after_force_close_start(snap.ts, config) and not force and not hard:
+        state.manual_check_required = True
+        state.recovery_until = now_jst() + timedelta(minutes=30)
+        if not state.force_close_logged:
+            payload = {"side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "current_price": snap.price, "ts": snap.ts.isoformat(), "force_close_after": config.get("force_close_after", "15:20:00"), "force_close_until": config.get("force_close_until", "15:24:00")}
+            storage.log_structured("CRITICAL", "LIVE_POSITION_DETECTED_OUTSIDE_FORCE_CLOSE_WINDOW", payload, True)
+            storage.log_structured("CRITICAL", "MANUAL_POSITION_CHECK_REQUIRED", {"reason": "position_detected_outside_force_close_window", **payload}, True)
+            state.force_close_logged = True
+        return
     if not (hard or force):
         return
     reason = "HARD_STOP" if hard else "FORCE_CLOSE_1520"
+    exit_side = SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL
+    sig = PendingSignal(signal_bar_ts=snap.ts, execute_not_before_minute=snap.ts, side=exit_side, action=ACTION_EXIT, signal_name=reason, reason=reason, features={"signal_detected_at": now_jst().isoformat(), "pending_signal_created_at": now_jst().isoformat()})
     if not exit_orders_enabled(config, state, snap):
         storage.log_structured("WARN", "DATA_COLLECTION_ONLY_LIVE_POSITION_DETECTED", {"reason": reason, "side": pos.side, "qty": pos.qty, "entry_price": pos.entry_price, "current_price": snap.price}, True)
         if is_data_collection_only(config):
-            storage.log_structured("INFO", "DATA_COLLECTION_ONLY_EXIT_BLOCKED", {"reason": reason, "blocked_action": "send_order", "side": SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, "price": snap.price, "strategy": pos.strategy}, True)
+            storage.log_structured("INFO", "DATA_COLLECTION_ONLY_EXIT_BLOCKED", {"reason": reason, "blocked_action": "send_order", "side": exit_side, "price": snap.price, "strategy": pos.strategy}, True)
+        elif config.get("live_mode", False) is True and not live_trading_ack_ok(config):
+            log_missing_live_trading_ack(storage, sig, state, snap, config)
         else:
-            storage.log_structured("WARN", "EXIT_BLOCKED_BY_RUNTIME_GUARD", {"reason": reason, "live_mode": config.get("live_mode"), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None}, True)
+            storage.log_structured("WARN", "EXIT_BLOCKED_BY_RUNTIME_GUARD", {"reason": reason, "live_mode": config.get("live_mode"), "live_trading_ack": live_trading_ack_ok(config), "strategy_enabled": config.get("market_structure_strategy", {}).get("enabled"), "has_open_position": state.open_position is not None}, True)
         return
-    sig = PendingSignal(signal_bar_ts=snap.ts, execute_not_before_minute=snap.ts, side=SIDE_BUY if pos.side == SIDE_SELL else SIDE_SELL, action=ACTION_EXIT, signal_name=reason, reason=reason, features={"signal_detected_at": now_jst().isoformat(), "pending_signal_created_at": now_jst().isoformat()})
     execute_signal_order(config, client, storage, state, sig, snap)
 
 
@@ -1177,12 +1289,15 @@ def main() -> int:
     db_path = str(outdir / f"market_structure_{now_jst().strftime('%Y%m%d')}.db")
     db_cfg = config.get("async_db_writer", {})
     storage = AsyncDbWriter(db_path, config.get("sqlite", {}), db_cfg.get("max_queue_size", 10000), db_cfg.get("batch_size", 100), db_cfg.get("flush_interval_sec", 0.5))
+    print_startup_banner(args.config, config, db_path)
     storage.log_structured("INFO", "ASYNC_DB_WRITER_STARTED", {"db_path": db_path}, True)
     startup = {"live_mode": config.get("live_mode"), "strategy_mode": config.get("strategy_mode"), "data_collection_only": config.get("data_collection_only"), "entry_execution": config.get("entry_execution"), "exit_execution": config.get("exit_execution"), "market_structure_strategy": config.get("market_structure_strategy"), "entry_front_order_type": config.get("entry_front_order_type"), "exit_front_order_type": config.get("exit_front_order_type"), "legacy_long_rsi50_enabled": False, "legacy_long_rsi35_enabled": False, "legacy_scalping_enabled": False, "legacy_feature_entries_enabled": False, "legacy_big_trend_enabled": False, "legacy_hold_score_enabled": False}
     storage.log_structured("INFO", "MARKET_STRUCTURE_ENGINE_STARTED", startup, True)
     storage.log_structured("INFO", "DATA_COLLECTION_ONLY_ENABLED", startup, True)
     storage.log_structured("INFO", "ORDER_DISABLED_CONFIRMATION", {"orders_enabled": orders_enabled(config), "live_mode": config.get("live_mode"), "data_collection_only": is_data_collection_only(config), "entry_execution_enabled": config.get("entry_execution", {}).get("enabled"), "exit_execution": config.get("exit_execution"), "entry_front_order_type": config.get("entry_front_order_type"), "exit_front_order_type": config.get("exit_front_order_type")}, True)
     storage.log_structured("INFO", "LEGACY_STRATEGIES_DISABLED", {k: startup[k] for k in startup if k.startswith("legacy_")}, True)
+    if config.get("live_mode", False) is True and not is_data_collection_only(config):
+        storage.log_structured("INFO", "LIVE_MODE_CONFIRMATION", live_mode_confirmation_payload(config), True)
     state = RuntimeState()
     client = KabuApiClient(config.get("base_url") or config.get("api_base_url") or API_BASE_DEFAULT, config.get("api_password", ""), config.get("order_password", ""))
     try:
@@ -1202,6 +1317,7 @@ def main() -> int:
     started = time.monotonic(); runtime = config.get("runtime_minutes")
     last_ws_seq: Optional[int] = None; last_rest = 0.0; latest: Optional[TickSnapshot] = None
     md_cfg = config.get("market_data_source", {})
+    interrupted = False
     try:
         while runtime is None or (time.monotonic() - started) < float(runtime) * 60:
             loop_now = now_jst()
@@ -1231,8 +1347,22 @@ def main() -> int:
             if b1t: save_bar_and_features(config, storage, state, b1t, latest, True)
             if b3t: save_bar_and_features(config, storage, state, b3t, latest, False)
             time.sleep(float(md_cfg.get("websocket_loop_sleep_sec", 0.1)) if md_cfg.get("mode") == "websocket" else 1.0)
+    except KeyboardInterrupt:
+        interrupted = True
+        storage.log_structured("INFO", "SHUTDOWN_REQUESTED_BY_KEYBOARD", {"reason": "KeyboardInterrupt"}, True)
+        print("Stopped by Ctrl+C. Shutting down gracefully...", flush=True)
     finally:
-        ws.stop(); storage.stop()
+        try:
+            ws.stop()
+        except Exception:
+            pass
+        try:
+            storage.log_structured("INFO", "ENGINE_SHUTDOWN_FLUSH_START", {}, True)
+            storage.stop()
+            if interrupted:
+                print("Stopped by Ctrl+C. DB writer flushed.", flush=True)
+        except Exception as exc:
+            print(f"DB writer shutdown warning: {exc}", flush=True)
     return 0
 
 

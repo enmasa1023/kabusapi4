@@ -54,5 +54,8 @@
     "block_entry_on_unexpected_position": true,
     "allow_safety_exit_during_manual_check": true,
     "allow_strategy_exit_during_manual_check": false
-  }
+  },
+  "live_trading_ack": "I_UNDERSTAND_REAL_ORDERS",
+  "force_close_after": "15:20:00",
+  "force_close_until": "15:24:00"
 }
