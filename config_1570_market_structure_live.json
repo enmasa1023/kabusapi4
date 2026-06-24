@@ -1,0 +1,169 @@
+{
+  "live_mode": true,
+  "symbol": "1570",
+  "exchange": 1,
+  "order_exchange": 9,
+  "exit_order_exchange": 1,
+  "margin_entry_exchange": 9,
+  "order_qty": 2,
+  "entry_min_fill_qty": 2,
+  "account_type": 4,
+  "margin_trade_type": 3,
+  "margin_trade_type_long": 3,
+  "margin_trade_type_short": 1,
+  "entry_cash_margin": 2,
+  "exit_cash_margin": 3,
+  "entry_deliv_type": 0,
+  "exit_deliv_type": 2,
+  "entry_front_order_type": 20,
+  "exit_front_order_type": 20,
+  "entry_price": 0,
+  "exit_price": 0,
+  "expire_day": 0,
+  "outdir": "monitor_output_market_structure",
+  "runtime_minutes": null,
+  "force_close_after": "15:20:00",
+  "new_entry_cutoff_time": "15:10:00",
+  "strategy_mode": "market_structure",
+  "data_collection_only": {
+    "enabled": false,
+    "disable_all_orders": false,
+    "disable_paper_trades": true,
+    "log_signal_candidates": true,
+    "log_order_block_events": true,
+    "allow_market_data_collection": true,
+    "allow_position_polling": true,
+    "allow_order_polling": true
+  },
+  "entry_execution": {
+    "enabled": true,
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 0,
+    "fallback_to_market": false,
+    "verify_position_after_cancel": true,
+    "skip_signal_after_timeout": true,
+    "log_execution_detail": true
+  },
+  "take_profit_execution": {
+    "enabled": false
+  },
+  "market_data_source": {
+    "mode": "websocket",
+    "fallback_to_rest": true,
+    "bar_finalize_delay_ms": 300,
+    "rest_polling_when_ws_unavailable": true,
+    "max_ws_snapshot_age_sec": 3.0,
+    "rest_fallback_min_interval_sec": 2.0,
+    "ws_queue_maxlen": 5000,
+    "websocket_loop_sleep_sec": 0.1,
+    "persist_raw_ws_snapshots": false,
+    "persist_raw_ws_snapshot_every_n": 0,
+    "debug_ws_snapshot_events": false,
+    "log_final_snapshot_events": false
+  },
+  "market_structure_features": {
+    "enabled": true,
+    "save_every_1m_bar": true,
+    "save_signal_candidates": true,
+    "lookback_minutes": [
+      3,
+      5,
+      10,
+      20,
+      30,
+      60
+    ],
+    "opening_range_minutes": [
+      5,
+      10
+    ],
+    "afternoon_open_range_minutes": [
+      5,
+      10
+    ],
+    "volume_median_lookback_minutes": 20,
+    "volume_z_lookback_minutes": 20
+  },
+  "market_structure_strategy": {
+    "enabled": true,
+    "mode": "strict",
+    "signal_on_bar_close": true,
+    "execute_on_next_bar_first_tick": true,
+    "allow_short": true,
+    "allow_long": false,
+    "max_positions": 1,
+    "allow_add_position": false,
+    "allow_same_bar_reversal": false,
+    "hard_stop_ticks": 20,
+    "short": {
+      "enabled": true,
+      "volume_ratio_min": 1.2,
+      "rsi9_max": 50,
+      "require_close_below_ma5": true,
+      "require_close_below_ma25": true,
+      "require_close_below_vwap": false,
+      "use_obi_l10_filter": false,
+      "obi_l10_max": 0.1
+    },
+    "long": {
+      "enabled": false,
+      "volume_ratio_min": 1.2,
+      "require_close_above_ma5": true,
+      "require_close_above_ma25": true,
+      "require_close_above_vwap": true,
+      "require_next_bar_hold": true,
+      "rsi9_min": 50
+    },
+    "exit": {
+      "short_exit_on_break_high_5m": true,
+      "short_exit_on_break_high_10m": true,
+      "long_exit_on_break_low_5m": true,
+      "exit_on_opposite_signal": true
+    },
+    "logging": {
+      "save_features_1m": true,
+      "save_signal_candidates": true,
+      "save_decisions": true,
+      "save_no_trade_reason": false
+    }
+  },
+  "sqlite": {
+    "journal_mode": "WAL",
+    "synchronous": "NORMAL",
+    "busy_timeout_ms": 3000,
+    "temp_store": "MEMORY",
+    "wal_autocheckpoint": 1000
+  },
+  "async_db_writer": {
+    "enabled": true,
+    "max_queue_size": 10000,
+    "batch_size": 100,
+    "flush_interval_sec": 0.5,
+    "drop_low_priority_when_full": true
+  },
+  "api_password": "enmasa1023",
+  "order_password": "47095095",
+  "exit_execution": {
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 1,
+    "fallback_to_market": false,
+    "log_execution_detail": true
+  },
+  "position_reconcile": {
+    "enabled": true,
+    "check_on_startup": true,
+    "check_both_sides_when_expected_side_none": true,
+    "resume_existing_position": false,
+    "block_entry_on_unexpected_position": true,
+    "allow_safety_exit_during_manual_check": true,
+    "allow_strategy_exit_during_manual_check": false
+  },
+  "force_close_until": "15:24:00",
+  "live_trading_ack": "I_UNDERSTAND_REAL_ORDERS"
+}

@@ -1,0 +1,61 @@
+{
+  "_warning": "Example only. Do not use until you intentionally copy required secrets/passwords and verify kabu Station connectivity.",
+  "_purpose": "Minimal switches required to enable real market_structure orders from the safe data-collection config.",
+  "live_mode": true,
+  "strategy_mode": "market_structure",
+  "data_collection_only": {
+    "enabled": false,
+    "disable_all_orders": false,
+    "disable_paper_trades": true,
+    "log_signal_candidates": true,
+    "log_order_block_events": true,
+    "allow_market_data_collection": true,
+    "allow_position_polling": true,
+    "allow_order_polling": true
+  },
+  "entry_execution": {
+    "enabled": true,
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 0,
+    "fallback_to_market": false,
+    "verify_position_after_cancel": true,
+    "skip_signal_after_timeout": true,
+    "log_execution_detail": true
+  },
+  "market_structure_strategy": {
+    "enabled": true,
+    "allow_short": true,
+    "allow_long": false,
+    "max_positions": 1,
+    "allow_add_position": false,
+    "hard_stop_ticks": 20
+  },
+  "entry_front_order_type": 20,
+  "exit_front_order_type": 20,
+  "entry_price": 0,
+  "exit_price": 0,
+  "exit_execution": {
+    "mode": "limit_with_timeout",
+    "limit_mode": "marketable_best",
+    "timeout_sec": 2.0,
+    "cancel_on_timeout": true,
+    "max_reprice_attempts": 1,
+    "fallback_to_market": false,
+    "log_execution_detail": true
+  },
+  "position_reconcile": {
+    "enabled": true,
+    "check_on_startup": true,
+    "check_both_sides_when_expected_side_none": true,
+    "resume_existing_position": false,
+    "block_entry_on_unexpected_position": true,
+    "allow_safety_exit_during_manual_check": true,
+    "allow_strategy_exit_during_manual_check": false
+  },
+  "live_trading_ack": "I_UNDERSTAND_REAL_ORDERS",
+  "force_close_after": "15:20:00",
+  "force_close_until": "15:24:00"
+}
